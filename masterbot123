@@ -147,8 +147,8 @@ else:
 SVETOFOR_SHEET = "Светофор"
 DISTRIBUTION_SPREADSHEET_NAME = "Сводная таблица распределения"
 ALLOWED_STATUSES = ["Бронь", "Закрытие сделки", "Предварительная заявка"]
-ALLOWED_STATUS_IDS = ["18913933", "18960415", "142"]
-NEW_GAMES_STATUS_IDS = ["142", "18913933"]
+ALLOWED_STATUS_IDS = ["18913933", "18960415", "18913930"]
+NEW_GAMES_STATUS_IDS = ["18913930", "18913933"]
 SUCCESSFUL_STATUS_ID = "18960415"
 DATE_FILTER_DAYS = 30
 PREPAYMENT_FIELD_ID = None
@@ -558,13 +558,19 @@ async def get_pipeline_stages() -> Dict[str, str]:
                 if r.status != 200:
                     logger.error("[6.0] get_pipeline_stages: HTTP %d", r.status)
                     return {}
+
                 js = await r.json()
-                stages = {
-                    str(st["id"]): st["name"]
-                    for pl in js["_embedded"]["pipelines"]
-                    for st in pl["_embedded"]["statuses"]
-                }
-                logger.debug("[6.0] get_pipeline_stages: %d статусов", len(stages))
+                stages = {}
+                logger.info("[6.0] AmoCRM Pipeline Status Mapping:")
+                for pl in js["_embedded"]["pipelines"]:
+                    pipeline_name = pl.get("name", "—")
+                    for st in pl["_embedded"]["statuses"]:
+                        st_id = str(st["id"])
+                        st_name = st["name"]
+                        stages[st_id] = st_name
+                        logger.info("    %s → %s (pipeline: %s)", st_id, st_name, pipeline_name)
+
+                logger.debug("[6.0] get_pipeline_stages: загружено %d статусов", len(stages))
                 return stages
     except Exception as e:
         logger.exception("[6.0] get_pipeline_stages: ошибка %s", e)
@@ -978,7 +984,7 @@ async def generate_name_mapping() -> None:
                 "stages": {
                     "142": "New",
                     "18913933": "In Progress",
-                    "143": "Successful"
+                    "18913930": "Successful"
                 }
             }
         }
