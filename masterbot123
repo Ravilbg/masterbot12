@@ -1,3 +1,4 @@
+
 # ████████████████████████████████████████████████████████████████████████████
 # █                                                                         █
 # █                           MasterBot 12.92                               █
@@ -558,19 +559,13 @@ async def get_pipeline_stages() -> Dict[str, str]:
                 if r.status != 200:
                     logger.error("[6.0] get_pipeline_stages: HTTP %d", r.status)
                     return {}
-
                 js = await r.json()
-                stages = {}
-                logger.info("[6.0] AmoCRM Pipeline Status Mapping:")
-                for pl in js["_embedded"]["pipelines"]:
-                    pipeline_name = pl.get("name", "—")
-                    for st in pl["_embedded"]["statuses"]:
-                        st_id = str(st["id"])
-                        st_name = st["name"]
-                        stages[st_id] = st_name
-                        logger.info("    %s → %s (pipeline: %s)", st_id, st_name, pipeline_name)
-
-                logger.debug("[6.0] get_pipeline_stages: загружено %d статусов", len(stages))
+                stages = {
+                    str(st["id"]): st["name"]
+                    for pl in js["_embedded"]["pipelines"]
+                    for st in pl["_embedded"]["statuses"]
+                }
+                logger.debug("[6.0] get_pipeline_stages: %d статусов", len(stages))
                 return stages
     except Exception as e:
         logger.exception("[6.0] get_pipeline_stages: ошибка %s", e)
@@ -739,7 +734,6 @@ async def update_amocrm_tags(deal_id: int, tags: List[str]) -> bool:
 # - 2.2 (14.05.2025): фиксы JSON‑decode и rate‑limit.
 # - 2.3 (15.05.2025): исключён pipeline_id=None, статусы формируются корректно —
 #                    устранён TypeError «Invalid variable type» при запросе.
-
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║                                                                           ║
@@ -996,7 +990,7 @@ async def generate_name_mapping() -> None:
 # ║                  [10.0] Обработка Telegram-сообщений                      ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 # Описание: стартовое меню, «Новые / Распределённые игры» и запуск опроса.
-# version: 1.8 (31.05.2025) — объединённый new_games_handler
+# version: 1.9 (07.06.2025)  — фикс ограничения 100 симв. на варианты опроса
 
 from aiogram.types import ReplyKeyboardRemove
 router = Router()
@@ -1026,21 +1020,14 @@ async def start_handler(message: types.Message) -> None:
             reply_markup=ReplyKeyboardRemove()
         )
 
-# ──────────────── 📅 Новые игры  (один универсальный роут) ────────────────
-@router.message(
-    lambda m: m.text
-    and m.text.strip() in {"📅 Новые игры", "\U0001F4C5 Новые игры"}
-)
+# ──────────────── 📅 Новые игры ────────────────
+@router.message(lambda m: m.text and m.text.strip() in {"📅 Новые игры", "\U0001F4C5 Новые игры"})
 async def new_games_handler(message: types.Message) -> None:
-    """Кнопка «Новые игры»."""
     user_id = message.from_user.id
     ui = get_user_info(user_id)
 
     if not ui or ui["role"] not in ACCESS["games"]:
-        await message.answer(
-            "⛔ Нет доступа.",
-            reply_markup=await get_main_menu(user_id)
-        )
+        await message.answer("⛔ Нет доступа.", reply_markup=await get_main_menu(user_id))
         return
 
     await show_games(
@@ -1055,15 +1042,11 @@ async def new_games_handler(message: types.Message) -> None:
 # ──────────────── ✅ Распределённые игры ────────────────
 @router.message(lambda m: m.text and m.text.strip() == "✅ Распределённые игры")
 async def assigned_games_handler(message: types.Message) -> None:
-    """Кнопка «Распределённые игры»."""
     user_id = message.from_user.id
     ui = get_user_info(user_id)
 
     if not ui or ui["role"] not in ACCESS["games"]:
-        await message.answer(
-            "⛔ Нет доступа.",
-            reply_markup=await get_main_menu(user_id)
-        )
+        await message.answer("⛔ Нет доступа.", reply_markup=await get_main_menu(user_id))
         return
 
     await show_games(
@@ -1123,11 +1106,30 @@ async def create_poll_handler(message: types.Message) -> None:
     for idx, chunk in enumerate(chunks, 1):
         header  = f"{base_header} (Часть {idx})" if len(chunks) > 1 else base_header
         options, indices = [], {}
+
         for i, d in enumerate(chunk):
-            date, _time = d["event_datetime_str"].split(", ")
-            extra = f", {d['extra_services']}" if d["extra_services"] else ""
-            options.append(f"🎉 {d['name']} – {date} – {d['package']}{extra}")
+            date = d["event_datetime"].strftime("%d.%m")
+
+            # ── формируем вариант опроса ≤ 100 симв. ─────────────────
+            text = f"🎉 {d['name']} – {date}"
+            if d["package"]:
+                text = f"{text} – {d['package']}"
+
+            if d["extra_services"]:
+                rest = 100 - len(text) - 1          # +1 на пробел перед услугами
+                if rest > 0:
+                    extra = d["extra_services"]
+                    if len(extra) > rest:
+                        extra = extra[:rest - 1].rstrip(", ") + "…"
+                    text = f"{text} {extra}"
+
+            if len(text) > 100:                     # страховка
+                text = text[:97].rstrip(", ") + "…"
+            # ───────────────────────────────────────────────────────────
+
+            options.append(text)
             indices[i] = d["id"]
+
         options += ["🚫 Не смогу работать", "🛡️ Могу администратором"]
 
         poll_msg = await bot.send_poll(
@@ -1150,7 +1152,7 @@ async def create_poll_handler(message: types.Message) -> None:
     dash_msg = await bot.send_message(
         user_id,
         report_text,
-        reply_markup=bot_data.distribution_keyboard,   # кнопки-игры
+        reply_markup=bot_data.distribution_keyboard,
         parse_mode="Markdown"
     )
     bot_data.personal_report_message_id = dash_msg.message_id
