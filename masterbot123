@@ -15,6 +15,7 @@
 # Дата: 13.05.2025
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 import os
@@ -217,41 +218,62 @@ AMOCRM_FIELDS = {
 # - 1.13 (13.05.2025): Обновлены пути к файлам логов, добавлена папка logs.
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║                                                                           ║
 # ║                       [3.0] Глобальные объекты                            ║
-# ║                                                                           ║
+# ║  version: 1.4 (08.06.2025) — добавлен detail_blocks                       ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
-# Описание: Определение глобального объекта bot_data для хранения состояния.
-# version: 1.2  (17.05.2025)  ← Добавлено games_by_user
+
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from aiogram import types
+from aiogram.types import InlineKeyboardMarkup
+
 
 class BotData:
-    """Класс для хранения состояния бота."""
-    def __init__(self):
+    """Все переменные, которые должны жить до перезапуска бота."""
+    def __init__(self) -> None:
+        # ── конфигурация / токены ───────────────────────────────────────────
         self.config: Dict = {}
         self.tokens: Dict = {}
+
+        # ── Chat / Spreadsheet IDs ──────────────────────────────────────────
         self.admin_chat_id: Optional[int] = None
         self.svetofor_spreadsheet_id: Optional[str] = None
-        self.responses: Dict = {}
+
+        # ── Опросы и распределение ─────────────────────────────────────────
         self.current_poll_deals: List[Dict] = []
-        self.distribution_cache: Dict = {}
+        self.responses: Dict = {}                        # poll_id → ответы
+        self.distribution_cache: Dict = {}               # deal_id → {role: tag}
+        self.distribution_keyboard: Optional[InlineKeyboardMarkup] = None
+
+        # ── Служебные указатели ─────────────────────────────────────────────
         self.personal_report_message_id: Optional[int] = None
         self.current_poll_leader: Optional[int] = None
         self.coordination_cycle_active: bool = False
-        self.distribution_keyboard: Optional[InlineKeyboardMarkup] = None
+
+        # ── Периоды отчётов ────────────────────────────────────────────────
         self.current_event_period: Optional[List[datetime]] = None
         self.last_event_period: Optional[List[datetime]] = None
+
+        # ── Кеши сообщений ─────────────────────────────────────────────────
         self.pipeline_mapping: Dict = {}
         self.deals_cache: Dict = {}
         self.messages_to_delete: Dict[int, List[int]] = {}
-        # 🆕 запоминаем списки игр, показанные каждому пользователю
+        self.last_user_messages: Dict[int, List[types.Message]] = {}
+        self.detail_blocks: Dict[Tuple[int, int], List[types.Message]] = {}  # (uid, deal) → msgs
+
+        # ── UI-поддержка ───────────────────────────────────────────────────
         self.games_by_user: Dict[int, List[Dict]] = {}
+
 
 bot_data = BotData()
 
-# version‑history:
-# - 1.0: базовая структура
-# - 1.1 (11.05.2025): добавлены deals_cache, messages_to_delete
-# - 1.2 (17.05.2025): games_by_user для корректной работы деталей
+# version-history:
+# 1.0 — базовая структура
+# 1.1 — deals_cache, messages_to_delete
+# 1.2 — games_by_user
+# 1.3 — last_user_messages
+# 1.4 — detail_blocks
+
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -987,214 +1009,247 @@ async def generate_name_mapping() -> None:
         logger.error("[9.0] generate_name_mapping: Ошибка генерации маппинга: %s", e, exc_info=True)
         
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║                  [10.0] Обработка Telegram-сообщений                      ║
+# ║                  [10.0] Обработка Telegram-сообщений  (v3.2)             ║
+# ║  /start · «📅 Новые игры» · «✅ Распределённые игры» · «📋 Создать опрос»    ║
+# ║                                                                           ║
+# ║  Правило «один экран — одно меню»:                                         ║
+# ║  • vacuum удаляет ТОЛЬКО рабочие сообщения (last_user_messages, …);        ║
+# ║    `menu_message_id` он не трогает.                                        ║
+# ║  • триггер-команды юзера сразу `message.delete()`                          ║
+# ║  • клавиатуру главного меню мы обновляем inplace, а не посылаем новую.     ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
-# Описание: стартовое меню, «Новые / Распределённые игры» и запуск опроса.
-# version: 1.9 (07.06.2025)  — фикс ограничения 100 симв. на варианты опроса
 
 from aiogram.types import ReplyKeyboardRemove
+from datetime import datetime, timedelta
+
 router = Router()
 
-# ─────────────────────────── /start ────────────────────────────
+# ────────────── helper: удаляем триггер-команду из ЛС ───────────────────────
+async def _delete_trigger(msg: types.Message) -> None:
+    try:
+        await msg.delete()
+    except Exception:
+        bot_data.messages_to_delete.setdefault(msg.from_user.id, []).append(msg.message_id)
+
+# ────────────── helper: «подкрашиваем» живое меню во время работы ───────────
+async def _refresh_menu(user_id: int) -> None:
+    """
+    Обновляет клавиатуру (и при необходимости текст) единственного
+    сообщения-меню, чтобы кнопка «📋» превращалась в «📊» и обратно,
+    не создавая копий.
+    """
+    menu_id = getattr(bot_data, "menu_message_id", None)
+    if not menu_id:
+        return
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=user_id,
+            message_id=menu_id,
+            reply_markup=await get_main_menu(user_id) or ReplyKeyboardRemove()
+        )
+    except Exception:                       # меню могли удалить вручную
+        bot_data.menu_message_id = None
+
+# ─────────────────────────────── /start ─────────────────────────────────────
 @router.message(CommandStart())
 async def start_handler(message: types.Message) -> None:
-    """/start — приветствие и показ главного меню."""
-    user_id = message.from_user.id
+    uid = message.from_user.id
     try:
-        first_name = message.from_user.first_name or "Пользователь"
-        kb = await get_main_menu(user_id)
+        await delete_previous_private_messages(uid)
+
+        kb  = await get_main_menu(uid)
         txt = (
-            f"🎉 Привет, {first_name}! Я MasterBot {VERSION} 🤖\n"
-            f"Твой ID: {user_id}\n"
+            f"🎉 Привет, {message.from_user.first_name or 'Пользователь'}! "
+            f"Я MasterBot {VERSION} 🤖\n"
+            f"Твой ID: {uid}\n"
         )
-        txt += (
-            "К сожалению, у вас нет доступных действий."
-            if not kb else "Я помогу управлять распределением ведущих на квесты."
-        )
-        await message.answer(txt, reply_markup=kb or ReplyKeyboardRemove())
-        logger.info("[10.0] start_handler: user=%d name=%s", user_id, first_name)
+        txt += "К сожалению, у вас нет доступных действий." if not kb else \
+               "Я помогу управлять распределением ведущих на квесты."
+
+        if (mid := getattr(bot_data, "menu_message_id", None)):
+            try:
+                await bot.edit_message_text(txt, uid, mid, reply_markup=kb)
+                return
+            except Exception:
+                bot_data.menu_message_id = None                       # упало → создаём заново
+
+        sent = await message.answer(txt, reply_markup=kb or ReplyKeyboardRemove())
+        bot_data.menu_message_id = sent.message_id                    # vacuum не трогает
+        await _delete_trigger(message)                                # убираем /start
     except Exception as e:
         logger.error("[10.0] start_handler: %s", e, exc_info=True)
-        await message.answer(
-            "⚠️ Произошла ошибка. Попробуйте позже.",
-            reply_markup=ReplyKeyboardRemove()
-        )
 
-# ──────────────── 📅 Новые игры ────────────────
+# ──────────────── 📅 Новые игры ─────────────────────────────────────────────
 @router.message(lambda m: m.text and m.text.strip() in {"📅 Новые игры", "\U0001F4C5 Новые игры"})
 async def new_games_handler(message: types.Message) -> None:
-    user_id = message.from_user.id
-    ui = get_user_info(user_id)
+    uid = message.from_user.id
+    if (ui := get_user_info(uid)) and ui["role"] in ACCESS["games"]:
+        await delete_previous_private_messages(uid)
+        await show_games(message, uid, NEW_GAMES_STATUS_IDS, "📅 Новые игры:", True)
+    else:
+        await message.answer("⛔ Нет доступа.", reply_markup=await get_main_menu(uid))
+    await _delete_trigger(message)
 
-    if not ui or ui["role"] not in ACCESS["games"]:
-        await message.answer("⛔ Нет доступа.", reply_markup=await get_main_menu(user_id))
-        return
-
-    await show_games(
-        message=message,
-        user_id=user_id,
-        status_ids=NEW_GAMES_STATUS_IDS,
-        title="📅 Новые игры:",
-        only_unassigned=True
-    )
-    logger.info("[10.0] new_games_handler: список игр отправлен %d", user_id)
-
-# ──────────────── ✅ Распределённые игры ────────────────
+# ──────────────── ✅ Распределённые игры ────────────────────────────────────
 @router.message(lambda m: m.text and m.text.strip() == "✅ Распределённые игры")
 async def assigned_games_handler(message: types.Message) -> None:
-    user_id = message.from_user.id
-    ui = get_user_info(user_id)
+    uid = message.from_user.id
+    if (ui := get_user_info(uid)) and ui["role"] in ACCESS["games"]:
+        await delete_previous_private_messages(uid)
+        await show_games(message, uid, [SUCCESSFUL_STATUS_ID], "✅ Распределённые игры:")
+    else:
+        await message.answer("⛔ Нет доступа.", reply_markup=await get_main_menu(uid))
+    await _delete_trigger(message)
 
-    if not ui or ui["role"] not in ACCESS["games"]:
-        await message.answer("⛔ Нет доступа.", reply_markup=await get_main_menu(user_id))
-        return
-
-    await show_games(
-        message=message,
-        user_id=user_id,
-        status_ids=[SUCCESSFUL_STATUS_ID],
-        title="✅ Распределённые игры:"
-    )
-
-# ──────────────── 📋 Создать опрос ────────────────
+# ──────────────── 📋 Создать опрос (фикс «меню пропадало») ──────────────────
 @router.message(lambda m: m.text and m.text.strip() == "📋 Создать опрос")
 async def create_poll_handler(message: types.Message) -> None:
-    """Создаёт опросы по ближайшим 14 дням и формирует дашборд-отчёт."""
-    user_id = message.from_user.id
+    uid = message.from_user.id
 
-    # ── проверки доступа ───────────────────────────────────────────────
-    if not await has_access(user_id, "poll"):
-        await message.answer("⛔ Нет доступа.", reply_markup=await get_main_menu(user_id))
-        return
+    # — проверки доступа —
+    if not await has_access(uid, "poll"):
+        await message.answer("⛔ Нет доступа.", reply_markup=await get_main_menu(uid))
+        await _delete_trigger(message); return
     if bot_data.coordination_cycle_active:
         await message.answer("⚠️ Уже есть активный опрос.")
-        return
+        await _delete_trigger(message); return
     if not bot_data.admin_chat_id or not await is_bot_admin(bot_data.admin_chat_id):
         await message.answer("⚠️ Чат ведущих не настроен или бот не админ.")
-        return
-    sid = bot_data.config.get("svetofor_spread_id")
-    if not sid:
+        await _delete_trigger(message); return
+    if not (sid := bot_data.config.get("svetofor_spread_id")):
         await message.answer("⚠️ Не указан ID таблицы «Светофор».")
-        return
-    # ──────────────────────────────────────────────────────────────────
+        await _delete_trigger(message); return
 
+    await delete_previous_private_messages(uid)
+
+    # — собираем сделки —
     deals = await get_amocrm_deals(sid)
     now, window_end = datetime.now(tz=MSK_TZ), datetime.now(tz=MSK_TZ) + timedelta(days=14)
     poll_deals = [
         d for d in deals
         if d["status_id"] in NEW_GAMES_STATUS_IDS
-        and now <= d["event_datetime"] <= window_end
-        and not d["team_leads"]
+           and now <= d["event_datetime"] <= window_end
+           and not d["team_leads"]
     ]
     if not poll_deals:
         await message.answer("😔 Нет подходящих игр для опроса.",
-                             reply_markup=await get_main_menu(user_id))
-        return
+                             reply_markup=await get_main_menu(uid))
+        await _delete_trigger(message); return
 
-    # ── подготовка опросов ─────────────────────────────────────────────
-    poll_deals.sort(key=lambda x: x["event_datetime"])
-    bot_data.current_poll_deals       = poll_deals
-    bot_data.current_poll_leader      = user_id
+    # — фиксируем контекст опроса —
+    bot_data.current_poll_deals        = poll_deals
+    bot_data.current_poll_leader       = uid
     bot_data.responses.clear()
-    bot_data.coordination_cycle_active = True
-    # -------------------------------------------------------------------
+    bot_data.distribution_cache.clear()
+    bot_data.coordination_cycle_active = True     # ← кнопка «📊» в меню
 
-    chunks      = [poll_deals[i:i + 8] for i in range(0, len(poll_deals), 8)]
+    # — публикуем poll-сообщения —
     urgent      = any(d["event_datetime"] <= now + timedelta(days=3) for d in poll_deals)
     base_header = "🚨 Срочные игры!" if urgent else "📊 Новые игры"
+    chunks      = [poll_deals[i:i + 8] for i in range(0, len(poll_deals), 8)]
 
     for idx, chunk in enumerate(chunks, 1):
         header  = f"{base_header} (Часть {idx})" if len(chunks) > 1 else base_header
         options, indices = [], {}
-
         for i, d in enumerate(chunk):
-            date = d["event_datetime"].strftime("%d.%m")
-
-            # ── формируем вариант опроса ≤ 100 симв. ─────────────────
-            text = f"🎉 {d['name']} – {date}"
-            if d["package"]:
-                text = f"{text} – {d['package']}"
-
+            date  = d["event_datetime"].strftime("%d.%m")
+            title = f"🎉 {d['name']} – {date}"
+            if d["package"]:         title += f" – {d['package']}"
             if d["extra_services"]:
-                rest = 100 - len(text) - 1          # +1 на пробел перед услугами
-                if rest > 0:
-                    extra = d["extra_services"]
-                    if len(extra) > rest:
-                        extra = extra[:rest - 1].rstrip(", ") + "…"
-                    text = f"{text} {extra}"
-
-            if len(text) > 100:                     # страховка
-                text = text[:97].rstrip(", ") + "…"
-            # ───────────────────────────────────────────────────────────
-
-            options.append(text)
-            indices[i] = d["id"]
+                rest  = 100 - len(title) - 1
+                extra = d["extra_services"]
+                if len(extra) > rest:
+                    extra = extra[:rest - 1].rstrip(', ') + "…"
+                title += f" {extra}"
+            options.append(title[:100]); indices[i] = d["id"]
 
         options += ["🚫 Не смогу работать", "🛡️ Могу администратором"]
 
         poll_msg = await bot.send_poll(
-            bot_data.admin_chat_id,
-            header,
-            options,
-            is_anonymous=False,
-            allows_multiple_answers=True
+            bot_data.admin_chat_id, header, options,
+            is_anonymous=False, allows_multiple_answers=True
         )
         bot_data.responses[poll_msg.poll.id] = {
-            "deals": {d["id"]: [] for d in chunk},
+            "deals":           {d["id"]: [] for d in chunk},
             "admin_available": [],
-            "not_available": [],
-            "deal_indices": indices
+            "not_available":   [],
+            "deal_indices":    indices
         }
 
-    # ── формируем личный дашборд ───────────────────────────────────────
-    report_text = await generate_poll_report()
+    # — подтверждение и чистка триггера —
+    ok = await message.answer("✅ Опросы отправлены.")          # без клавиатуры!
+    bot_data.messages_to_delete.setdefault(uid, []).extend([message.message_id, ok.message_id])
 
-    dash_msg = await bot.send_message(
-        user_id,
-        report_text,
+    # — обновляем уже существующее меню —
+    await _refresh_menu(uid)
+
+    # — личный дашборд —
+    dash = await bot.send_message(
+        uid,
+        await generate_poll_report(),
         reply_markup=bot_data.distribution_keyboard,
         parse_mode="Markdown"
     )
-    bot_data.personal_report_message_id = dash_msg.message_id
-
-    # отдельное сообщение с кнопками действий
-    await bot.send_message(
-        user_id,
-        "ℹ️ Действия с опросом:",
-        reply_markup=get_distribution_keyboard()
-    )
+    bot_data.last_user_messages[uid]   = [dash]
+    bot_data.personal_report_message_id = dash.message_id
 
     await report_unknown_names()
 
-    # ── очистка данных через 24 ч ───────────────────────────────────────
     scheduler.add_job(
         clear_poll_data,
         "date",
         run_date=now + POLL_DURATION,
-        args=[user_id],
-        id=f"clear_poll_{user_id}",
+        args=[uid],
+        id=f"clear_poll_{uid}",
         replace_existing=True
     )
 
-    await message.answer("✅ Опросы отправлены.", reply_markup=await get_main_menu(user_id))
-    logger.info("[10.0] create_poll_handler: polls for %d deals", len(poll_deals))
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║               [10.1] poll_report_handler  (v1.3)                         ║
+# ║  «📊 Отчёт по опросу» – логика без изменений, но меню остаётся.            ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+@router.message(lambda m: m.text and m.text.strip() in {"📊 Отчёт по опросу", "\U0001F4CA Отчёт по опросу"})
+async def poll_report_handler(message: types.Message) -> None:
+    uid = message.from_user.id
+    if not await has_access(uid, "poll"):
+        await message.answer("⛔ Нет доступа.", reply_markup=await get_main_menu(uid))
+        await _delete_trigger(message); return
+    if not bot_data.coordination_cycle_active:
+        await message.answer("⚠️ Активных опросов нет.", reply_markup=await get_main_menu(uid))
+        await _delete_trigger(message); return
 
+    await delete_previous_private_messages(uid)
+
+    dash = await bot.send_message(
+        uid,
+        await generate_poll_report(),
+        reply_markup=bot_data.distribution_keyboard,
+        parse_mode="Markdown"
+    )
+    bot_data.last_user_messages[uid]          = [dash]
+    bot_data.personal_report_message_id       = dash.message_id
+    bot_data.messages_to_delete.setdefault(uid, []).append(dash.message_id)
+
+    await _refresh_menu(uid)                  # переключаем кнопку «📊» → «📊» (без изменений)
+    await _delete_trigger(message)
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║                                                                           ║
-# ║                      [11.0] Callback-обработчики                          ║
-# ║                                                                           ║
+# ║          [11.0] game_details_handler (v2.0 — single-screen fix)          ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
-# Обработка callback c.data="game_details_<id>" — показывает полные детали,
-# включая «Пакет услуг» и «Доп. услуги».
-# Добавлена кнопка возврата к списку игр.
+# Показывает детали игры и гарантирует, что в ЛС остаётся ОДНО сообщение.
+# version: 2.0 (08.06.2025)
+
 @router.callback_query(lambda c: c.data.startswith("game_details_"))
 async def game_details_handler(callback: types.CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    deal_id = int(callback.data.split("_")[-1])
+    user_id  = callback.from_user.id
+    deal_id  = int(callback.data.split("_")[-1])
+
     try:
-        # поиск сделки в кэше пользователя или в текущем опросе
+        # ➊ Чистим предыдущее «окно»
+        await delete_previous_private_messages(user_id)
+
+        # ➋ Ищем сделку (в кеше show_games или в активном опросе)
         deal = next(
             (d for d in bot_data.games_by_user.get(user_id, []) if d["id"] == deal_id),
             next((d for d in bot_data.current_poll_deals if d["id"] == deal_id), None)
@@ -1203,8 +1258,8 @@ async def game_details_handler(callback: types.CallbackQuery) -> None:
             await callback.answer("⚠️ Игра не найдена.", show_alert=True)
             return
 
-        # подготовка текста деталей
-        date_part    = (deal.get("event_datetime_str") or "—").split(",")[0]
+        # ➌ Формируем текст
+        date_part    = deal["event_datetime"].strftime("%d.%m.%Y")
         time_part    = deal.get("event_time", "—")
         quest        = deal.get("game_name", "—")
         package      = deal.get("package", "—")
@@ -1214,7 +1269,7 @@ async def game_details_handler(callback: types.CallbackQuery) -> None:
         extra        = deal.get("extra_services", "—")
         comment      = deal.get("comment", "—")
         prepay       = deal.get("prepayment", 0)
-        leads        = ", ".join(l.get("name", "") for l in deal.get("team_leads", [])) or "—"
+        leads        = ", ".join(l["name"] for l in deal.get("team_leads", [])) or "—"
         photographer = deal.get("photographer", "—")
         total_budget = deal.get("total_budget", 0)
         to_calc      = deal.get("to_calculate", 0)
@@ -1236,40 +1291,58 @@ async def game_details_handler(callback: types.CallbackQuery) -> None:
             f"🧮 *К расчёту*: {to_calc} ₽",
         ])
 
-        # кнопка возврата
+        # ➍ Кнопка «Назад»
         kb = InlineKeyboardBuilder()
         kb.button(text="⬅️ Назад к списку", callback_data="back_to_games_list")
         kb.adjust(1)
 
-        await callback.message.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+        sent = await callback.message.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+        # ➎ Сохраняем только ЭТО сообщение как активное
+        bot_data.last_user_messages[user_id] = [sent]
+
         await callback.answer()
 
     except Exception as e:
+        logger.error("[11.0] game_details_handler v2.0: %s", e, exc_info=True)
         await callback.answer("⚠️ Ошибка при загрузке деталей.", show_alert=True)
 
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║                   [11.1] back_to_games_list_handler (v1.1)               ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+# «⬅️ Назад к списку» теперь тоже запускает пылесос.
+# version: 1.1 (08.06.2025)
 
 @router.callback_query(lambda c: c.data == "back_to_games_list")
 async def back_to_games_list_handler(callback: types.CallbackQuery) -> None:
-    """Возвращает пользователя к списку игр."""
     user_id = callback.from_user.id
     try:
+        # 🧹 убираем детали, чтобы остался только новый список
+        await delete_previous_private_messages(user_id)
+
         games = bot_data.games_by_user.get(user_id)
         if not games:
             await callback.answer("😔 Список игр недоступен.", show_alert=True)
             return
 
-        # восстановление списка
         kb = InlineKeyboardBuilder()
         for d in games:
             btn_text = f"🎉 {d['name']} {d['event_time']}"
             kb.button(text=btn_text, callback_data=f"game_details_{d['id']}")
         kb.adjust(1)
 
-        await callback.message.answer("📋 Список игр:\nВыберите игру:", reply_markup=kb.as_markup())
-        await callback.answer()
+        sent = await callback.message.answer(
+            "📋 Список игр:\nВыберите игру:", reply_markup=kb.as_markup()
+        )
 
-    except Exception:
+        # сохраняем единственный активный экран
+        bot_data.last_user_messages[user_id] = [sent]
+
+        await callback.answer()
+    except Exception as e:
+        logger.error("[11.1] back_to_games_list_handler: %s", e, exc_info=True)
         await callback.answer("⚠️ Не удалось вернуться к списку.", show_alert=True)
+
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║                  [11.2] report_back_handler (⬅️ Назад)                    ║
@@ -1296,57 +1369,53 @@ async def report_back_handler(callback: types.CallbackQuery) -> None:
         await callback.answer()
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║                                                                           ║
-# ║                          [12.0] Клавиатуры                                ║
+# ║                           [12.0] Клавиатуры                              ║
 # ║                                                                           ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
-# Описание: Генерация reply‑ и inline‑клавиатур для взаимодействия с ботом.
-# version: 1.4
+# version: 1.5 (08.06.2025) — кнопка «📋 Создать опрос» → «📊 Отчёт по опросу»
+#   • если bot_data.coordination_cycle_active == True, в меню показывается
+#     отчёт; иначе — создание опроса.
 
 from typing import List, Optional
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils.keyboard import ReplyKeyboardBuilder   # aiogram 3.x builder
+from aiogram.utils.keyboard import ReplyKeyboardBuilder   # aiogram 3.x builder
 
 async def get_main_menu(user_id: int) -> Optional[ReplyKeyboardMarkup]:
-    """Создаёт главное меню в зависимости от роли пользователя."""
+    """Создаёт главное меню в зависимости от роли и состояния опроса."""
     try:
         user_info = get_user_info(user_id) or {}
         role = user_info.get("role", "")
 
-        # — формируем список кнопок —
         btns: List[KeyboardButton] = []
+
         if role in ACCESS["games"]:
             btns.extend([
                 KeyboardButton(text="\U0001F4C5 Новые игры"),
                 KeyboardButton(text="\U00002705 Распределённые игры")
             ])
+
         if role in ACCESS["poll"]:
-            btns.append(KeyboardButton(text="\U0001F4CB Создать опрос"))
+            if bot_data.coordination_cycle_active:
+                # идёт активный опрос → показываем отчёт
+                btns.append(KeyboardButton(text="\U0001F4CA Отчёт по опросу"))
+            else:
+                # опроса нет → можно создать новый
+                btns.append(KeyboardButton(text="\U0001F4CB Создать опрос"))
 
         if not btns:
             logger.warning("[12.0] get_main_menu: Нет доступных кнопок для %d, role=%s",
                            user_id, role)
             return None
 
-        # — собираем клавиатуру через builder —
         builder = ReplyKeyboardBuilder()
         builder.add(*btns)
-        builder.adjust(2)                         # 2 кнопки в строке
-        markup = builder.as_markup(resize_keyboard=True)
-        logger.debug("[12.0] get_main_menu: Сгенерировано меню для %d (%s), %d кнопок",
-                     user_id, role, len(btns))
-        return markup
+        builder.adjust(2)
+        return builder.as_markup(resize_keyboard=True)
+
     except Exception as exc:
         logger.error("[12.0] get_main_menu: Ошибка для %d: %s", user_id, exc, exc_info=True)
         return None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# История изменений:
-# - 1.0 (??.05.2025): Базовая реализация.
-# - 1.1 (11.05.2025): Логи + проверка пустых кнопок.
-# - 1.2 (14.05.2025): Исправлена валидация ReplyKeyboardMarkup.
-# - 1.3 (15.05.2025): Переведено на ReplyKeyboardBuilder.
-# - 1.4 (15.05.2025): Финальная правка — убрана старая строка с пустым ReplyKeyboardMarkup.
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║                     [12.1] Клавиатура распределения                       ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
@@ -1368,24 +1437,27 @@ def get_distribution_keyboard() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-# ████████████████████████████████████████████████████████████████████████████
-# █                                                                         █
-# █                       [13.0] generate_poll_report                        █
-# █                                                                         █
-# ████████████████████████████████████████████████████████████████████████████
-# Описание: строит личный «дашборд»-отчёт руководителя.
-#           Для каждой игры создаётся кнопка-строка вида
-#           ✅ Квест — DD.MM   или   ❌ Квест — DD.MM
-#           Галочка ставится, если минимальный состав собран.
-#           Клавиатура сохраняется в bot_data.distribution_keyboard.
-# version: 6.1 (30.05.2025)
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║                [13.0] generate_poll_report  (v6.3)                      ║
+# ║  • role_cfg теперь ищется без учёта регистра и лишних пробелов          ║
+# ║  • если игра не найдена в GAME_ROLE_MAPPING → fallback 1+0              ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+# — вспомогательная функция --------------------------------------------------
+
+def _get_role_cfg(game_name: str) -> dict[str, int]:
+    """Возвращает нужное кол‑во main/assist для game_name (case‑insensitive)."""
+    clean = game_name.strip().lower()
+    for title, cfg in GAME_ROLE_MAPPING.items():
+        if title.lower() == clean:
+            return cfg
+    return {"main_leaders": 1, "assistants": 0}  # fallback
 
 async def generate_poll_report() -> str:
     logger.debug("[13.0] generate_poll_report: start")
 
-    # Если опрос не запущен или нет откликов — просто уведомляем
     if not bot_data.current_poll_deals or not bot_data.responses:
         return "⚠️ Нет активных опросов."
 
@@ -1397,36 +1469,38 @@ async def generate_poll_report() -> str:
         date_str  = deal["event_datetime"].strftime("%d.%m")
         pkg_lower = (deal.get("package") or "").strip().lower()
 
-        # Требуемые роли по константе
-        role_def    = GAME_ROLE_MAPPING.get(name, {"main_leaders": 1, "assistants": 0})
+        role_def    = _get_role_cfg(name)
         need_main   = role_def["main_leaders"]
         need_assist = role_def["assistants"]
         need_admin  = 1 if pkg_lower in ("стандарт", "стандарт+", "премиум", "vip", "вип") else 0
 
-        # Собираем всех, кто откликнулся на эту игру
         respondents: list[dict] = []
         for poll_data in bot_data.responses.values():
             respondents += poll_data["deals"].get(deal_id, [])
 
-        # Считаем, сколько зеленых/желтых/админских откликов
         have_main = have_assist = have_admin = 0
         for u in respondents:
             status = await get_user_status_from_svetofor(u["user_id"], name)
             if status == "green":
                 have_main += 1
-                have_assist += 1  # зелёный годится и как помощник
+                have_assist += 1
             elif status == "yellow":
                 have_assist += 1
             if u.get("is_admin_eligible"):
                 have_admin += 1
 
-        ready = (
-            have_main   >= need_main and
-            have_assist >= need_assist and
-            have_admin  >= need_admin
-        )
+        ready = (have_main >= need_main and
+                 have_assist >= need_assist and
+                 have_admin >= need_admin)
         icon = "✅" if ready else "❌"
         btn_text = f"{icon} {name} — {date_str}"
+
+        logger.debug(
+            "[13.0] %s — %s | need: %d+%d+%d, have: %d+%d+%d",
+            name, date_str,
+            need_main, need_assist, need_admin,
+            have_main, have_assist, have_admin
+        )
 
         keyboard.append([
             InlineKeyboardButton(text=btn_text, callback_data=f"show_deal_{deal_id}")
@@ -1435,114 +1509,141 @@ async def generate_poll_report() -> str:
     bot_data.distribution_keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard)
     return "📊 *Опрос создан. Выберите игру для просмотра и редактирования состава:*"
 
-
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║                 [13.0.1] show_deal_callback_handler                       ║
+# ║           [13.0.1] show_deal_callback_handler  (v5.4)                     ║
+# ║  • блок сохраняется и в detail_blocks, и в last_user_messages             ║
+# ║  • при открытии другой секции пылесос уничтожит прежние детали            ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
-# Описание: Показывает подробный отчёт по одной игре с кнопками замены
-# version: 1.0 (28.05.2025)
 
 @router.callback_query(lambda c: c.data.startswith("show_deal_"))
 async def show_deal_callback_handler(callback: types.CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    deal_id = int(callback.data.split("_")[-1])
+
     try:
-        deal_id = int(callback.data.split("_")[-1])
+        # удаляем предыдущие детали этого же юзера/игры
+        old_msgs = bot_data.detail_blocks.pop((user_id, deal_id), [])
+        for m in old_msgs:
+            try:
+                await m.delete()
+            except Exception:
+                pass
+
         deal = next((d for d in bot_data.current_poll_deals if d["id"] == deal_id), None)
         if not deal:
             await callback.answer("⚠️ Игра не найдена.", show_alert=True)
             return
 
-        game = deal["game_name"]
-        game_l = game.lower()
-        date = deal["event_datetime"].strftime("%d.%m.%Y")
-        time = deal["event_time"]
-        pkg = (deal.get("package") or "").strip()
-        pkg_lower = pkg.lower()
-        players = parse_players_count(deal.get("players", 0))
-        pkg_emoji = {
-            "компакт": "🎒", "стандарт": "📦", "стандарт+": "📦➕",
-            "премиум": "💎", "вип": "👑", "vip": "👑"
-        }.get(pkg_lower, "🎁")
+        # ── HEADER ---------------------------------------------------------
+        game     = deal["game_name"]
+        date     = deal["event_datetime"].strftime("%d.%m.%Y")
+        time     = deal["event_time"]
+        pkg      = (deal.get("package") or "—").strip()
+        pkg_icon = {"компакт": "🎒", "стандарт": "📦", "стандарт+": "📦➕",
+                    "премиум": "💎", "vip": "👑", "вип": "👑"}.get(pkg.lower(), "🎁")
+        players  = parse_players_count(deal.get("players"))
 
-        role_def = GAME_ROLE_MAPPING.get(game, {"main_leaders": 1, "assistants": 0})
-        need_main = role_def["main_leaders"]
-        need_assist = role_def["assistants"]
-        need_admin = 1 if pkg_lower in ("стандарт", "стандарт+", "премиум", "vip", "вип") else 0
+        header_text = (
+            f"🎮 *Игра:* {game}\n"
+            f"📅 *Дата:* {date}\n"
+            f"🕒 *Время:* {time}\n"
+            f"📦 *Пакет:* {pkg_icon} {pkg}\n"
+            f"👥 *Игроки:* {players or '—'}"
+        )
+        msgs = [await callback.message.answer(header_text, parse_mode="Markdown")]
 
-        respondents = []
-        for data in bot_data.responses.values():
-            respondents += data["deals"].get(deal_id, [])
-
-        used_ids = set()
-        kb = InlineKeyboardBuilder()
-        lines = [
-            f"🎮 *Игра:* {game}",
-            f"📅 *Дата:* {date}",
-            f"🕒 *Время:* {time}",
-            f"📦 *Пакет:* {pkg_emoji} {pkg or '—'}",
-            f"👥 *Игроки:* {players}",
+        # ── СПИСКИ УЧАСТНИКОВ ---------------------------------------------
+        respondents = [
+            u
+            for pdata in bot_data.responses.values()
+            for u in pdata["deals"].get(deal_id, [])
         ]
+        role_cfg    = _get_role_cfg(game)
+        need_main   = role_cfg["main_leaders"]
+        need_assist = role_cfg["assistants"]
+        need_admin  = 1 if pkg.lower() in {"стандарт", "стандарт+", "премиум", "vip", "вип"} else 0
+        used: set[int] = set()
 
-        async def role_block(label: str, role_type: str, required: int):
-            nonlocal kb
-            result = []
-            selected, alt = [], []
+        async def render(title: str, rtype: str, required: int) -> None:
+            chosen, alt = [], []
             for u in respondents:
-                if u["user_id"] in used_ids:
+                if u["user_id"] in used:
                     continue
-                status = await get_user_status_from_svetofor(u["user_id"], game)
-                if role_type == "main" and status == "green":
-                    (selected if len(selected) < required else alt).append((u, status))
-                elif role_type == "assist" and status in ("green", "yellow"):
-                    (selected if len(selected) < required else alt).append((u, status))
-                elif role_type == "admin" and u.get("is_admin_eligible"):
-                    (selected if len(selected) < required else alt).append((u, "🛡️"))
+                st = await get_user_status_from_svetofor(u["user_id"], game)
+                if rtype == "main"   and st == "green":
+                    (chosen if len(chosen) < required else alt).append((u, st))
+                elif rtype == "assist" and st in {"green", "yellow"}:
+                    (chosen if len(chosen) < required else alt).append((u, st))
+                elif rtype == "admin"  and u.get("is_admin_eligible"):
+                    (chosen if len(chosen) < required else alt).append((u, "🛡️"))
 
-            icon = {"main": "🧭", "assist": "🛟", "admin": "🛡️"}[role_type]
-            result.append(f"\n───── {icon} *{label.upper()}* ─────")
-            result.append(f"✅ {len(selected)}/{required}")
-            if not selected:
-                result.append("– —")
-            for u, st in selected:
-                used_ids.add(u["user_id"])
-                name = f"{u['first_name']} {u['last_name_initial']}"
-                result.append(f"– {name} {st if st in ['🛡️'] else '🟢' if st == 'green' else '🟡'}")
+            icon  = {"main": "🧭", "assist": "🛟", "admin": "🛡️"}[rtype]
+            block = [
+                f"───── {icon} *{title.upper()}* ─────",
+                f"{'✅' if len(chosen) >= required else '❌'} {len(chosen)}/{required}"
+            ]
+            if not chosen:
+                block.append("– —")
+            for u, st in chosen:
+                used.add(u["user_id"])
+                marker = "🟢" if st == "green" else "🟡" if st == "yellow" else st
+                block.append(f"– {u['first_name']} {u['last_name_initial']} {marker}")
+
+            msgs.append(await callback.message.answer("\n".join(block), parse_mode="Markdown"))
 
             if alt:
-                result.append("🔁 *Альтернатива:*")
+                kb = InlineKeyboardBuilder()
                 for u, st in alt:
                     name = f"{u['first_name']} {u['last_name_initial']}"
-                    btn = InlineKeyboardButton(
-                        text=f"{name} {st if st in ['🛡️'] else '🟢' if st == 'green' else '🟡'}",
-                        callback_data=f"swap_{deal_id}_{role_type}_{u['user_id']}"
+                    mark = "🟢" if st == "green" else "🟡" if st == "yellow" else st
+                    kb.button(
+                        text=f"{name} {mark}",
+                        callback_data=f"swap_{deal_id}_{rtype}_{u['user_id']}"
                     )
-                    kb.row(btn)
+                kb.adjust(1)
+                msgs.append(await callback.message.answer("🔁 Альтернатива:", reply_markup=kb.as_markup()))
 
-            return result
+        await render("Ведущие",   "main",   need_main)
+        await render("Помощники", "assist", need_assist)
+        await render("Админ",     "admin",  need_admin)
 
-        lines += await role_block("Ведущие", "main", need_main)
-        lines += await role_block("Помощники", "assist", need_assist)
-        lines += await role_block("Админ", "admin", need_admin)
+        # ── СТАЖЁРЫ --------------------------------------------------------
+        interns = [
+            u for u in respondents
+            if u["user_id"] not in used and
+               await get_user_status_from_svetofor(u["user_id"], game) == "red"
+        ]
+        if interns:
+            iblock = ["───── 👷 *СТАЖЁРЫ* ─────"]
+            iblock += [f"– {u['first_name']} {u['last_name_initial']} 🔴" for u in interns]
+            msgs.append(await callback.message.answer("\n".join(iblock), parse_mode="Markdown"))
 
-        kb.row(
-            InlineKeyboardButton(text="⬅️ Назад", callback_data="report_back")
-        )
-        await callback.message.answer("\n".join(lines), reply_markup=kb.as_markup(), parse_mode="Markdown")
+        # ── НАЗАД ----------------------------------------------------------
+        back_kb = InlineKeyboardBuilder()
+        back_kb.button(text="⬅️ Назад к списку", callback_data="back_to_games_list")
+        back_kb.adjust(1)
+        msgs.append(await callback.message.answer("⬅️", reply_markup=back_kb.as_markup()))
+
+        # сохраняем для «пылесоса»
+        bot_data.detail_blocks[(user_id, deal_id)] = msgs
+        bot_data.last_user_messages[user_id] = msgs     # ← ключевой момент
+
         await callback.answer()
 
-    except Exception as e:
-        logger.error("[13.0.1] show_deal_callback_handler: %s", e, exc_info=True)
-        await callback.answer("⚠️ Ошибка при отображении отчёта.", show_alert=True)
+    except Exception as exc:
+        logger.error("[13.0.1] show_deal_callback_handler v5.4: %s", exc, exc_info=True)
+        await callback.answer("⚠️ Ошибка при отображении состава.", show_alert=True)
+
+
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║                      [13.0.1.1] assign_swap_handler                       ║
+# ║                  [13.0.1.1] assign_swap_handler  (v1.3)                  ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
-# Описание: Меняет выбранного участника на текущей роли (ведущий, помощник, админ)
-# version: 1.0 (28.05.2025)
 
 @router.callback_query(lambda c: c.data.startswith("swap_"))
 async def assign_swap_handler(callback: types.CallbackQuery) -> None:
     try:
-        _, deal_id_str, role_type, new_user_id_str = callback.data.split("_")
-        deal_id = int(deal_id_str)
+        _, deal_id_str, role_type, new_user_id_str = callback.data.split("_", 3)
+        deal_id     = int(deal_id_str)
         new_user_id = int(new_user_id_str)
 
         deal = next((d for d in bot_data.current_poll_deals if d["id"] == deal_id), None)
@@ -1550,44 +1651,70 @@ async def assign_swap_handler(callback: types.CallbackQuery) -> None:
             await callback.answer("⚠️ Игра не найдена.", show_alert=True)
             return
 
-        # Получаем кандидатов на эту роль
-        role_prefix = {
-            "main": "lead",
-            "assist": "assistant",
-            "admin": "admin"
-        }[role_type]
-
-        # Ищем текущего участника на этой роли
-        dist = bot_data.distribution_cache.get(str(deal_id), {})
-        current_key = next((k for k in dist if k.startswith(role_prefix)), None)
-        if not current_key:
-            await callback.answer("⚠️ Не удалось найти роль.", show_alert=True)
+        role_prefix = {"main": "lead", "assist": "assistant", "admin": "admin"}.get(role_type)
+        if not role_prefix:
+            await callback.answer("⚠️ Не удалось определить тип роли.", show_alert=True)
             return
 
-        # Получаем имя нового участника
+        dist = bot_data.distribution_cache.setdefault(str(deal_id), {})
+
+        # ищем первый свободный слот нужного типа
+        role_key = None
+        for i in range(1, 5):
+            key = f"{role_prefix}{i}" if role_prefix != "admin" else "admin"
+            if key not in dist or not dist[key]:
+                role_key = key
+                break
+        if not role_key:
+            await callback.answer("⚠️ Свободная роль не найдена.", show_alert=True)
+            return
+
         user_info = get_user_info(new_user_id)
         if not user_info:
             await callback.answer("⚠️ Пользователь не найден.", show_alert=True)
             return
 
-        name = f"{user_info['first_name']} {user_info['last_name_initial']}"
-        suffix = {
-            "lead": ".1", "assistant": ".Пом", "admin": ".Ад"
-        }.get(role_prefix, "")
-
-        tag = f"{name}{suffix}"
-
-        # Обновляем распределение
-        dist[current_key] = tag
-        bot_data.distribution_cache[str(deal_id)] = dist
+        name   = f"{user_info['first_name']} {user_info['last_name_initial']}"
+        suffix = {"lead": ".1", "assistant": ".Пом", "admin": ".Ад"}.get(role_prefix, "")
+        dist[role_key] = f"{name}{suffix}"
 
         await callback.answer("✅ Назначение обновлено.")
-        # Обновляем интерфейс отчёта одной игры
+        # перерисовываем экран деталей
         await show_deal_callback_handler(callback)
 
     except Exception as e:
         logger.error("[13.0.1.1] assign_swap_handler: %s", e, exc_info=True)
         await callback.answer("⚠️ Ошибка при замене участника.", show_alert=True)
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║                [13.0.1.2] refresh_deal_details  (helper)                 ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+async def refresh_deal_details(user_id: int, deal_id: int) -> None:
+    """
+    Обновляет содержимое уже открытого экрана деталей игры.
+    Используется assign_swap_handler и повторные show_deal вызовы.
+    """
+    msgs = bot_data.detail_blocks.get((user_id, deal_id))
+    if not msgs:
+        return  # нечего обновлять
+
+    header_msg = msgs[0]
+    # быстро перерисовать: удаляем все сообщения, кроме header
+    for m in msgs[1:]:
+        try:
+            await m.delete()
+        except Exception:
+            pass
+    msgs[:] = msgs[:1]  # оставили только header
+
+    # повторно вызываем show_deal для перерисовки (без мерцания)
+    dummy_cb = types.CallbackQuery(
+        id="refresh", from_user=types.User(id=user_id, is_bot=False, first_name=""),
+        chat_instance="", message=header_msg, data=f"show_deal_{deal_id}"
+    )
+    await show_deal_callback_handler(dummy_cb)
+
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -1689,6 +1816,55 @@ async def save_distribution_to_amocrm_handler(callback: types.CallbackQuery) -> 
     except Exception as e:
         logger.error("[13.0.3] save_distribution_to_amocrm_handler: %s", e, exc_info=True)
         await callback.answer("⚠️ Ошибка при сохранении.", show_alert=True)
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║        [13.0.4] delete_previous_private_messages  (v3.1 – 10-06-2025)    ║
+# ║  • единственный «пылесос» в проекте                                      ║
+# ║  • чистит last_user_messages, detail_blocks, messages_to_delete           ║
+# ║  • пишет DEBUG-сводку о результате                                        ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+async def delete_previous_private_messages(user_id: int) -> None:
+    """
+    Удаляет все сообщения, которые бот когда-либо отправил пользователю в ЛС:
+
+    • объекты Message из bot_data.last_user_messages
+    • «детальные» сообщения из bot_data.detail_blocks
+    • «сиротские» ID из bot_data.messages_to_delete
+
+    В конце пишет лог: сколько удалено успешно / сколько не получилось.
+    """
+    # 1️⃣ собираем объекты Message
+    msg_objects: list[types.Message] = bot_data.last_user_messages.pop(user_id, [])
+
+    # 2️⃣ добавляем detail_blocks пользователя
+    for key in [k for k in list(bot_data.detail_blocks) if k[0] == user_id]:
+        msg_objects += bot_data.detail_blocks.pop(key, [])
+
+    # 3️⃣ собираем «сиротские» message_id
+    orphan_ids: list[int] = bot_data.messages_to_delete.pop(user_id, [])
+
+    # 4️⃣ удаляем всё, что нашли
+    ok = fail = 0
+    for m in msg_objects:
+        try:
+            await m.delete()
+            ok += 1
+        except Exception:
+            fail += 1
+    for mid in orphan_ids:
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=mid)
+            ok += 1
+        except Exception:
+            fail += 1
+
+    logger.debug("[13.0.4] vacuum uid=%d → %d ok | %d fail", user_id, ok, fail)
+
+# История изменений:
+# v3.1 (10-06-2025) — подчистка комментариев, единый счётчик ok/fail.
+# v3.0 (08-06-2025) — объединённые last_user_messages + detail_blocks + orphan_ids.
+
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -1974,71 +2150,88 @@ async def create_distribution_table(spreadsheet_id: str, deals: List[Dict], dist
 # - 1.0: Базовая функция для Google Sheets.
 # - 1.1 (11.05.2025): Улучшено логирование, добавлены проверки.
 
+
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║                         [16.0] Отображение игр                            ║
+# ║                     [16.0] show_games (v3.2, single-screen)              ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
-# Кнопка-игра: 🎉 <Название> <HH:MM> <Пакет>  (пакет — только если задан)
-# version: 2.3 (обновлено под новые требования)
+# После показа списка игр в last_user_messages остаётся ровно один объект.
+# version: 3.2 (08.06.2025)
+from contextlib import asynccontextmanager
+import asyncio
+
+_user_locks: dict[int, asyncio.Lock] = {}
+
+@asynccontextmanager
+async def user_lock(uid: int):
+    """Пер-пользовательский асинхронный замок,
+    чтобы не было гонок при одновременных кликах."""
+    lock = _user_locks.setdefault(uid, asyncio.Lock())
+    await lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
 
 async def show_games(
     message: types.Message,
     user_id: int,
-    status_ids: List[str],
+    status_ids: list[str],
     title: str,
-    only_unassigned: bool | None = None
+    only_unassigned: bool | None = None,
 ) -> None:
-    try:
-        spreadsheet_id = bot_data.config.get("svetofor_spread_id")
-        if not spreadsheet_id:
+    async with user_lock(user_id):
+        logger.debug("[16.0] === show_games START for %d ===", user_id)
+
+        # 0. чистим предыдущий экран
+        await delete_previous_private_messages(user_id)
+
+        # 1. сделки
+        spread_id = bot_data.config.get("svetofor_spread_id")
+        if not spread_id:
             await message.answer("⚠️ Не указан ID таблицы «Светофор».")
-            logger.error("[16.0] show_games: svetofor_spread_id отсутствует")
+            logger.error("[16.0] show_games: нет spread_id")
             return
 
-        deals = await get_amocrm_deals(spreadsheet_id)
-        if not deals:
-            await message.answer(f"{title}\n😔 Игры не найдены.")
-            logger.info("[16.0] show_games: нет сделок")
-            return
+        deals = await get_amocrm_deals(spread_id)
+        now   = datetime.now(tz=MSK_TZ)
 
         if only_unassigned is None:
             only_unassigned = (status_ids == NEW_GAMES_STATUS_IDS)
 
-        now = datetime.now(tz=MSK_TZ)
         filtered = [
             d for d in deals
             if d["status_id"] in status_ids
                and d["event_datetime"] >= now
                and (not only_unassigned or not d["team_leads"])
         ]
+
         if not filtered:
             await message.answer(f"{title}\n😔 Подходящих игр нет.")
-            logger.info("[16.0] show_games: фильтры вернули пусто")
             return
 
         filtered.sort(key=lambda d: d["event_datetime"])
         filtered = filtered[:20]
-        bot_data.games_by_user[user_id] = filtered
 
+        # 2. клавиатура
         kb = InlineKeyboardBuilder()
-        for deal in filtered:
-            time_part = deal.get("event_time", "")
-            # Попытка взять пакет услуг, иначе оставить пустым
-            pkg = (deal.get("package") or deal.get("extra_services") or "").strip()
-            pkg_part = f" {pkg}" if pkg and pkg != "Не указано" else ""
-
-            btn_text = f"🎉 {deal['name']} {time_part}{pkg_part}"
-            kb.button(text=btn_text, callback_data=f"game_details_{deal['id']}")
-
+        for d in filtered:
+            date  = d["event_datetime"].strftime("%d.%m")
+            extra = d.get("package") or d.get("extra_services") or ""
+            extra = f" · {extra}" if extra and extra != "Не указано" else ""
+            kb.button(
+                text=f"🎉 {d['name']} — {date}{extra}",
+                callback_data=f"game_details_{d['id']}"
+            )
         kb.adjust(1)
-        await message.answer(f"{title}\nВыберите игру:", reply_markup=kb.as_markup())
-        logger.info("[16.0] show_games: отправлено %d игр пользователю %d", len(filtered), user_id)
 
-    except Exception as e:
-        logger.error("[16.0] show_games: ошибка для %d: %s", user_id, e, exc_info=True)
-        await message.answer("⚠️ Ошибка при загрузке списка игр.")
+        # 3. отправляем и оставляем ОДНО сообщение в истории
+        sent = await message.answer(f"{title}\nВыберите игру:", reply_markup=kb.as_markup())
 
+        bot_data.last_user_messages[user_id] = [sent]
+        bot_data.games_by_user[user_id]      = filtered
 
-
+        logger.info("[16.0] show_games DONE for %d (sent %d games)",
+                    user_id, len(filtered))
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
