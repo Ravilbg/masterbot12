@@ -1031,24 +1031,43 @@ async def _delete_trigger(msg: types.Message) -> None:
     except Exception:
         bot_data.messages_to_delete.setdefault(msg.from_user.id, []).append(msg.message_id)
 
-# ────────────── helper: «подкрашиваем» живое меню во время работы ───────────
+# ────────────── helper: обновляем / восстанавливаем главное меню ────────────
+# version: 1.2 (10.06.2025) — auto-fallback, если меню удалили вручную
+
 async def _refresh_menu(user_id: int) -> None:
     """
-    Обновляет клавиатуру (и при необходимости текст) единственного
-    сообщения-меню, чтобы кнопка «📋» превращалась в «📊» и обратно,
-    не создавая копий.
+    Обновляет клавиатуру главного сообщения-меню.
+    • Если сообщение ещё существует — просто меняем reply_markup.
+    • Если сообщение удалено (MessageNotModified, BadRequest, etc.) —
+      создаём новое с тем же текстом и запоминаем его ID.
     """
-    menu_id = getattr(bot_data, "menu_message_id", None)
-    if not menu_id:
+    new_kb = await get_main_menu(user_id)
+    if not new_kb:                          # у пользователя нет доступных действий
         return
+
+    menu_id = getattr(bot_data, "menu_message_id", None)
+
+    if menu_id:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=user_id,
+                message_id=menu_id,
+                reply_markup=new_kb
+            )
+            return                          # успех, на этом всё
+        except Exception as e:
+            logger.debug("[10.0] _refresh_menu: старое меню недоступно → %s", e)
+            bot_data.menu_message_id = None  # сбрасываем и переходим к созданию
+
+    # дошли сюда → меню нет, создаём новое
     try:
-        await bot.edit_message_reply_markup(
-            chat_id=user_id,
-            message_id=menu_id,
-            reply_markup=await get_main_menu(user_id) or ReplyKeyboardRemove()
-        )
-    except Exception:                       # меню могли удалить вручную
-        bot_data.menu_message_id = None
+        text = "🤖 Панель управления"        # короткий статичный заголовок
+        sent = await bot.send_message(user_id, text, reply_markup=new_kb)
+        bot_data.menu_message_id = sent.message_id
+        logger.debug("[10.0] _refresh_menu: создано новое меню id=%d", sent.message_id)
+    except Exception as e:
+        logger.error("[10.0] _refresh_menu: не удалось создать меню: %s", e, exc_info=True)
+
 
 # ─────────────────────────────── /start ─────────────────────────────────────
 @router.message(CommandStart())
@@ -1510,129 +1529,141 @@ async def generate_poll_report() -> str:
     return "📊 *Опрос создан. Выберите игру для просмотра и редактирования состава:*"
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║           [13.0.1] show_deal_callback_handler  (v5.4)                     ║
-# ║  • блок сохраняется и в detail_blocks, и в last_user_messages             ║
-# ║  • при открытии другой секции пылесос уничтожит прежние детали            ║
+# ║           [13.0.1] show_deal_callback_handler  (v5.6 – 10-06-2025)        ║
+# ║  • Пылесос: delete_previous_private_messages вызывается СРАЗУ            ║
+# ║  • Всегда остаётся единственный «живой» блок сообщений в ЛС              ║
+# ║  • Используется bot.send_message → не reply’им на удалённое сообщение    ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
 @router.callback_query(lambda c: c.data.startswith("show_deal_"))
 async def show_deal_callback_handler(callback: types.CallbackQuery) -> None:
+    """
+    Отображает состав команды выбранной игры.
+    Гарантирует, что предыдущий список/детали удалены и в личке остаётся
+    ровно один актуальный набор сообщений.
+    """
     user_id = callback.from_user.id
     deal_id = int(callback.data.split("_")[-1])
 
     try:
-        # удаляем предыдущие детали этого же юзера/игры
-        old_msgs = bot_data.detail_blocks.pop((user_id, deal_id), [])
-        for m in old_msgs:
-            try:
-                await m.delete()
-            except Exception:
-                pass
+        # ➊ Убираем всё старое (список игр, предыдущие детали, сироты)
+        await delete_previous_private_messages(user_id)
 
+        # ➋ Находим сделку в current_poll_deals
         deal = next((d for d in bot_data.current_poll_deals if d["id"] == deal_id), None)
         if not deal:
             await callback.answer("⚠️ Игра не найдена.", show_alert=True)
             return
 
-        # ── HEADER ---------------------------------------------------------
-        game     = deal["game_name"]
-        date     = deal["event_datetime"].strftime("%d.%m.%Y")
-        time     = deal["event_time"]
-        pkg      = (deal.get("package") or "—").strip()
-        pkg_icon = {"компакт": "🎒", "стандарт": "📦", "стандарт+": "📦➕",
-                    "премиум": "💎", "vip": "👑", "вип": "👑"}.get(pkg.lower(), "🎁")
-        players  = parse_players_count(deal.get("players"))
-
+        # ➌ Формируем HEADER
+        game        = deal["game_name"]
+        date_str    = deal["event_datetime"].strftime("%d.%m.%Y")
+        time_str    = deal.get("event_time", "—")
+        pkg         = (deal.get("package") or "—").strip()
+        pkg_icon    = {"компакт": "🎒", "стандарт": "📦", "стандарт+": "📦➕",
+                       "премиум": "💎", "vip": "👑", "вип": "👑"}.get(pkg.lower(), "🎁")
+        players_cnt = parse_players_count(deal.get("players"))
         header_text = (
-            f"🎮 *Игра:* {game}\n"
-            f"📅 *Дата:* {date}\n"
-            f"🕒 *Время:* {time}\n"
+            f"🎮 *{game}*\n"
+            f"📅 {date_str} · 🕒 {time_str}\n"
             f"📦 *Пакет:* {pkg_icon} {pkg}\n"
-            f"👥 *Игроки:* {players or '—'}"
+            f"👥 *Игроки:* {players_cnt or '—'}"
         )
-        msgs = [await callback.message.answer(header_text, parse_mode="Markdown")]
 
-        # ── СПИСКИ УЧАСТНИКОВ ---------------------------------------------
+        msgs: list[types.Message] = [
+            await bot.send_message(user_id, header_text, parse_mode="Markdown")
+        ]
+
+        # ➍ Собираем респондентов
         respondents = [
             u
-            for pdata in bot_data.responses.values()
-            for u in pdata["deals"].get(deal_id, [])
+            for p in bot_data.responses.values()
+            for u in p["deals"].get(deal_id, [])
         ]
-        role_cfg    = _get_role_cfg(game)
-        need_main   = role_cfg["main_leaders"]
-        need_assist = role_cfg["assistants"]
-        need_admin  = 1 if pkg.lower() in {"стандарт", "стандарт+", "премиум", "vip", "вип"} else 0
-        used: set[int] = set()
+        role_cfg     = _get_role_cfg(game)
+        need_main    = role_cfg["main_leaders"]
+        need_assist  = role_cfg["assistants"]
+        need_admin   = 1 if pkg.lower() in {"стандарт", "стандарт+", "премиум", "vip", "вип"} else 0
+        used_uids: set[int] = set()
 
-        async def render(title: str, rtype: str, required: int) -> None:
+        async def render_block(title: str, rtype: str, required: int) -> None:
             chosen, alt = [], []
             for u in respondents:
-                if u["user_id"] in used:
+                if u["user_id"] in used_uids:
                     continue
-                st = await get_user_status_from_svetofor(u["user_id"], game)
-                if rtype == "main"   and st == "green":
-                    (chosen if len(chosen) < required else alt).append((u, st))
-                elif rtype == "assist" and st in {"green", "yellow"}:
-                    (chosen if len(chosen) < required else alt).append((u, st))
-                elif rtype == "admin"  and u.get("is_admin_eligible"):
+                status = await get_user_status_from_svetofor(u["user_id"], game)
+                if rtype == "main" and status == "green":
+                    (chosen if len(chosen) < required else alt).append((u, status))
+                elif rtype == "assist" and status in {"green", "yellow"}:
+                    (chosen if len(chosen) < required else alt).append((u, status))
+                elif rtype == "admin" and u.get("is_admin_eligible"):
                     (chosen if len(chosen) < required else alt).append((u, "🛡️"))
 
-            icon  = {"main": "🧭", "assist": "🛟", "admin": "🛡️"}[rtype]
-            block = [
-                f"───── {icon} *{title.upper()}* ─────",
-                f"{'✅' if len(chosen) >= required else '❌'} {len(chosen)}/{required}"
-            ]
+            icon = {"main": "🧭", "assist": "🛟", "admin": "🛡️"}[rtype]
+            status_line = f"{'✅' if len(chosen) >= required else '❌'} {len(chosen)}/{required}"
+            block_lines = [f"───── {icon} *{title.upper()}* ─────", status_line]
+
             if not chosen:
-                block.append("– —")
+                block_lines.append("– —")
             for u, st in chosen:
-                used.add(u["user_id"])
-                marker = "🟢" if st == "green" else "🟡" if st == "yellow" else st
-                block.append(f"– {u['first_name']} {u['last_name_initial']} {marker}")
+                used_uids.add(u["user_id"])
+                mark = "🟢" if st == "green" else "🟡" if st == "yellow" else st
+                block_lines.append(f"– {u['first_name']} {u['last_name_initial']} {mark}")
 
-            msgs.append(await callback.message.answer("\n".join(block), parse_mode="Markdown"))
+            msgs.append(await bot.send_message(user_id, "\n".join(block_lines), parse_mode="Markdown"))
 
+            # альтернатива (если есть)
             if alt:
                 kb = InlineKeyboardBuilder()
                 for u, st in alt:
-                    name = f"{u['first_name']} {u['last_name_initial']}"
-                    mark = "🟢" if st == "green" else "🟡" if st == "yellow" else st
+                    mark = "🟢" if st == "green" else "🟡"
                     kb.button(
-                        text=f"{name} {mark}",
+                        text=f"{u['first_name']} {u['last_name_initial']} {mark}",
                         callback_data=f"swap_{deal_id}_{rtype}_{u['user_id']}"
                     )
                 kb.adjust(1)
-                msgs.append(await callback.message.answer("🔁 Альтернатива:", reply_markup=kb.as_markup()))
+                msgs.append(await bot.send_message(
+                    user_id, "🔁 Альтернатива:", reply_markup=kb.as_markup()
+                ))
 
-        await render("Ведущие",   "main",   need_main)
-        await render("Помощники", "assist", need_assist)
-        await render("Админ",     "admin",  need_admin)
+        await render_block("Ведущие",   "main",   need_main)
+        await render_block("Помощники", "assist", need_assist)
+        await render_block("Админ",     "admin",  need_admin)
 
-        # ── СТАЖЁРЫ --------------------------------------------------------
+        # ➎ СТАЖЁРЫ
         interns = [
             u for u in respondents
-            if u["user_id"] not in used and
+            if u["user_id"] not in used_uids and
                await get_user_status_from_svetofor(u["user_id"], game) == "red"
         ]
         if interns:
-            iblock = ["───── 👷 *СТАЖЁРЫ* ─────"]
-            iblock += [f"– {u['first_name']} {u['last_name_initial']} 🔴" for u in interns]
-            msgs.append(await callback.message.answer("\n".join(iblock), parse_mode="Markdown"))
+            iblock = ["───── 👷 *СТАЖЁРЫ* ─────"] + [
+                f"– {u['first_name']} {u['last_name_initial']} 🔴" for u in interns
+            ]
+            msgs.append(await bot.send_message(user_id, "\n".join(iblock), parse_mode="Markdown"))
 
-        # ── НАЗАД ----------------------------------------------------------
+        # ➏ BACK-кнопка
         back_kb = InlineKeyboardBuilder()
         back_kb.button(text="⬅️ Назад к списку", callback_data="back_to_games_list")
         back_kb.adjust(1)
-        msgs.append(await callback.message.answer("⬅️", reply_markup=back_kb.as_markup()))
+        msgs.append(await bot.send_message(user_id, "⬅️", reply_markup=back_kb.as_markup()))
 
-        # сохраняем для «пылесоса»
+        # ➐ Сохраняем активный блок для последующего пылесоса
+        bot_data.last_user_messages[user_id] = msgs
         bot_data.detail_blocks[(user_id, deal_id)] = msgs
-        bot_data.last_user_messages[user_id] = msgs     # ← ключевой момент
 
         await callback.answer()
 
     except Exception as exc:
-        logger.error("[13.0.1] show_deal_callback_handler v5.4: %s", exc, exc_info=True)
+        logger.error("[13.0.1] show_deal_callback_handler v5.6: %s", exc, exc_info=True)
         await callback.answer("⚠️ Ошибка при отображении состава.", show_alert=True)
+
+# ────────────────────────────────────────────────────────────────────────────
+# История изменений:
+# v5.6 – 10-06-2025 — добавлен глобальный vacuum-шаг; отправка сообщений через
+#                     bot.send_message; гарантирован единственный активный блок.
+# v5.5 – 08-06-2025 — первоначальное решение с vacuum; без правок send_message.
+# v5.4 – 07-06-2025 — старая реализация без полноценного пылесоса.
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
