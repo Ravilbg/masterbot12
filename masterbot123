@@ -50,6 +50,8 @@ def get_distribution_keyboard() -> InlineKeyboardMarkup:
 # Описание: Инициализация системы логирования для вывода в консоль и файл с улучшенной детализацией.
 # version: 1.2
 
+# E.Ermakov. Just to create Pull Request
+
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
