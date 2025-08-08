@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable, Any, TypeVar
 
 # ── пути ---------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent.parent
+# Определяем BASE_DIR в любых окружениях (интерактивных и файловых)
+try:
+    BASE_DIR = Path(__file__).resolve().parent.parent
+except NameError:
+    BASE_DIR = Path(os.getcwd()).resolve()
 CONFIG_JSON = BASE_DIR / "config.json"
 
 # ── bootstrap: json → env ----------------------------------------------------
@@ -16,28 +20,45 @@ if CONFIG_JSON.exists():
             _raw = json.load(_f)
         for _k, _v in _raw.items():
             env_key = _k.upper()
-            # пересылаем только «простые» типы и если var ещё не определён
             if env_key not in os.environ and not isinstance(_v, (dict, list)):
                 os.environ[env_key] = str(_v)
     except Exception:
         pass
 
-# ── dual-import для двух версий Pydantic -------------------------------------
+# ── dual-import для Pydantic или заглушек -------------------------------------
+_T = TypeVar("_T")
 try:
     from pydantic_settings import BaseSettings
     from pydantic import Field, field_validator
     _V2 = True
-except ModuleNotFoundError:
-    from pydantic import BaseSettings, Field, validator  # type: ignore
+except (ModuleNotFoundError, ImportError):
+    # Заглушки для среды без pydantic
+    class BaseSettings:
+        def __init_subclass__(cls, **kwargs):
+            super().__init_subclass__(**kwargs)
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items(): setattr(self, k, v)
+    def Field(default: Any = None, env: str = "", default_factory: Callable[[], Any] = None) -> Any:
+        # поддержка default и default_factory
+        if default_factory is not None:
+            return default_factory()
+        return default
+    def validator(field_name: str, pre: bool = False, always: bool = False) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def wrap(fn: Callable[..., Any]) -> Callable[..., Any]: return fn
+        return wrap
+    def field_validator(field_name: str, mode: str = "before") -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def wrap(fn: Callable[..., Any]) -> Callable[..., Any]: return fn
+        return wrap
     _V2 = False
 
-def _make_validator(field_name: str):
+
+def _make_validator(field_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     if _V2:
-        def wrap(fn):
+        def wrap(fn: Callable[..., Any]) -> Callable[..., Any]:
             return field_validator(field_name, mode="before")(fn)  # type: ignore
         return wrap
     else:
-        def wrap(fn):
+        def wrap(fn: Callable[..., Any]) -> Callable[..., Any]:
             return validator(field_name, pre=True, always=True)(fn)  # type: ignore
         return wrap
 
@@ -59,6 +80,10 @@ class Settings(BaseSettings):
     AMO_DOMAIN: str = Field(..., env="AMO_DOMAIN")
     PIPELINE_ID: Optional[int] = None
     SVETOFOR_SPREAD_ID: str = Field(..., env="SVETOFOR_SPREAD_ID")
+
+    # — новые параметры для интеграции чата и базы знаний —
+    POLLS_CHAT_ID: int = Field(-1001234567890, env="POLLS_CHAT_ID")
+    GUIDE_BOT_LINK: str = Field("https://t.me/guide_bot_link", env="GUIDE_BOT_LINK")
 
     # — time & cache —
     DATE_FILTER_DAYS: int = 30
@@ -93,7 +118,6 @@ class Settings(BaseSettings):
     def _detect_creds(cls, v: Optional[str]) -> str:
         if v:
             return v
-        # пробуем типовые имена в BASE_DIR
         for name in ("svetofor-credentials.json", "service-account-key.json", "credentials.json"):
             p = BASE_DIR / name
             if p.exists():
@@ -101,7 +125,7 @@ class Settings(BaseSettings):
         return ""
 
     @_make_validator("GAME_ROLE_MAPPING")
-    def _load_role_map(cls, v: Dict | None):
+    def _load_role_map(cls, v: Dict | None) -> Dict[str, Dict[str, int]]:
         if v:
             return v
         if CONFIG_JSON.exists():
@@ -123,7 +147,7 @@ class Settings(BaseSettings):
         }
 
     @_make_validator("AMOCRM_FIELDS")
-    def _load_amocrm_fields(cls, v: Dict | None):
+    def _load_amocrm_fields(cls, v: Dict | None) -> Dict[str, str]:
         if v:
             return v
         if CONFIG_JSON.exists():
@@ -149,4 +173,26 @@ class Settings(BaseSettings):
 
 # ── экспорт singleton --------------------------------------------------------
 settings = Settings()
+# Создаем директорию для логов, если не существует
 os.makedirs(settings.LOG_DIR, exist_ok=True)
+
+
+# ════════════════════════════════════════════════════════════════
+#                              ТЕСТЫ
+# ════════════════════════════════════════════════════════════════
+
+def _test():
+    # Проверяем, что настройки загружаются без ошибок
+    s = Settings()
+    assert isinstance(s.VERSION, str), "VERSION должен быть строкой"
+    assert isinstance(s.POLLS_CHAT_ID, int), "POLLS_CHAT_ID должен быть int"
+    assert s.POLLS_CHAT_ID < 0, "ID чата группы должен быть отрицательным"
+    assert s.GUIDE_BOT_LINK.startswith("https://t.me/"), "Некорректная ссылка на GUIDE_BOT_LINK"
+    # Проверяем работу валидаторов
+    assert isinstance(s.GAME_ROLE_MAPPING, dict), "GAME_ROLE_MAPPING должен быть словарём"
+    assert isinstance(s.AMOCRM_FIELDS, dict), "AMOCRM_FIELDS должен быть словарём"
+    print("✅ core/config.py tests passed")
+
+
+if __name__ == "__main__":
+    _test()
