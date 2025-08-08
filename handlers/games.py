@@ -74,7 +74,7 @@ async def _refresh_menu(user_id: int) -> None:
     Используется после закрытия inline-экранов.
     """
     # локальный импорт, чтобы не было циклических зависимостей
-    from handlers.polls_lifecycle import get_main_menu
+    from core.menu import get_main_menu
 
     try:
         kb = await get_main_menu(user_id)

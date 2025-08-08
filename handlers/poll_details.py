@@ -70,14 +70,42 @@ def _tag_uid(tag: str) -> Optional[int]:
 
 def _role_cfg(game_name: str) -> Dict[str, int]:
     """
-    Конфиг ролей для *game_name* из settings.GAME_ROLE_MAPPING
-    (регистр игнорируется). Если игра не найдена — 1 ведущий, 0 ассистентов.
+    Возвращает конфиг ролей для *game_name* из settings.GAME_ROLE_MAPPING
+    с tolerant-поиском.
+
+    Алгоритм
+    --------
+    1) exact:  нормализованные строки совпадают полностью;
+    2) sub:    одна содержит другую;
+    3) fuzzy:  SequenceMatcher.ratio() > 0.80;
+    4) fallback → {"main_leaders": 1, "assistants": 0}.
     """
-    norm = game_name.strip().lower()
+    import re                                         # локальный импорт
+    from difflib import SequenceMatcher               #   ───//───
+
+    _re = re.compile(r"[^\w\d]+", re.UNICODE)
+
+    def _clean(s: str) -> str:
+        return _re.sub(" ", s).lower().strip()
+
+    norm = _clean(game_name)
+    best_ratio = 0.0
+    best_cfg: Dict[str, int] | None = None
+
     for key, cfg in settings.GAME_ROLE_MAPPING.items():
-        if key.lower() == norm:
+        k_norm = _clean(key)
+
+        if norm == k_norm or norm in k_norm or k_norm in norm:   # exact / sub
             return cfg
-    return {"main_leaders": 1, "assistants": 0}
+
+        ratio = SequenceMatcher(None, norm, k_norm).ratio()      # fuzzy
+        if ratio > best_ratio:
+            best_ratio, best_cfg = ratio, cfg
+
+    if best_ratio > 0.80 and best_cfg:
+        return best_cfg                                          # type: ignore[return-value]
+
+    return {"main_leaders": 1, "assistants": 0}                  # fallback
 
 
 # ███ [1.3] Svetofor-cached status
@@ -86,8 +114,8 @@ async def _status_cached(uid: int, game: str) -> str:
     """
     Безопасно получает 'green' | 'yellow' | 'red' | '' из «Светофора».
 
-    • Результат кешируется на *settings.CACHE_TTL_SECONDS*.  
-    • Любая ошибка внутри fetcher() или в кеше не прерывает работу —  
+    • Результат кешируется на *settings.CACHE_TTL_SECONDS*.
+    • Любая ошибка внутри fetcher() или в кеше не прерывает работу —
       пишем warning и возвращаем ''.
     """
     key = f"sv:{uid}:{game}".lower()
@@ -160,7 +188,6 @@ async def _test() -> None:
 if __name__ == "__main__":
     import asyncio
     asyncio.run(_test())
-
 
 # ════════════════════════════════════════════════════════════════════
 # 2.  Detail-view: основной callback-handler

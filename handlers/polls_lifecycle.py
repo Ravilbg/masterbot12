@@ -1,15 +1,10 @@
 # ███ [0] IMPORTS
 # --------------------------------------------------------------------
-# ПРИМЕЧАНИЕ:
-# •  «from __future__ import annotations» ОБЯЗАТЕЛЬНО должен идти
-#    самой первой строкой файла, иначе Python выдаёт SyntaxError.
-# •  Импортированы только реально используемые типы/функции —
-#    Pylance больше не ругается на «неиспользуемые» или «неизвестные».
-
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Set
 
@@ -20,7 +15,9 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
 )
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from pytz import timezone
+from difflib import SequenceMatcher
 
 from core.config import settings
 from core.db import get_user_info, get_all_leader_uids
@@ -28,6 +25,7 @@ from core.state import state
 from core.utils import delete_previous_private_messages, truncate
 from handlers.games import _delete_trigger, _refresh_menu
 from handlers.poll_details import refresh_deal_details
+from handlers.guide import PROFILE_BUTTON_TEXT
 from services.amocrm import get_amocrm_deals
 from services.gsheets import get_user_status_from_svetofor
 
@@ -37,53 +35,17 @@ router = Router()
 MSK_TZ = timezone("Europe/Moscow")
 
 # История изменений:
-#   • 2025-07-31 — импорт future.annotations перемещён в начало,
-#                  удалены лишние зависимости; Pylance OK.
+#   • 2025-07-31 — перенёс future.annotations, убрал лишние импорты
+#   • 2025-08-03 — добавлен PROFILE_BUTTON_TEXT и ReplyKeyboardBuilder
+
 
 # ════════════════════════════════════════════════════════════════════
 # [1] ГЛАВНОЕ МЕНЮ
 # ════════════════════════════════════════════════════════════════════
-async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup | None:
-    """
-    Формирует reply-клавиатуру для пользователя в зависимости от
-    его роли и текущего состояния цикла распределения.
-    """
-    ui = await get_user_info(user_id) or {}
-    role = ui.get("role", "")
-    buttons: List[types.KeyboardButton] = []
+# Единственный источник меню теперь в core.menu.
+# Оставляем ре-экспорт, чтобы старые импорты не упали.
+from core.menu import get_main_menu  # noqa: F401
 
-    # ── блок «Игры» ─────────────────────────────────────────────────
-    if role in settings.ACCESS["games"]:
-        buttons.extend(
-            [
-                types.KeyboardButton(text="📅 Новые игры"),
-                types.KeyboardButton(text="✅ Распределённые игры"),
-            ]
-        )
-
-    # ── блок «Опрос / цикл» ────────────────────────────────────────
-    if role in settings.ACCESS["poll"]:
-        if state.coordination_cycle_active:
-            buttons.extend(
-                [
-                    types.KeyboardButton(text="📊 Отчёт по опросу"),
-                    types.KeyboardButton(text="✉️ Рассылка уведомлений"),
-                    types.KeyboardButton(text="📈 Статистика игр"),
-                    types.KeyboardButton(text="⏹️ Завершить цикл"),
-                ]
-            )
-        else:
-            buttons.append(types.KeyboardButton(text="📋 Создать опрос"))
-
-    if not buttons:
-        return None
-
-    # по две кнопки в строке
-    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
-
-# История изменений:
-#   • 2025-07-30 — мелкие правки docstring, переименование переменных
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -91,30 +53,36 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup | None:
 # ════════════════════════════════════════════════════════════════════
 
 # ── 2.0  Конфиг ролей для игры ─────────────────────────────────────
+# FIX 2025-08-03 — расширенный tolerant-поиск:
+#   • точное совпадение → подстрока → fuzzy-ratio > 0.8.
+#   • исключены дубли кода.
+# --------------------------------------------------------------------
+_RE_NON_ALNUM = re.compile(r"[^\w\d]+", re.UNICODE)
+
+def _clean(txt: str) -> str:
+    """«Понижает шум»: удаляет всё, кроме букв/цифр, приводит к lower()."""
+    return _RE_NON_ALNUM.sub(" ", txt).lower().strip()
+
 def _role_cfg(game_name: str) -> Dict[str, int]:
     """
-    Возвращает словарь вида {"main_leaders": X, "assistants": Y}
-    для *game_name*, игнорируя регистр и лишние пробелы.
-    Если игра не найдена — возвращается конфиг «1 ведущий / 0 ассистентов».
+    Возвращает конфиг ролей {"main_leaders": X, "assistants": Y}
+    для *game_name* с tolerant-поиском.
     """
-    norm = game_name.strip().lower()
+    norm = _clean(game_name)
+    best_ratio = 0.0
+    best_cfg: Dict[str, int] | None = None
+
     for key, cfg in settings.GAME_ROLE_MAPPING.items():
-        if key.strip().lower() == norm:
+        k_norm = _clean(key)
+        if norm == k_norm or norm in k_norm or k_norm in norm:
             return cfg
+        ratio = SequenceMatcher(None, norm, k_norm).ratio()
+        if ratio > best_ratio:
+            best_ratio, best_cfg = ratio, cfg
+
+    if best_ratio > 0.80 and best_cfg:
+        return best_cfg  # type: ignore[return-value]
     return {"main_leaders": 1, "assistants": 0}
-
-
-async def _is_admin_role(uid: int) -> bool:
-    """
-    True, если пользователь с *uid* имеет роль администратора/руководителя.
-    """
-    info = await get_user_info(uid) or {}
-    return info.get("role", "").lower().strip() in {
-        "администратор",
-        "админ",
-        "руководитель",
-        "administrator",
-    }
 
 # ────────────────────────────────────────────────────────────────────
 # 2.1  Напоминания «Отметьтесь в опросе»
@@ -128,7 +96,6 @@ async def _send_reminders() -> None:
         logger.debug("[reminders] skip: cycle finished/paused")
         return
 
-    # uid’ы, кто уже откликнулся
     responded: Set[int] = {
         u["user_id"]
         for pdata in state.responses.values()
@@ -138,7 +105,6 @@ async def _send_reminders() -> None:
         )
         for u in lst
     }
-
     pending = set(await get_all_leader_uids()) - responded
     if not pending:
         logger.debug("[reminders] everyone answered, nothing to ping")
@@ -149,16 +115,15 @@ async def _send_reminders() -> None:
         try:
             await bot.send_message(uid, "👋 Напоминание! Отметьтесь в опросе.")
             logger.debug("[reminders] ping sent to %d", uid)
-        except Exception as exc:  # pragma: no cover  – неважно для тестов
+        except Exception as exc:
             logger.warning("[reminders] ping to %d FAILED: %s", uid, exc)
-
 
 def _schedule_reminders() -> None:
     """
-    Планирует два звонка `_send_reminders()` через 6 ч и 18 ч.
-    Сохраняет таймеры в state.reminder_tasks для последующей отмены.
+    Планирует два вызова `_send_reminders()` через 6 ч и 18 ч.
+    Сохраняет таймеры в state.reminder_tasks.
     """
-    _cancel_reminders()  # сбрасываем прежние, если были
+    _cancel_reminders()
     loop = asyncio.get_event_loop()
     for hours in (6, 18):
         handle = loop.call_later(
@@ -168,10 +133,9 @@ def _schedule_reminders() -> None:
         state.reminder_tasks.append(handle)
     logger.debug("[reminders] scheduled (%s)", ", ".join(f"{h} h" for h in (6, 18)))
 
-
 def _cancel_reminders() -> None:
     """
-    Останавливает все запланированные reminder-таймеры и очищает список.
+    Отменяет все запланированные напоминания и очищает список.
     """
     for h in state.reminder_tasks:
         try:
@@ -188,7 +152,7 @@ def _cancel_reminders() -> None:
 async def _request_confirmations() -> None:
     """
     Создаёт в admin-чате пост «Подтвердите “+”» и помечает, что он уже отправлен.
-    Повторных вызовов не делает, если пост уже есть.
+    Не дублирует публикацию, если уже был вызван.
     """
     if state.manual_confirm_requested:
         logger.debug("[confirm_post] already requested → skip")
@@ -211,20 +175,11 @@ async def _request_confirmations() -> None:
 # ────────────────────────────────────────────────────────────────────
 async def _refresh_detail_views(impacted: Set[int], refresh_all: bool) -> None:
     """
-    Перерисовывает открытые detail-view’ы.
-
-    Parameters
-    ----------
-    impacted    : set[int]
-        id игр, в которых что-то изменилось.
-    refresh_all : bool
-        True → обновить все карточки (когда изменение затрагивает
-        глобальный состав, например появление/удаление «🛡 Админом»).
+    Перерисовывает открытые detail-view’ы пользователей.
     """
     if refresh_all:
         impacted = {d["id"] for d in state.current_poll_deals}
 
-    # Собираем задачи на перерисовку
     tasks = [
         refresh_deal_details(uid, deal_id)
         for (uid, deal_id) in list(state.detail_blocks)
@@ -237,6 +192,7 @@ async def _refresh_detail_views(impacted: Set[int], refresh_all: bool) -> None:
     logger.debug("[details] refreshing %d view(s) for deals: %s",
                  len(tasks), ", ".join(map(str, impacted)))
     await asyncio.gather(*tasks, return_exceptions=True)
+
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -375,45 +331,74 @@ async def create_poll_handler(message: types.Message) -> None:
 # ════════════════════════════════════════════════════════════════════
 # [4] ОТЧЁТ / КЛАВИАТУРА
 # ════════════════════════════════════════════════════════════════════
-def _merge_keyboards(k1: InlineKeyboardMarkup, k2: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=k1.inline_keyboard + k2.inline_keyboard)
+def _merge_keyboards(
+    k1: InlineKeyboardMarkup,
+    k2: InlineKeyboardMarkup,
+) -> InlineKeyboardMarkup:
+    """
+    Склеивает две Inline-клавиатуры, сохраняя порядок строк.
+    Используется при формировании личного дашборда лидера:
+      • k1 — кнопки игр,
+      • k2 — action-панель (approve/refresh и т. д.).
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[*k1.inline_keyboard, *k2.inline_keyboard]
+    )
 
 
 async def generate_poll_report() -> str:
-    """Строит текст отчёта + state.distribution_keyboard."""
+    """
+    Строит текст отчёта и заполняет `state.distribution_keyboard`.
+
+    • Для каждой игры показывает «✅/❌», название и дату.
+    • Если минимум набран — добавляет кнопку «👍 Утвердить».
+    • Когда готова хотя бы одна игра — добавляет «Утвердить все».
+    """
     if not state.current_poll_deals or not state.responses:
         return "⚠️ Нет активных опросов."
 
     keyboard: List[List[InlineKeyboardButton]] = []
+    any_ready = False
+
     for deal in state.current_poll_deals:
         did = deal["id"]
         if did in state.deal_force_closed:
             continue
+
         ready = await _is_deal_ready(did)
+        any_ready |= ready
         icon = "✅" if ready else "❌"
 
-        logger.debug(
-            "[report] deal=%d %s ready=%s",
-            did,
-            deal["game_name"],
-            ready,
-        )
-
-        row = [
+        row: List[InlineKeyboardButton] = [
             InlineKeyboardButton(
                 text=f"{icon} {deal['game_name']} — {deal['event_datetime']:%d.%m}",
                 callback_data=f"show_deal_{did}",
             )
         ]
         if ready:
-            row.append(InlineKeyboardButton(text="👍 Утвердить", callback_data=f"approve_deal_{did}"))
+            row.append(
+                InlineKeyboardButton(
+                    text="👍 Утвердить",
+                    callback_data=f"approve_deal_{did}",
+                )
+            )
         keyboard.append(row)
 
-    if any(state.current_deal_ready.get(d["id"]) for d in state.current_poll_deals):
-        keyboard.append([InlineKeyboardButton(text="Утвердить все", callback_data="approve_all_ready")])
+        logger.debug(
+            "[report] deal_id=%d ready=%s (%s)",
+            did,
+            ready,
+            deal["game_name"],
+        )
+
+    if any_ready:
+        keyboard.append(
+            [InlineKeyboardButton(text="Утвердить все", callback_data="approve_all_ready")]
+        )
 
     state.distribution_keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard)
     return "📊 *Опрос создан. Выберите игру:*"
+
 # ███ [4.x] Вспом. клавиатура отчёта и __all__
 # --------------------------------------------------------------------
 def _build_report_keyboard() -> InlineKeyboardMarkup:
@@ -822,16 +807,35 @@ async def clear_poll_data(user_id: int) -> None:
 # ███ [99] _TEST
 # --------------------------------------------------------------------
 async def _test() -> None:
-    """Smoke-тест get_main_menu и generate_poll_report (пустой)."""
-    uid = 1
-    state.coordination_cycle_active = True
-    menu = await get_main_menu(uid)
-    assert any("✉️ Рассылка уведомлений" in b.text for row in menu.keyboard for b in row)
-    state.current_poll_deals = []
-    state.responses = {}
-    assert await generate_poll_report() == "⚠️ Нет активных опросов."
-    print("handlers/polls_lifecycle OK")
+    """
+    Smoke-тест get_main_menu и generate_poll_report (пустой),
+    подменяем get_user_info на фиктивную, чтобы были кнопки.
+    """
+    # подменяем get_user_info, чтобы роль была в ACCESS["poll"]
+    orig = get_user_info
+    async def fake_get_user_info(uid: int) -> dict:
+        return {"role": settings.ACCESS["poll"][0]}
+    globals()["get_user_info"] = fake_get_user_info
 
+    try:
+        uid = 1
+        state.coordination_cycle_active = True
+        menu = await get_main_menu(uid)
+        assert menu is not None, "Меню не должно быть None для роли poll"
+        # проверяем, что кнопка «✉️ Рассылка уведомлений» действительно есть
+        assert any(
+            btn.text == "✉️ Рассылка уведомлений"
+            for row in menu.keyboard
+            for btn in row
+        ), "Нет кнопки «✉️ Рассылка уведомлений» в меню"
+        # проверяем отчёт
+        state.current_poll_deals = []
+        state.responses = {}
+        assert await generate_poll_report() == "⚠️ Нет активных опросов."
+        print("handlers/polls_lifecycle OK")
+    finally:
+        # восстанавливаем оригинальную функцию
+        globals()["get_user_info"] = orig
 
 if __name__ == "__main__":
     import asyncio
