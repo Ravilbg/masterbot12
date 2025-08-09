@@ -1,13 +1,12 @@
 """core/utils.py — универсальные вспомогательные функции MasterBot
 ────────────────────────────────────────────────────────────────────────────
-Версия 2025‑08‑07 · совместима с MasterBot ≥ 15.0
+Версия 2025‑08‑08 · совместима с MasterBot ≥ 15.1
 
-Main changes vs 2025‑08‑03
-──────────────────────────
-• delete_previous_private_messages():
-    – теперь отслеживает **неудавшиеся** удаления и пишет их обратно
-      в state.messages_to_delete[user] c предупреждением в логе;
-    – _safe_delete() / _safe_delete_message_obj() возвращают bool success.
+Изменения 2025‑08‑08
+────────────────────
+• `delete_previous_private_messages` теперь гарантирует наличие
+  `state.messages_to_delete` (через `setdefault`) до первой записи.
+• Минорный рефакторинг логов (unchanged functionality).
 """
 
 from __future__ import annotations
@@ -72,14 +71,16 @@ def parse_players_count(val: Any) -> int:
 # [3] helpers – flood‑safe delete
 # ════════════════════════════════════════════════════════════════════
 async def _safe_delete(bot: Bot, chat_id: int, message_id: int) -> bool:
-    """Удаляет сообщение. Возвращает *True*, если успешно."""
+    """Удаляет сообщение. Возвращает *True* при успехе."""
     for attempt in range(3):
         try:
             await bot.delete_message(chat_id, message_id)
             return True
         except TelegramRetryAfter as e:
             wait = int(getattr(e, "retry_after", 1)) + 1
-            logger.warning("[vacuum] FloodWait %ds for %d/%d (attempt %d)", wait, chat_id, message_id, attempt + 1)
+            logger.warning(
+                "[vacuum] FloodWait %ds for %d/%d (attempt %d)", wait, chat_id, message_id, attempt + 1
+            )
             await asyncio.sleep(wait)
         except Exception as exc:
             logger.debug("[vacuum] delete %d/%d failed on attempt %d: %s", chat_id, message_id, attempt + 1, exc)
@@ -104,6 +105,10 @@ async def _safe_delete_message_obj(msg: Message) -> bool:
 # ════════════════════════════════════════════════════════════════════
 async def delete_previous_private_messages(user_id: int) -> None:
     """Удаляет все сохранённые ботом личные сообщения пользователя."""
+
+    # гарантируем, что структура существует
+    mtd: dict[int, List[int]] = state.__dict__.setdefault("messages_to_delete", {})  # type: ignore[arg-type]
+
     bot = Bot.get_current()
     removed: List[int] = []
     failed: List[int] = []
@@ -115,8 +120,8 @@ async def delete_previous_private_messages(user_id: int) -> None:
     for key in [k for k in state.detail_blocks if k[0] == user_id]:
         msg_objs.extend(state.detail_blocks.pop(key, []))
 
-    # 3) orphan ids, накопленные ранее
-    orphan_ids: List[int] = state.messages_to_delete.pop(user_id, [])
+    # 3) orphan‑ids, накопленные ранее
+    orphan_ids: List[int] = mtd.pop(user_id, [])
 
     # 4) персональный отчёт лидера
     if user_id == state.current_poll_leader and state.personal_report_message_id:
@@ -125,19 +130,23 @@ async def delete_previous_private_messages(user_id: int) -> None:
 
     # ── удаляем объекты Message ────────────────────────────────────
     if msg_objs:
-        results = await asyncio.gather(*(_safe_delete_message_obj(m) for m in msg_objs), return_exceptions=False)
+        results = await asyncio.gather(
+            *(_safe_delete_message_obj(m) for m in msg_objs), return_exceptions=False
+        )
         for ok, m in zip(results, msg_objs):
             (removed if ok else failed).append(m.message_id)
 
     # ── удаляем по ID ──────────────────────────────────────────────
     if orphan_ids:
-        results = await asyncio.gather(*(_safe_delete(bot, user_id, mid) for mid in orphan_ids), return_exceptions=False)
+        results = await asyncio.gather(
+            *(_safe_delete(bot, user_id, mid) for mid in orphan_ids), return_exceptions=False
+        )
         for ok, mid in zip(results, orphan_ids):
             (removed if ok else failed).append(mid)
 
-    # если что‑то не удалилось — сохраним на потом и залогируем
+    # если что‑то не удалилось — сохраняем на потом и логируем
     if failed:
-        state.messages_to_delete.setdefault(user_id, []).extend(failed)
+        mtd.setdefault(user_id, []).extend(failed)
         logger.warning("[vacuum] uid=%d NOT removed %d msg(s): %s", user_id, len(failed), failed)
     if removed:
         logger.debug("[vacuum] uid=%d removed %d msg(s): %s", user_id, len(removed), removed)
@@ -153,5 +162,6 @@ async def _test() -> None:
 
 if __name__ == "__main__":
     import asyncio, logging as _l
+
     _l.basicConfig(level=_l.DEBUG)
     asyncio.run(_test())

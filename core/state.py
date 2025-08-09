@@ -3,14 +3,14 @@
 Хранит все временные данные процесса: конфиг, кеши, состояние опроса,
 таймеры напоминаний и прочие «живые» переменные.
 
-Дополнения v12.93-cycle (2025-07-22)
-• confirmed_users, reminder_tasks, force_closed, deal_force_closed,
-  manual_confirm_requested — для цикла распределения.
-• current_deal_ready, all_ready_notified, pending_plus — логика «готово / +».
-• locked_distribution — структура тегов после подтверждения лидером.
-• poll_message_ids — трекинг опубликованных опросов.
-• register_message / register_poll — для пылесоса и удаления опросов.
-• group_menu_message_id — хранит ID закреплённого меню в группах.
+Дополнения v15.2 · 2025-08-09
+• **pending_confirmations** — deal_id → {"distribution": {...}, "confirmed": set()}.
+• **confirmed**             — deal_id → {uid…} (подтверждение «✅»).
+• **my_games_by_user**       — uid → [List[deal]] для нового дашборда.
+• **_vacuum_task**           — ссылка на фоновый «пылесос» сообщений.
+• **last_user_messages**     — теперь List[Message], а не single id.
+
+Остальной интерфейс совместим с версиями < 15.0.
 """
 
 from __future__ import annotations
@@ -33,35 +33,37 @@ class _State:
     """Runtime-данные, живут пока работает процесс."""
 
     # ——— Config / tokens ——————————————————————————
-    config: Dict[str, Any] = {}          # JSON из config.json
-    tokens: Dict[str, Any] = {}          # tokens.json
+    config: Dict[str, Any] = {}
+    tokens: Dict[str, Any] = {}
 
     # ——— Chat / Spreadsheet ——————————————————————
     admin_chat_id: Optional[int] = None
     svetofor_spreadsheet_id: Optional[str] = None
 
     # ——— Poll / Distribution ————————————————————
-    current_poll_deals: List[Dict] = []                   # сделки в текущем опросе
-    poll_message_ids: List[int] = []                      # ID опубликованных опросов
-    locked_distribution: Dict[int, Dict[str, str]] = {}   # deal_id → {role: tag}
-    responses: Dict[str, Any] = {}                        # poll_id → ответы
-    distribution_cache: Dict[str, Dict[str, str]] = {}    # deal_id → {role: tag}
+    current_poll_deals: List[Dict] = []                      # игры в текущем опросе
+    poll_message_ids: List[int] = []                         # ID опубликованных опросов
+    locked_distribution: Dict[int, Dict[str, str]] = {}      # deal_id → {role: tag}
+    confirmed: Dict[int, Set[int]] = {}                      # deal_id → {uid…}
+    pending_confirmations: Dict[int, Dict[str, Any]] = {}    # deal_id → {"distribution": {...}, "confirmed": set()}
+    responses: Dict[str, Any] = {}                           # poll_id → ответы
+    distribution_cache: Dict[str, Dict[str, str]] = {}       # deal_id → {role: tag}
     distribution_keyboard: Optional[InlineKeyboardMarkup] = None
     current_poll_leader: Optional[int] = None
     coordination_cycle_active: bool = False
     personal_report_message_id: Optional[int] = None
 
-    # ——— Manual control flags (v12.93) ——————————
-    force_closed: bool = False                           # ручной стоп всего цикла
-    deal_force_closed: Set[int] = set()                  # ID игр, закрытых «Стоп набор»
-    manual_confirm_requested: bool = False               # «+» запрошены вручную
-    confirmed_users: Set[int] = set()                    # UID, приславшие «+»
-    reminder_tasks: List[asyncio.TimerHandle] = []       # ссылки на call_later-таймеры
+    # ——— Manual control flags ————————————————
+    force_closed: bool = False
+    deal_force_closed: Set[int] = set()
+    manual_confirm_requested: bool = False
+    confirmed_users: Set[int] = set()                        # устарело (исп. для «+»)
+    reminder_tasks: List[asyncio.TimerHandle] = []
 
-    # ——— Ready / Approvals (v12.93) —————————————
-    current_deal_ready: Dict[int, bool] = {}             # deal_id → True, если набран минимум
-    all_ready_notified: bool = False                     # уже сообщали «все готовы»
-    pending_plus: Dict[int, int] = {}                    # msg_id → deal_id
+    # ——— Ready / Approvals ——————————————————————
+    current_deal_ready: Dict[int, bool] = {}
+    all_ready_notified: bool = False
+    pending_plus: Dict[int, int] = {}
 
     # ——— Periods ——————————————————————————————
     current_event_period: Optional[List[datetime]] = None
@@ -69,14 +71,18 @@ class _State:
 
     # ——— Caches / msg housekeeping —————————————
     pipeline_mapping: Dict = {}
-    deals_cache: Dict[str, Dict] = {}                    # произвольный кеш сделок
-    messages_to_delete: Dict[int, List[int]] = {}        # uid → [msg_id…]
-    last_user_messages: Dict[int, int] = {}              # user_id → last message_id
-    detail_blocks: Dict[Tuple[int, int], List[int]] = {} # (uid, deal_id) → [msg_id]
-    games_by_user: Dict[int, List[Dict]] = {}            # uid → [{deal}, …]
+    deals_cache: Dict[str, Dict] = {}
+    messages_to_delete: Dict[int, List[int]] = {}
+    last_user_messages: Dict[int, List[Message]] = {}
+    detail_blocks: Dict[Tuple[int, int], List[Message]] = {}
+    games_by_user: Dict[int, List[Dict]] = {}               # legacy cache
+    my_games_by_user: Dict[int, List[Dict]] = {}            # новый дашборд
 
-    # ——— Pinned menus for guide ————————————————————
-    group_menu_message_id: Dict[int, int] = {}           # chat_id → pinned menu message_id
+    # ——— Background tasks ——————————————————————
+    _vacuum_task: Optional[asyncio.Task] = None
+
+    # ——— Pinned menus ——————————————————————————
+    group_menu_message_id: Dict[int, int] = {}
 
     # ——— cache helpers —————————————————————————
     def cache_ok(self, key: str, ttl: timedelta) -> bool:
@@ -85,23 +91,23 @@ class _State:
             return False
         return datetime.now() - entry.get("timestamp", datetime.now()) < ttl
 
-    # ——— async per-user lock ——————————————————————
+    # ——— async per-user lock —————————————————————
     _user_locks: Dict[int, asyncio.Lock] = {}
 
     def lock_for(self, uid: int) -> asyncio.Lock:
         """Возвращает новый или существующий asyncio.Lock для пользователя."""
         return self._user_locks.setdefault(uid, asyncio.Lock())
 
-    # ——— message housekeeping —————————————————————
+    # ——— message housekeeping ————————————————
     async def register_message(self, user_id: int, message_id: int) -> Optional[int]:
-        """Сохраняет новое сообщение и возвращает предыдущее message_id."""
-        prev = self.last_user_messages.get(user_id)
-        self.last_user_messages[user_id] = message_id
+        prev = None
+        msgs = self.last_user_messages.setdefault(user_id, [])
+        if msgs:
+            prev = msgs[-1].message_id if hasattr(msgs[-1], "message_id") else None
         return prev
 
     # ——— poll housekeeping ——————————————————————
     async def register_poll(self, message_id: int) -> None:
-        """Добавляет ID опроса для последующего удаления."""
         self.poll_message_ids.append(message_id)
 
 # ███ [3.0] SINGLETON
@@ -109,6 +115,7 @@ class _State:
 state = _State()
 
 # История изменений:
-#   • 2025-07-22 — добавлены поля для manual-cycle, reminder_tasks, ready/approvals
-#   • 2025-08-04 — добавлено locked_distribution, poll_message_ids/housekeeping
-#   • 2025-08-05 — добавлено group_menu_message_id для закреплённого меню в группах
+#   • 2025-07-22 — initial manual-cycle fields
+#   • 2025-08-04 — locked_distribution, poll_message_ids
+#   • 2025-08-08 — confirmed, my_games_by_user, _vacuum_task, list last_user_messages
+#   • 2025-08-09 — pending_confirmations для цикла подтверждений
