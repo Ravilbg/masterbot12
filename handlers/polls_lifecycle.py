@@ -859,15 +859,6 @@ async def _vacuum_old_messages() -> None:
                 state.messages_to_delete.pop(uid, None)
         await asyncio.sleep(900)  # 15 минут
 
-
-# запускаем пылесос при инициализации модуля (если не запущен)
-try:
-    if not getattr(state, "_vacuum_task", None):
-        state._vacuum_task = asyncio.create_task(_vacuum_old_messages())
-except RuntimeError:
-    # event loop ещё не готов (например, при unit‑тестах)
-    pass
-
 # ███ [99] _TEST
 # --------------------------------------------------------------------
 async def _test() -> None:

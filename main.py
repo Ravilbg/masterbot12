@@ -37,6 +37,7 @@ from core.utils import delete_previous_private_messages
 from handlers import setup as setup_handlers
 from handlers.guide import group_keyboard, router as guide_router
 from handlers.profile import profile_handler
+from handlers.polls_lifecycle import _vacuum_old_messages
 
 # side-routers (импортами, чтобы не потерять F401)
 from handlers.confirmations import router as _r1  # noqa: F401
@@ -137,6 +138,17 @@ async def on_startup() -> None:
     await init_db()
     logger.info("[startup] DB initialized, Leader-ID=%d", settings.LEADER_ID)
 
+    state._vacuum_task = asyncio.create_task(_vacuum_old_messages())
+
+
+async def on_shutdown() -> None:
+    task = getattr(state, "_vacuum_task", None)
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        state._vacuum_task = None
+
 # ════════════════════════════════════════════════════════════════════
 # [3] /start HANDLERS
 # ════════════════════════════════════════════════════════════════════
@@ -179,6 +191,7 @@ async def main() -> None:
 
     dp = Dispatcher()
     dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
 
     dp.message.middleware(UpdateLogger())
     dp.callback_query.middleware(UpdateLogger())
