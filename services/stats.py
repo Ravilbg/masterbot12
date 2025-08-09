@@ -1,4 +1,5 @@
-"""services/stats.py — статистика игр по ведущим
+"""
+services/stats.py — статистика игр по ведущим
 ─────────────────────────────────────────────────────────────────────────────
 • games_per_leader(days=30) → Dict[int, int]
     Возвращает {user_id: кол-во сыгранных игр за последние *days* суток}.
@@ -44,12 +45,7 @@ async def games_per_leader(days: int = 30) -> Dict[int, int]:
     Dict[int, int]
         Mapping вида {user_id: games_count}.
     """
-    sid = settings.SVETOFOR_SPREAD_ID
-    if not sid:
-        logger.warning("[stats] SVETOFOR_SPREAD_ID не указан в settings")
-        return {}
-
-    deals = await get_amocrm_deals(sid)
+    deals = await get_amocrm_deals()
     if not deals:
         logger.debug("[stats] deals list empty → {}")
         return {}
@@ -61,7 +57,8 @@ async def games_per_leader(days: int = 30) -> Dict[int, int]:
     for deal in deals:
         if deal.get("status_id") != ok_status:
             continue
-        if deal.get("event_datetime") < threshold:
+        event_dt = deal.get("event_datetime")
+        if not event_dt or event_dt < threshold:
             continue
 
         for lead in deal.get("team_leads", []):
