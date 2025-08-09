@@ -1,205 +1,172 @@
 # handlers/polls_distribution.py
 # ─────────────────────────────────────────────────────────────────────────────
-"""Ручное управление распределением: подтверждения «+», утверждение игр,
-запись тегов в AmoCRM.
+"""
+Ручное управление распределением (этап лидера):
+• Руководитель нажимает «✅ Утвердить игру» или «👌 Утвердить все готовые».
+• Распределение фиксируется → `state.locked_distribution`.
+• В чат ведущих уходит уведомление «Состав … утверждён…».
+• Каждому назначенному UID дашборд «Мои игры» перерисовывается.
+• Игры переводятся в режим ожидания подтверждений (state.pending_confirmations).
 
-Версия v12.94-cycle · 2025-07-23
+Версия v14.2-cycle · 2025-08-09
 """
 
 from __future__ import annotations
 
-# ███ [0] IMPORTS
-# --------------------------------------------------------------------
 import logging
-from typing import Dict, List
+from typing import Dict, List, Set
 
-from aiogram import Router, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram import Bot, Router, types
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup
 
+from core.config import settings
 from core.state import state
-from services.amocrm import update_amocrm_tags
-from handlers.confirmations import _get_all_assigned_uids
+from handlers.my_games import redraw_my_games
+from handlers.poll_details import refresh_deal_details
 
-# ── ленивый импорт polls_lifecycle: функции гарантированно существуют
-#    к моменту выполнения, а Pylance больше не ругается на «не определено».
 import handlers.polls_lifecycle as plc  # noqa: E402
-
-# локальные алиасы для удобства (оставляем старые имена ─ править остальной код не нужно)
-_cancel_reminders      = plc._cancel_reminders
-_request_confirmations = plc._request_confirmations
-clear_poll_data        = plc.clear_poll_data
-_is_deal_ready         = plc._is_deal_ready
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-# История изменений:
-#   • 2025-07-30 — добавлен ленивый импорт plc + алиасы для устранения предупреждений Pylance
+# алиасы
+_is_deal_ready = plc._is_deal_ready
 
 
 # ════════════════════════════════════════════════════════════════════
-# [1] INLINE-КЛАВИАТУРА ПОД ОТЧЁТОМ
+# [1] УТИЛИТЫ
 # ════════════════════════════════════════════════════════════════════
+
+def _leaders_chat_id() -> int:
+    return (
+        getattr(settings, "LEADERS_CHAT_ID", None)
+        or getattr(settings, "leaders_chat_id", None)
+        or getattr(settings, "ADMIN_CHAT_ID", None)
+        or getattr(settings, "admin_chat_id", None)
+    )
+
+def _uids_from_roles(roles: Dict[str, List[int]]) -> Set[int]:
+    return set(roles.get("main", []) + roles.get("assist", []) + roles.get("admin", []))
+
+def _extract_current_team(deal_id: int) -> Dict[str, List[int]]:
+    roles = getattr(state, "detail_roles", {})
+    if isinstance(roles, dict) and deal_id in roles:
+        return {
+            "main": list(roles[deal_id].get("main", [])),
+            "assist": list(roles[deal_id].get("assist", [])),
+            "admin": list(roles[deal_id].get("admin", [])),
+        }
+    return {"main": [], "assist": [], "admin": []}
+
+def _lock_distribution(deal_id: int, roles: Dict[str, List[int]]) -> Set[int]:
+    state.locked_distribution[deal_id] = roles
+    state.pending_confirmations[deal_id] = {
+        "distribution": roles,
+        "confirmed": set()
+    }
+    logger.debug("[polls_dist] deal %d locked, pending_confirmations=%s", deal_id, roles)
+    return _uids_from_roles(roles)
+
+
+# ════════════════════════════════════════════════════════════════════
+# [2] INLINE-КЛАВИАТУРА (заглушка)
+# ════════════════════════════════════════════════════════════════════
+
 def distribution_actions_markup() -> InlineKeyboardMarkup:
-    """
-    Возвращает **пустую** клавиатуру.
-
-    Все «служебные» кнопки удалены из дашборда лидера согласно новому UI-дизайну.
-    """
     return InlineKeyboardMarkup(inline_keyboard=[])
 
-# ════════════════════════════════════════════════════════════════════
-# [2] ОБЩИЕ УТИЛИТЫ
-# ════════════════════════════════════════════════════════════════════
-def _compose_tag_report(deal: Dict) -> str:
-    """Формирует текст тэгов для игры."""
-    dist = state.distribution_cache.get(str(deal["id"]), {})
-    if not dist:
-        return "_нет распределения_"
-    lines: List[str] = []
-    for role, tag in dist.items():
-        emoji = {
-            "lead": "🧭",
-            "assistant": "🛟",
-            "admin": "🛡️",
-        }.get(role.split("1")[0], "👤")
-        lines.append(f"{emoji} {role}: {tag or '_—_'}")
-    return "\n".join(lines)
 
 # ════════════════════════════════════════════════════════════════════
-# [3] HANDLERS: ОБЩИЕ ДЕЙСТВИЯ
+# [3] HANDLER approve_deal
 # ════════════════════════════════════════════════════════════════════
-@router.callback_query(lambda c: c.data == "poll_force_confirm_all")
-async def poll_force_confirm_all_handler(callback: types.CallbackQuery) -> None:
-    if state.manual_confirm_requested:
-        await callback.answer("Уже запрошено.", show_alert=True)
-        return
-    _cancel_reminders()
-    await _request_confirmations()
-    await callback.answer("Запросили «+» от ведущих.")
-    logger.info("[manual] force confirm")
 
-
-@router.callback_query(lambda c: c.data == "poll_force_finish")
-async def poll_force_finish_handler(callback: types.CallbackQuery) -> None:
-    await clear_poll_data(callback.from_user.id)
-    await callback.answer("Цикл завершён вручную.")
-    logger.info("[manual] force finish")
-
-
-@router.callback_query(lambda c: c.data == "save_distribution")
-async def save_distribution_to_amocrm_handler(callback: types.CallbackQuery) -> None:
-    if not state.distribution_cache:
-        await callback.answer("⚠️ Сначала утвердите распределение.", show_alert=True)
-        return
-
-    await callback.answer("⏳ Сохраняю теги…")
-    ok = await update_amocrm_tags(state.distribution_cache)
-    if ok:
-        await callback.answer("✅ Теги сохранены в AmoCRM.", show_alert=True)
-        logger.info("[manual] tags saved")
-    else:
-        await callback.answer("❌ Ошибка при сохранении.", show_alert=True)
-        logger.error("[manual] tags save failed")
-
-# ════════════════════════════════════════════════════════════════════
-# [4] УТВЕРЖДЕНИЕ ОТДЕЛЬНОЙ ИГРЫ
-# ════════════════════════════════════════════════════════════════════
 @router.callback_query(lambda c: c.data.startswith("approve_deal_"))
-async def approve_deal_handler(callback: types.CallbackQuery) -> None:
-    did = int(callback.data.split("_")[-1])
-    if not state.current_deal_ready.get(did):
-        await callback.answer("Минимум ещё не набран.", show_alert=True)
+async def poll_approve_game_handler(callback: CallbackQuery) -> None:
+    try:
+        deal_id = int(callback.data.rsplit("_", 1)[-1])
+    except Exception:
+        await callback.answer("Ошибка: неизвестный формат callback.", show_alert=True)
         return
 
-    deal = next(d for d in state.current_poll_deals if d["id"] == did)
-    if str(did) not in state.distribution_cache:
-        await callback.answer("⚠️ Нет распределения.", show_alert=True)
+    from handlers.polls_lifecycle import _sync_leader_report
+    ready = await _is_deal_ready(deal_id)
+    if not ready:
+        await callback.answer("Минимальный состав ещё не набран.", show_alert=True)
         return
 
-    caption = (
-        f"🎯 *{deal['name']}* — {deal['event_datetime']:%d.%m}\n"
-        f"{_compose_tag_report(deal)}"
-    )
-    msg = await callback.message.answer(caption, parse_mode="Markdown")
-    state.pending_plus[msg.message_id] = did
-    await callback.answer("Ожидаем «+» от ведущего.")
-    logger.info("[manual] approve deal %d", did)
-
-# ════════════════════════════════════════════════════════════════════
-# [5] УТВЕРЖДЕНИЕ ВСЕХ ГОТОВЫХ
-# ════════════════════════════════════════════════════════════════════
-@router.callback_query(lambda c: c.data == "approve_all_ready")
-async def approve_all_ready_handler(callback: types.CallbackQuery) -> None:
-    ready_deals = [d for d in state.current_poll_deals if state.current_deal_ready.get(d["id"])]
-    if not ready_deals:
-        await callback.answer("Пока нет готовых игр.", show_alert=True)
+    roles = _extract_current_team(deal_id)
+    if not _uids_from_roles(roles):
+        logger.warning("[approve] deal %d has no roles in detail_roles", deal_id)
+        await callback.answer("Нет текущего распределения (откройте детали и расставьте роли).", show_alert=True)
         return
 
-    cnt = 0
-    for deal in ready_deals:
-        if str(deal["id"]) not in state.distribution_cache:
-            continue
-        caption = (
-            f"🎯 *{deal['name']}* — {deal['event_datetime']:%d.%m}\n"
-            f"{_compose_tag_report(deal)}"
-        )
-        msg = await callback.message.answer(caption, parse_mode="Markdown")
-        state.pending_plus[msg.message_id] = deal["id"]
-        cnt += 1
+    _lock_distribution(deal_id, roles)
+    state.approved_deals.add(deal_id)
 
-    await callback.answer(f"Отправлено {cnt} запрос(ов) «+».")
-    logger.info("[manual] approve all ready (%d)", cnt)
+    await callback.answer("Игра утверждена ✅")
+
+    # уведомление в чат ведущих
+    chat_id = _leaders_chat_id()
+    try:
+        title = state.deal_titles.get(deal_id, f"Сделка #{deal_id}")
+        text = f"🚦 Состав команды на игру «{title}» утверждён.\n" \
+               f"Подтвердите своё участие в личном кабинете: «🎲 Мои игры» → «✅ Подтвердить»."
+        await callback.message.bot.send_message(chat_id, text)
+    except Exception as e:
+        logger.error("[approve] notify leaders chat failed: %s", e)
+
+    # обновляем дашборды «Мои игры»
+    for uid in _uids_from_roles(roles):
+        try:
+            await redraw_my_games(uid)
+        except Exception as exc:
+            logger.warning("[polls_dist] redraw_my_games uid %d failed: %s", uid, exc)
+
+    try:
+        await _sync_leader_report()
+    except Exception as e:
+        logger.warning("[approve] _sync_leader_report failed: %s", e)
+
+    try:
+        await refresh_deal_details(callback.from_user.id, deal_id)
+    except Exception as e:
+        logger.warning("[approve] refresh_deal_details failed: %s", e)
+
+    logger.info("[approve] deal %d approved by %d; roles=%s", deal_id, callback.from_user.id, roles)
+
 
 # ════════════════════════════════════════════════════════════════════
-# [6] ПРЕДВАРИТЕЛЬНЫЙ ОТЧЁТ (ПО КЛИКУ «👌 Утвердить распределение»)
+# [4] HANDLERS stop/back
 # ════════════════════════════════════════════════════════════════════
-@router.callback_query(lambda c: c.data == "distribute_leaders")
-async def distribute_leaders_handler(callback: types.CallbackQuery) -> None:
-    if not state.distribution_cache:
-        await callback.answer("⚠️ Распределение не готово.", show_alert=True)
-        return
 
-    report: List[str] = ["📋 *Предварительное распределение:*"]
-    for deal in state.current_poll_deals:
-        dist = state.distribution_cache.get(str(deal["id"]), {})
-        report.append(f"\n🎯 *{deal['name']}* — {deal['event_datetime']:%d.%m}")
-        if not dist:
-            report.append("_нет распределения_")
-            continue
-        for role, tag in dist.items():
-            emoji = {"lead": "🧭", "assistant": "🛟", "admin": "🛡️"}.get(role.split("1")[0], "👤")
-            report.append(f"{emoji} {role}: {tag or '_—_'}")
+@router.callback_query(lambda c: c.data.startswith("poll_stop_"))
+async def poll_stop_game_handler(callback: CallbackQuery) -> None:
+    deal_id = int(callback.data.rsplit("_", 1)[-1])
+    state.deal_force_closed.add(deal_id)
+    await callback.answer("Набор остановлен.")
+    logger.info("[details] deal %d force-stopped by %d", deal_id, callback.from_user.id)
 
-    await callback.message.answer("\n".join(report), parse_mode="Markdown")
+@router.callback_query(lambda c: c.data.startswith("poll_back_"))
+async def poll_back_handler(callback: CallbackQuery) -> None:
     await callback.answer()
+    from handlers.polls_lifecycle import _sync_leader_report
+    try:
+        await _sync_leader_report()
+    except Exception as e:
+        logger.warning("[back] _sync_leader_report failed: %s", e)
+
 
 # ════════════════════════════════════════════════════════════════════
-# [7] ПЛЕЙСХОЛДЕР «MANUAL_EDIT»
+# [99] SELF-TEST
 # ════════════════════════════════════════════════════════════════════
-@router.callback_query(lambda c: c.data == "manual_edit")
-async def manual_edit_placeholder(callback: types.CallbackQuery) -> None:
-    """Заглушка под будущий визуальный редактор распределения."""
-    await callback.answer("Функция в разработке.", show_alert=True)
 
-# ███ [99] _TEST
-# --------------------------------------------------------------------
 async def _test() -> None:
-    """Smoke-тест distribution_actions_markup и _compose_tag_report."""
-    # distribution_actions_markup
-    markup = distribution_actions_markup()
-    assert isinstance(markup, InlineKeyboardMarkup)
-    assert markup.inline_keyboard == []
-
-    # _compose_tag_report
-    dummy = {"id": 1}
-    state.distribution_cache = {}
-    assert _compose_tag_report(dummy) == "_нет распределения_"
-    state.distribution_cache = {"1": {"lead1": "Иван|1"}}
-    report = _compose_tag_report(dummy)
-    assert "Иван" in report
-    print("handlers/polls_distribution OK")
+    roles = {"main": [1], "assist": [2], "admin": [3]}
+    uids = _uids_from_roles(roles)
+    assert uids == {1, 2, 3}
+    print("handlers.polls_distribution ✅ tests passed")
 
 if __name__ == "__main__":
-    import asyncio
+    import asyncio, logging as _l
+    _l.basicConfig(level=_l.DEBUG)
     asyncio.run(_test())

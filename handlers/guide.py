@@ -1,23 +1,25 @@
 # handlers/guide.py — «бот-проводник» для группового чата ведущих
 # ────────────────────────────────────────────────────────────────────
 """
-MasterBot v14.3 · 2025-08-06
+MasterBot v14.7 · 2025-08-08
 
-В группе — закреплённое сообщение с inline-кнопкой:
-  • 👤 Личный кабинет → PROFILE_LINK
-
-• Меню auto-pinned при /start в группе или при добавлении бота.
-• Поддержка кастомных inline-кнопок из SQLite по тексту сообщения.
+Fix 14.7
+• custom_button_handler теперь работает **только** в группах / супергруппах,
+  поэтому не перехватывает личные сообщения («🎲 Мои игры» и т.п.).
+• Исключение SkipHandler больше не поднимается — если кнопка не совпала,
+  хендлер просто возвращает управление без ошибок.
+• Остальной функционал (пин-меню, SQLite, логика кастом-кнопок) неизменён.
 """
 
 from __future__ import annotations
 
 # ███ [0] IMPORTS
 # --------------------------------------------------------------------
+import contextlib
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 from aiogram import Bot, Router
 from aiogram.enums import ChatType
@@ -36,15 +38,12 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 # ensure storage for pinned menus
-if not hasattr(state, "group_menu_message_id"):
-    state.group_menu_message_id = {}  # chat_id → pinned message_id
+state.group_menu_message_id = getattr(state, "group_menu_message_id", {})
 
 # ███ [1] КОНСТАНТЫ
 # --------------------------------------------------------------------
 PROFILE_BUTTON_TEXT = "👤 Личный кабинет"
-
-# TODO: заменить на реальную ссылку
-PROFILE_LINK = "https://t.me/masbot12_bot?start=profile"
+PROFILE_LINK = "https://t.me/masbot12_bot?start=profile"  # TODO: real link
 
 # ███ [2] SQLite — кастомные кнопки
 # --------------------------------------------------------------------
@@ -62,7 +61,7 @@ def init_db() -> None:
                 button_url  TEXT,
                 PRIMARY KEY(chat_id, button_text)
             )
-        """
+            """
         )
     logger.debug("[guide] custom_buttons table initialized at %s", DB_FILE)
 
@@ -73,39 +72,27 @@ def fetch_custom_buttons(chat_id: int) -> List[Tuple[str, str]]:
         (chat_id,),
     )
     rows = cur.fetchall()
-    logger.debug(
-        "[guide] fetched %d custom buttons for chat %d", len(rows), chat_id
-    )
+    logger.debug("[guide] fetched %d custom buttons for chat %d", len(rows), chat_id)
     return rows
 
 
 # ███ [3] Меню и пиннинг
 # --------------------------------------------------------------------
 def build_menu_markup() -> InlineKeyboardMarkup:
-    """Inline-клавиатура для закреплённого меню в группе (одна кнопка)."""
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=PROFILE_BUTTON_TEXT, url=PROFILE_LINK)]
-        ]
+        inline_keyboard=[[InlineKeyboardButton(text=PROFILE_BUTTON_TEXT, url=PROFILE_LINK)]]
     )
 
 
 async def ensure_pinned_menu(chat_id: int) -> None:
-    """
-    Создаёт или обновляет закреплённое меню в группе chat_id.
-    """
     bot = Bot.get_current()
     menu_id = state.group_menu_message_id.get(chat_id)
     markup = build_menu_markup()
 
     if menu_id:
         try:
-            await bot.edit_message_reply_markup(
-                chat_id, menu_id, reply_markup=markup
-            )
-            logger.debug(
-                "[guide] updated pinned menu %d in chat %d", menu_id, chat_id
-            )
+            await bot.edit_message_reply_markup(chat_id, menu_id, reply_markup=markup)
+            logger.debug("[guide] updated pinned menu %d in chat %d", menu_id, chat_id)
             return
         except Exception as e:
             logger.warning("[guide] failed to update menu %d: %s", menu_id, e)
@@ -117,10 +104,8 @@ async def ensure_pinned_menu(chat_id: int) -> None:
         reply_markup=markup,
         disable_web_page_preview=True,
     )
-    try:
+    with contextlib.suppress(Exception):
         await UnpinAllChatMessages(chat_id=chat_id)
-    except Exception:
-        pass
     await PinChatMessage(chat_id=chat_id, message_id=sent.message_id)
     state.group_menu_message_id[chat_id] = sent.message_id
     logger.info("[guide] pinned new menu %d in chat %d", sent.message_id, chat_id)
@@ -129,51 +114,39 @@ async def ensure_pinned_menu(chat_id: int) -> None:
 # ███ [4] Групповое меню для main.py
 # --------------------------------------------------------------------
 def group_keyboard() -> InlineKeyboardMarkup:
-    """
-    Возвращает markup для reply_markup в main.py при /start в группе.
-    """
     return build_menu_markup()
 
 
-# ███ [5] Обработчики
+# ███ [5] ОБРАБОТЧИКИ
 # --------------------------------------------------------------------
 @router.my_chat_member()
 async def on_bot_join(evt: ChatMemberUpdated) -> None:
-    """
-    При добавлении бота в группу: обновляем/пинним меню.
-    """
     if evt.new_chat_member.status in {"member", "administrator"}:
         logger.info(
-            "[guide] bot joined chat %d as %s",
-            evt.chat.id,
-            evt.new_chat_member.status,
+            "[guide] bot joined chat %d as %s", evt.chat.id, evt.new_chat_member.status
         )
         await ensure_pinned_menu(evt.chat.id)
 
 
 @router.message(CommandStart())
 async def on_group_start(message: Message) -> None:
-    """
-    При /start в групповом чате — создаём или обновляем меню.
-    """
     if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         logger.info("[guide] /start in group %d", message.chat.id)
         await ensure_pinned_menu(message.chat.id)
 
 
-@router.message()
+@router.message(lambda m: m.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP})
 async def custom_button_handler(message: Message) -> None:
-    """
-    Реакция на текст сообщения: если совпадает с кастомной кнопкой, шлём её inline.
+    """Обработка кастом-кнопок *только* в группах.  
+    В личке — сразу возвращаем управление другим хендлерам.
     """
     txt = (message.text or "").strip()
     if not txt:
         return
+
     for text, url in fetch_custom_buttons(message.chat.id):
         if txt == text:
-            logger.info(
-                "[guide] custom %r clicked in chat %d", text, message.chat.id
-            )
+            logger.info("[guide] custom %r clicked in chat %d", text, message.chat.id)
             await message.reply(
                 "\u200B",
                 reply_markup=InlineKeyboardMarkup(
@@ -182,15 +155,12 @@ async def custom_button_handler(message: Message) -> None:
                 disable_web_page_preview=False,
             )
             return
-    logger.debug(
-        "[guide] no custom match for %r in chat %d", txt, message.chat.id
-    )
+
+    logger.debug("[guide] no custom match for %r in chat %d", txt, message.chat.id)
+    # просто выходим — другие хендлеры (личного кабинета и др.) обработают сообщение
 
 
-# ███ [6] Инициализация
+# ███ [6] ИНИЦИАЛИЗАЦИЯ
 # --------------------------------------------------------------------
 init_db()
 logger.info("[guide] module loaded, DB=%s", DB_FILE)
-
-# История изменений:
-#   • v14.3 (2025-08-06) — оставлена только кнопка «👤 Личный кабинет» в закреплённом меню

@@ -7,14 +7,16 @@
 
 from aiogram import Dispatcher
 
-from .games import router   as games_router
-from .polls_lifecycle import router   as polls_lifecycle_router
+from .my_games          import router as my_games_router          # «🎲 Мои игры»
+from .games             import router as games_router
+from .polls_lifecycle   import router as polls_lifecycle_router
 from .polls_distribution import router as polls_distribution_router
-from .poll_details import router as poll_details_router
-from .confirmations import router  as confirmations_router
-from .stats import router   as stats_router
+from .poll_details      import router as poll_details_router
+from .confirmations     import router as confirmations_router
+from .stats             import router as stats_router
 
 __all__ = [
+    "my_games_router",
     "games_router",
     "polls_lifecycle_router",
     "polls_distribution_router",
@@ -24,9 +26,11 @@ __all__ = [
     "setup",
 ]
 
+
 def setup(dp: Dispatcher) -> None:
     """Подключает все роутеры к диспетчеру."""
     for r in (
+        my_games_router,           # ← сначала «Мои игры»
         games_router,
         polls_lifecycle_router,
         polls_distribution_router,

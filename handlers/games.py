@@ -1,9 +1,9 @@
 # handlers/games.py
 # ─────────────────────────────────────────────────────────────────────────────
-"""handlers/games.py — список и детализация игр (версия v12.93-cycle — 2025-07-22)
+"""handlers/games.py — список и детализация игр (v12.93-cycle · 2025-07-22)
 
 • «📅 Новые игры» / «✅ Распределённые игры»
-• inline-список до 20 игр, детализация, возврат «Назад»
+• inline-список до 20 игр, детализация, «Назад»
 • per-user async-lock, vacuum старых сообщений
 • helper _delete_trigger (используется в polls_lifecycle.py)
 """
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 # ███ [1.0] IMPORTS
 # --------------------------------------------------------------------
-import asyncio
+import contextlib
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -35,7 +35,6 @@ logger = logging.getLogger(__name__)
 router = Router()
 MSK_TZ = timezone("Europe/Moscow")
 
-
 # ███ [2.0] ASYNC-LOCK helper
 # --------------------------------------------------------------------
 @asynccontextmanager
@@ -48,15 +47,9 @@ async def user_lock(uid: int):
     finally:
         lock.release()
 
-
 # ███ [3.0] UTILS
 # --------------------------------------------------------------------
 async def _delete_trigger(msg: types.Message) -> None:
-    """
-    Пробует удалить message. Если Telegram не дал удалить
-    (например, слишком старое), сохраняет ID в state.messages_to_delete
-    — позже vacuum-таск их подчистит.
-    """
     try:
         await msg.delete()
     except Exception:
@@ -64,16 +57,10 @@ async def _delete_trigger(msg: types.Message) -> None:
 
 
 def _truncate(text: str, limit: int = 100) -> str:
-    """Обрезает строку до *limit* символов, добавляя «…» при необходимости."""
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 async def _refresh_menu(user_id: int) -> None:
-    """
-    Перерисовывает главное Reply-меню (удаляет прежнее, отправляет новое).
-    Используется после закрытия inline-экранов.
-    """
-    # локальный импорт, чтобы не было циклических зависимостей
     from core.menu import get_main_menu
 
     try:
@@ -85,14 +72,10 @@ async def _refresh_menu(user_id: int) -> None:
         old_id = getattr(state, "menu_message_id", None)
 
         if old_id:
-            try:
+            with contextlib.suppress(Exception):
                 await bot.delete_message(chat_id=user_id, message_id=old_id)
-            except Exception:
-                pass
             state.menu_message_id = None
 
-        # Небольшой трюк: отправляем невидимый символ или точку, чтобы Telegram
-        # отрисовал клавиатуру без лишнего текста
         for txt in ("\u2060", "."):
             try:
                 sent = await bot.send_message(user_id, txt, reply_markup=kb)
@@ -103,7 +86,6 @@ async def _refresh_menu(user_id: int) -> None:
     except Exception as e:
         logger.error("[games] _refresh_menu: %s", e, exc_info=True)
 
-
 # ███ [4.0] CORE LIST/DETAILS LOGIC
 # --------------------------------------------------------------------
 async def show_games(
@@ -113,26 +95,16 @@ async def show_games(
     title: str,
     only_unassigned: bool | None = None,
 ) -> None:
-    """
-    Формирует inline-список до 20 игр с нужными status_id.
-    Сохраняет список в state.games_by_user для детализации.
-    """
+    """Формирует inline-список игр и сохраняет его в state.games_by_user."""
     bot = Bot.get_current()
 
     async with user_lock(user_id):
         await delete_previous_private_messages(user_id)
 
-        sid = settings.SVETOFOR_SPREAD_ID
-        if not sid:
-            await message.answer("⚠️ Не указан ID таблицы «Светофор».")
-            return
-
-        deals = await get_amocrm_deals(sid)
+        deals = await get_amocrm_deals()          # вызов БЕЗ аргументов
         if not deals:
             logger.error("[games] AmoCRM deals fetch failed for %d", user_id)
-            await message.answer(
-                f"{title}\n⚠️ Не удалось загрузить данные игр. Проверьте AmoCRM."
-            )
+            await message.answer(f"{title}\n⚠️ Не удалось загрузить данные игр.")
             return
 
         now = datetime.now(tz=MSK_TZ)
@@ -140,8 +112,7 @@ async def show_games(
             only_unassigned = status_ids == settings.NEW_GAMES_STATUS_IDS
 
         filtered = [
-            d
-            for d in deals
+            d for d in deals
             if d["status_id"] in status_ids
             and d["event_datetime"] >= now
             and (not only_unassigned or not d["team_leads"])
@@ -151,7 +122,6 @@ async def show_games(
             await message.answer(f"{title}\n😔 Подходящих игр нет.")
             return
 
-        # сортируем и обрезаем до 20
         filtered.sort(key=lambda d: d["event_datetime"])
         filtered = filtered[:20]
 
@@ -159,8 +129,7 @@ async def show_games(
         for d in filtered:
             date = d["event_datetime"].strftime("%d.%m")
             extra = d.get("package") or d.get("extra_services") or ""
-            if extra and extra != "Не указано":
-                extra = f" · {extra}"
+            extra = f" · {extra}" if extra and extra != "Не указано" else ""
             kb.button(
                 text=f"🎉 {_truncate(d['name'])} — {date}{extra}",
                 callback_data=f"game_details_{d['id']}",
@@ -168,13 +137,10 @@ async def show_games(
         kb.adjust(1)
 
         sent = await bot.send_message(
-            user_id,
-            f"{title}\nВыберите игру:",
-            reply_markup=kb.as_markup(),
+            user_id, f"{title}\nВыберите игру:", reply_markup=kb.as_markup()
         )
         state.last_user_messages[user_id] = [sent]
         state.games_by_user[user_id] = filtered
-
 
 # ███ [5.0] HANDLERS
 # --------------------------------------------------------------------
@@ -190,6 +156,40 @@ async def new_games_handler(message: types.Message) -> None:
             settings.NEW_GAMES_STATUS_IDS,
             "📅 Новые игры:",
             True,
+        )
+    else:
+        await message.answer("⛔ Нет доступа.")
+    await _delete_trigger(message)
+
+
+@router.message(Command("assigned_games"))
+@router.message(lambda m: m.text and m.text.strip() == "✅ Распределённые игры")
+async def assigned_games_handler(message: types.Message) -> None:
+    uid = message.from_user.id
+    ui = await get_user_info(uid)
+    if ui and ui["role"] in settings.ACCESS["games"]:
+        await show_games(
+            message,
+            uid,
+            [settings.SUCCESSFUL_STATUS_ID],
+            "✅ Распределённые игры:",
+        )
+    else:
+        await message.answer("⛔ Нет доступа.")
+    await _delete_trigger(message)
+
+
+@router.message(Command("assigned_games"))
+@router.message(lambda m: m.text and m.text.strip() == "✅ Распределённые игры")
+async def assigned_games_handler(message: types.Message) -> None:
+    uid = message.from_user.id
+    ui = await get_user_info(uid)
+    if ui and ui["role"] in settings.ACCESS["games"]:
+        await show_games(
+            message,
+            uid,
+            [settings.SUCCESSFUL_STATUS_ID],
+            "✅ Распределённые игры:",
         )
     else:
         await message.answer("⛔ Нет доступа.")

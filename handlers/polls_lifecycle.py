@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Set
 
-from aiogram import Bot, Router, types
+from aiogram import Bot, Router, types, F
 from aiogram.filters import Command
 from aiogram.types import (
     InlineKeyboardButton,
@@ -37,6 +37,7 @@ MSK_TZ = timezone("Europe/Moscow")
 # История изменений:
 #   • 2025-07-31 — перенёс future.annotations, убрал лишние импорты
 #   • 2025-08-03 — добавлен PROFILE_BUTTON_TEXT и ReplyKeyboardBuilder
+#   • 2025-08-09 — добавлен импорт F для корректной работы фильтров aiogram
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -204,15 +205,16 @@ async def create_poll_handler(message: types.Message) -> None:
     """
     Хендлер кнопки/команды «Создать опрос».
 
-    Детализированное логирование:
-    • INFO  — вызов хендлера, успешное создание опроса;
-    • DEBUG — параметры, число сделок, детали по каждой части;
-    • WARN  — причины раннего выхода (нет доступа, активный цикл и т.д.).
+    • детальные логи: INFO / DEBUG / WARNING;
+    • проверка доступа, активного цикла, admin-чата;
+    • выбирает новые игры (14 дней вперёд, без назначенных ведущих);
+    • инициализирует state, рассылает Poll’ы, ставит таймеры;
+    • учитывает требования min-состава (_role_cfg) — логика НЕ изменена.
     """
     uid = message.from_user.id
     logger.info("[create_poll] invoked by %d, text=%s", uid, (message.text or "").strip())
 
-    # --- проверка доступа ----------------------------------------------------
+    # ── 1. проверки доступа ─────────────────────────────────────────
     ui = await get_user_info(uid) or {}
     role = ui.get("role")
     if role not in settings.ACCESS["poll"]:
@@ -233,21 +235,19 @@ async def create_poll_handler(message: types.Message) -> None:
         await _delete_trigger(message)
         return
 
-    # --- выбор сделок --------------------------------------------------------
+    # ── 2. получаем сделки из AmoCRM ────────────────────────────────
     try:
-        deals = await get_amocrm_deals(settings.SVETOFOR_SPREAD_ID)
+        deals = await get_amocrm_deals()               # ← БЕЗ аргумента!
     except Exception as exc:
         logger.exception("[create_poll] get_amocrm_deals failed: %s", exc)
         await message.answer("⚠️ Не удалось получить игры из AmoCRM.")
         await _delete_trigger(message)
         return
 
-    now = datetime.now(tz=MSK_TZ)
-    window = now + timedelta(days=14)
-
+    now     = datetime.now(tz=MSK_TZ)
+    window  = now + timedelta(days=14)
     poll_deals = [
-        d
-        for d in deals
+        d for d in deals
         if d["status_id"] in settings.NEW_GAMES_STATUS_IDS
         and now <= d["event_datetime"] <= window
         and not d["team_leads"]
@@ -261,7 +261,7 @@ async def create_poll_handler(message: types.Message) -> None:
         await _delete_trigger(message)
         return
 
-    # --- инициализация state -------------------------------------------------
+    # ── 3. инициализация state ─────────────────────────────────────
     state.current_poll_deals        = poll_deals
     state.current_poll_leader       = uid
     state.responses.clear()
@@ -274,7 +274,7 @@ async def create_poll_handler(message: types.Message) -> None:
     state.current_deal_ready.clear()
     state.all_ready_notified        = False
 
-    # --- отправка опросов ----------------------------------------------------
+    # ── 4. отправляем опрос(ы) ──────────────────────────────────────
     urgent = any(d["event_datetime"] <= now + timedelta(days=3) for d in poll_deals)
     header_base = "🚨 Срочные!" if urgent else "📊 Новые игры"
     chunks = [poll_deals[i : i + 8] for i in range(0, len(poll_deals), 8)]
@@ -312,7 +312,7 @@ async def create_poll_handler(message: types.Message) -> None:
         logger.debug("[create_poll] poll sent: id=%s, deals=%s",
                      poll.poll.id, list(idx_map.values()))
 
-    # --- завершение ----------------------------------------------------------
+    # ── 5. завершаем ────────────────────────────────────────────────
     await message.answer("✅ Опросы отправлены.")
     await _refresh_menu(uid)
     await _send_leader_report(uid)
@@ -353,6 +353,8 @@ async def generate_poll_report() -> str:
     • Для каждой игры показывает «✅/❌», название и дату.
     • Если минимум набран — добавляет кнопку «👍 Утвердить».
     • Когда готова хотя бы одна игра — добавляет «Утвердить все».
+    • При готовности игры — гарантирует, что распределение в state.poll_distribution
+      заполнено из актуальных деталей (state.poll_details).
     """
     if not state.current_poll_deals or not state.responses:
         return "⚠️ Нет активных опросов."
@@ -369,12 +371,23 @@ async def generate_poll_report() -> str:
         any_ready |= ready
         icon = "✅" if ready else "❌"
 
+        # Если игра готова — подстрахуем, чтобы распределение было в state.poll_distribution
+        if ready:
+            details = state.poll_details.get(did)
+            if details and "distribution" in details:
+                state.poll_distribution[did] = details["distribution"]
+                logger.debug("[report] deal_id=%d distribution synced from poll_details", did)
+            else:
+                logger.warning("[report] deal_id=%d ready, но нет distribution в poll_details", did)
+
+        # Кнопка открытия деталей игры
         row: List[InlineKeyboardButton] = [
             InlineKeyboardButton(
                 text=f"{icon} {deal['game_name']} — {deal['event_datetime']:%d.%m}",
                 callback_data=f"show_deal_{did}",
             )
         ]
+        # Если готово — добавляем кнопку «👍 Утвердить»
         if ready:
             row.append(
                 InlineKeyboardButton(
@@ -391,13 +404,16 @@ async def generate_poll_report() -> str:
             deal["game_name"],
         )
 
+    # Если есть хотя бы одна готовая игра — добавляем кнопку «Утвердить все»
     if any_ready:
         keyboard.append(
             [InlineKeyboardButton(text="Утвердить все", callback_data="approve_all_ready")]
         )
 
+    # Сохраняем клавиатуру в state для дальнейшего использования
     state.distribution_keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard)
     return "📊 *Опрос создан. Выберите игру:*"
+
 
 # ███ [4.x] Вспом. клавиатура отчёта и __all__
 # --------------------------------------------------------------------
@@ -416,6 +432,7 @@ def _build_report_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=games_kb.inline_keyboard + actions_kb.inline_keyboard
     )
 
+
 # Экспорт «приватных» функций, которые используют другие модули
 __all__ = [
     "_cancel_reminders",
@@ -423,7 +440,9 @@ __all__ = [
     "_is_deal_ready",
     "clear_poll_data",
 ]
-# История изменений: добавлено 2025-07-30 — фиксы Pylance (_build_report_keyboard, __all__)
+# История изменений:
+#  • 2025-07-30 — фиксы Pylance (_build_report_keyboard, __all__)
+#  • 2025-08-09 — добавлена автосинхронизация distribution из poll_details для ready-игр
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -525,7 +544,7 @@ async def poll_report_handler(message: types.Message) -> None:
 # ███ [7] ГЕНЕРАЦИЯ И ПРОВЕРКА ГОТОВНОСТИ
 # --------------------------------------------------------------------
 async def _is_deal_ready(did: int) -> bool:
-    """True, если для игры did набран минимум (учитывая админа)."""
+    """True, если для игры did набран минимум (учитывая админа без проверки в светофоре)."""
     deal = next(d for d in state.current_poll_deals if d["id"] == did)
     cfg = _role_cfg(deal["game_name"])
     need_main, need_assist = cfg["main_leaders"], cfg["assistants"]
@@ -553,19 +572,14 @@ async def _is_deal_ready(did: int) -> bool:
     # 2.1 вручную назначен?
     have_admin = 1 if dist.get("admin") else 0
 
-    # 2.2 автоподбор из admin_available, если ещё нужен
+    # 2.2 автоподбор из admin_available без проверки в светофоре
     if need_admin and not have_admin:
         for pdata in state.responses.values():
-            # считаем только «часть» опроса, где есть эта игра
             if did not in pdata["deal_indices"].values():
                 continue
             for adm in pdata["admin_available"]:
                 uid = adm["user_id"]
-                if (
-                    adm.get("is_admin_eligible")
-                    and uid not in main_ids
-                    and uid not in assist_ids
-                ):
+                if uid not in main_ids and uid not in assist_ids:
                     have_admin = 1
                     break
             if have_admin:
@@ -577,18 +591,16 @@ async def _is_deal_ready(did: int) -> bool:
     )
 
     return (
-        have_main   >= need_main
+        have_main >= need_main
         and have_assist >= need_assist
-        and have_admin  >= need_admin
+        and have_admin >= need_admin
     )
 
-
-
-
 async def _check_ready_state(impacted: Set[int]) -> None:
-    """Уведомления: «минимум набран / все готовы»."""
+    """Уведомления: «предварительный состав команды набран / все готовы»."""
     bot = Bot.get_current()
     lead = state.current_poll_leader
+    chat_id = state.admin_chat_id or lead  # используем чат опроса, если задан
     newly_ready: List[str] = []
 
     for did in impacted:
@@ -599,16 +611,26 @@ async def _check_ready_state(impacted: Set[int]) -> None:
             newly_ready.append(f"{deal['game_name']} — {deal['event_datetime']:%d.%m}")
 
     if newly_ready:
-        txt = "✅ *Минимум набран:*\n" + "\n".join(f"• {n}" for n in newly_ready)
-        await bot.send_message(lead, txt, parse_mode="Markdown")
+        txt = (
+            "✅ *Предварительный состав команды на игру набран!*\n"
+            "Успейте отметиться в опросе, чтобы участвовать в распределении:\n"
+            + "\n".join(f"• {n}" for n in newly_ready)
+        )
+        await bot.send_message(chat_id, txt, parse_mode="Markdown")
 
     if (
         state.current_poll_deals
         and all(state.current_deal_ready.get(d["id"]) for d in state.current_poll_deals)
         and not state.all_ready_notified
     ):
-        await bot.send_message(lead, "🎉 Все игры укомплектованы минимумом!")
+        await bot.send_message(
+            chat_id,
+            "✅ Для всех игр определен предварительный состав команды, "
+            "успейте отметиться в опросе, чтобы участвовать в распределении.",
+            parse_mode="Markdown"
+        )
         state.all_ready_notified = True
+
 
 
 async def generate_poll_report() -> str:
@@ -772,7 +794,7 @@ async def _sync_leader_report() -> None:
 
 
 # ════════════════════════════════════════════════════════════════════
-# [10] ЗАВЕРШЕНИЕ ЦИКЛА
+# [10] ЗАВЕРШЕНИЕ ЦИКЛА И СЛУЖЕБНЫЕ УТИЛИТЫ
 # ════════════════════════════════════════════════════════════════════
 async def clear_poll_data(user_id: int) -> None:
     """Полный сброс состояния цикла."""
@@ -803,6 +825,48 @@ async def clear_poll_data(user_id: int) -> None:
     logger.info("[polls] cleared by %d", user_id)
     await _refresh_menu(user_id)
 
+
+# ────────────────────────────────────────────────────────────────────
+# 10.1  Автоматическая проверка «все игры закрыты?»
+# ────────────────────────────────────────────────────────────────────
+async def _check_cycle_finished(trigger_user: int | None = None) -> None:
+    """Если активных игр не осталось — закрываем цикл."""
+    if not state.coordination_cycle_active:
+        return  # уже закрыт
+    if state.current_poll_deals:  # есть ещё игры → продолжаем
+        return
+    leader = state.current_poll_leader or trigger_user or 0
+    await clear_poll_data(leader)
+
+
+# ────────────────────────────────────────────────────────────────────
+# 10.2  Фоновый «пылесос» для устаревших сообщений
+# ────────────────────────────────────────────────────────────────────
+async def _vacuum_old_messages() -> None:
+    """Раз в 15 минут пытаемся удалить сообщения, помеченные к очистке."""
+    while True:
+        bot = Bot.get_current()
+        for uid, msg_ids in list(state.messages_to_delete.items()):
+            updated: List[int] = []
+            for mid in msg_ids:
+                try:
+                    await bot.delete_message(chat_id=uid, message_id=mid)
+                except Exception:
+                    updated.append(mid)  # оставить, если не удалось
+            if updated:
+                state.messages_to_delete[uid] = updated
+            else:
+                state.messages_to_delete.pop(uid, None)
+        await asyncio.sleep(900)  # 15 минут
+
+
+# запускаем пылесос при инициализации модуля (если не запущен)
+try:
+    if not getattr(state, "_vacuum_task", None):
+        state._vacuum_task = asyncio.create_task(_vacuum_old_messages())
+except RuntimeError:
+    # event loop ещё не готов (например, при unit‑тестах)
+    pass
 
 # ███ [99] _TEST
 # --------------------------------------------------------------------

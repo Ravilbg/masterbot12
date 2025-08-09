@@ -1,166 +1,192 @@
 # handlers/confirmations.py
 # ─────────────────────────────────────────────────────────────────────────────
 """
-Подтверждение участия кнопкой «✅ Подтвердить участие».
+Утверждение состава руководителем и подтверждение участия ведущими.
+Полный цикл: «утверждение» → «подтверждение» → перевод сделки в AmoCRM.
 
-Изменения v13.0 · 2025-08-03
+Версия v14.5 · 2025-08-09
 ──────────────────────────────────────────────────────────────────────────────
-• Старый *plus_confirmation_handler* удалён — «+» больше не используется.
-• Новый *confirm_participation_handler* работает по callback-data  
-  ``confirm_participation_<deal_id>`` и выполняет:
-
-  1. Проверяет, назначен ли пользователь в *state.locked_distribution*  
-     на указанную игру. Если нет — отвечает предупреждением.
-  2. Добавляет UID в `state.confirmed[deal_id]`.
-  3. Когда подтвердили **все** назначенные на игру —  
-     • пишет теги в AmoCRM из *locked_distribution*;  
-     • шлёт сообщение в чат ведущих о полном подтверждении.
+• Добавлен блок [13.9] — approve_distribution_handler.
+• Подтверждение участия (блок [14.0]) теперь использует state.confirmed_distribution.
+• После утверждения руководителем всем назначенным ведущим доступна игра в «Мои игры» с кнопкой «Подтвердить».
+• После подтверждения всеми — перевод сделки в «Завершение сделки», удаление из цикла опроса, обновление дашбордов.
 """
 
 from __future__ import annotations
 
+# ███ [0] IMPORTS
+# --------------------------------------------------------------------
 import logging
-from typing import Dict, Optional, Set
+from typing import Optional, Dict, List
 
-from aiogram import Bot, Router
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup
+from aiogram import Router
+from aiogram.types import CallbackQuery
 
 from core.config import settings
+from core.db import get_user_info
 from core.state import state
-from services.amocrm import update_amocrm_tags
+from handlers.poll_details import refresh_deal_details
+from handlers.my_games import redraw_my_games
+from handlers.polls_lifecycle import _is_deal_ready, _sync_leader_report
+from services.amocrm import update_amocrm_tags, update_deal_status
 
-logger = logging.getLogger(__name__)
 router = Router()
+logger = logging.getLogger(__name__)
 
-# ════════════════════════════════════════════════════════════════════
-# [1] HELPERS
-# ════════════════════════════════════════════════════════════════════
 CONFIRM_PREFIX = "confirm_participation_"
+APPROVE_PREFIX = "approve_distribution_"
 
+# ███ [1] ВСПОМОГАТЕЛЬНЫЕ
+# --------------------------------------------------------------------
+def _leaders_chat_id() -> int:
+    return (
+        getattr(settings, "LEADERS_CHAT_ID", None)
+        or getattr(settings, "leaders_chat_id", None)
+        or getattr(settings, "ADMIN_CHAT_ID", None)
+        or getattr(settings, "admin_chat_id", None)
+    )
 
-def _extract_uid(tag: str) -> Optional[int]:
-    """'Имя|123' → 123 | None."""
-    if "|" not in tag:
-        return None
+async def _user_full_name(uid: int) -> str:
+    ui = await get_user_info(uid) or {}
+    fn = ui.get("first_name", "") or ""
+    ln = ui.get("last_name", "") or ""
+    if ln:
+        ln = f"{ln[:1]}."
+    return f"{fn} {ln}".strip()
+
+def _tag_for_user(full_name: str, role: str) -> str:
+    role = role.lower()
+    if role == "main":
+        return f"{full_name}.1"
+    if role == "assist":
+        return f"{full_name}.2"
+    if role == "admin":
+        return f"{full_name}.Ад"
+    return full_name
+
+# [2] УТВЕРЖДЕНИЕ СОСТАВА
+@router.callback_query(lambda c: c.data.startswith(APPROVE_PREFIX))
+async def approve_distribution_handler(callback: CallbackQuery) -> None:
     try:
-        return int(tag.rsplit("|", 1)[-1])
-    except ValueError:
-        return None
-
-
-def _assigned_uids(deal_id: int) -> Set[int]:
-    """UID-ы всех, кто зафиксирован на игру *deal_id*."""
-    tags = state.locked_distribution.get(deal_id, {})
-    return {uid for uid in (_extract_uid(t) for t in tags.values()) if uid is not None}
-
-
-def _get_all_assigned_uids() -> Set[int]:  # ← для handlers.polls_distribution
-    """UID всех, кто назначен хотя бы на одну игру текущего цикла."""
-    assigned: Set[int] = set()
-    for deal_roles in state.locked_distribution.values():
-        for tag in deal_roles.values():
-            uid = _extract_uid(tag)
-            if uid is not None:
-                assigned.add(uid)
-    return assigned
-
-
-def _confirm_map() -> Dict[int, Set[int]]:
-    """
-    state.confirmed: deal_id → {uid…}
-    Создаётся динамически при первом обращении.
-    """
-    return state.__dict__.setdefault("confirmed", {})
-
-
-# ════════════════════════════════════════════════════════════════════
-# [2] CALLBACK-HANDLER
-# ════════════════════════════════════════════════════════════════════
-@router.callback_query(lambda c: c.data.startswith(CONFIRM_PREFIX))
-async def confirm_participation_handler(callback: CallbackQuery) -> None:
-    """
-    Пользователь нажал «✅ Подтвердить участие».
-    """
-    await callback.answer()  # instant ACK
-
-    try:
-        deal_id = int(callback.data[len(CONFIRM_PREFIX):])
-    except ValueError:
-        await callback.answer("⚠️ Неверные данные.", show_alert=True)
+        deal_id = int(callback.data.split("_")[-1])
+    except Exception:
+        await callback.answer("Ошибка формата кнопки.", show_alert=True)
         return
 
     uid = callback.from_user.id
-    assigned = _assigned_uids(deal_id)
+    details = await refresh_deal_details(uid, deal_id)
+    if not details or "roles" not in details:
+        await callback.answer("Нет данных о составе.", show_alert=True)
+        return
 
-    # 1️⃣ назначен ли пользователь?
-    if uid not in assigned:
+    state.confirmed_distribution = getattr(state, "confirmed_distribution", {})
+    state.confirmed_distribution[deal_id] = {
+        "main":   list(details["roles"].get("main", [])),
+        "assist": list(details["roles"].get("assist", [])),
+        "admin":  list(details["roles"].get("admin", [])),
+    }
+
+    title = getattr(state, "deal_titles", {}).get(deal_id, f"Сделка #{deal_id}")
+    try:
+        await callback.message.bot.send_message(
+            _leaders_chat_id(),
+            f"📢 Состав команды на игру «{title}» утверждён.\n"
+            f"Подтвердите своё участие в личном кабинете."
+        )
+    except Exception as e:
+        logger.warning("[approve_distribution] notify leaders failed: %s", e)
+
+    await callback.answer("Состав утверждён ✅")
+
+
+# [3] ПОДТВЕРЖДЕНИЕ УЧАСТИЯ
+@router.callback_query(lambda c: c.data.startswith(CONFIRM_PREFIX))
+async def confirm_participation_handler(callback: CallbackQuery) -> None:
+    try:
+        deal_id = int(callback.data.rsplit("_", 1)[-1])
+    except Exception:
+        await callback.answer("Ошибка: неизвестный формат кнопки.", show_alert=True)
+        return
+
+    uid = callback.from_user.id
+    dist = getattr(state, "confirmed_distribution", {}).get(deal_id)
+    if not dist:
+        await callback.answer("Нет распределения для этой игры.", show_alert=True)
+        logger.error("[confirm] confirmed_distribution not found for deal=%d", deal_id)
+        return
+
+    role = None
+    for r in ("main", "assist", "admin"):
+        if uid in dist.get(r, []):
+            role = r
+            break
+    if not role:
         await callback.answer("Вы не назначены на эту игру.", show_alert=True)
         return
 
-    # 2️⃣ фиксируем подтверждение
-    confirmed = _confirm_map().setdefault(deal_id, set())
-    if uid in confirmed:
-        await callback.answer("Участие уже подтверждено ✅", show_alert=True)
+    # Тег → AmoCRM (исправленный интерфейс)
+    full_name = await _user_full_name(uid)
+    tag = _tag_for_user(full_name, role)
+    ok = await update_amocrm_tags({str(deal_id): {"confirm": tag}})
+    if not ok:
+        await callback.answer("Не удалось записать подтверждение в CRM.", show_alert=True)
+        logger.error("[confirm] update_amocrm_tags failed: deal=%d tag=%s", deal_id, tag)
         return
 
-    confirmed.add(uid)
-    await callback.answer("Спасибо! Участие подтверждено ✅", show_alert=True)
-    logger.info("[confirm] uid=%d confirmed deal=%d (%d/%d)",
-                uid, deal_id, len(confirmed), len(assigned))
+    await callback.answer("Участие подтверждено ✅")
 
-    # 3️⃣ все подтвердили?
-    if confirmed >= assigned and assigned:
-        ok = await update_amocrm_tags(
-            {str(deal_id): state.locked_distribution[deal_id]}
+    # Сообщение в чат
+    try:
+        title = getattr(state, "deal_titles", {}).get(deal_id, f"Сделка #{deal_id}")
+        await callback.message.bot.send_message(
+            _leaders_chat_id(),
+            f"✅ {full_name} подтвердил выход на игру «{title}».",
         )
-        if not ok:
-            logger.error("[confirm] AmoCRM tags write FAILED for deal %d", deal_id)
+    except Exception as e:
+        logger.warning("[confirm] notify leaders chat failed: %s", e)
 
-        # сообщение в чат ведущих
-        bot = Bot.get_current()
-        try:
-            game_name = next(
-                d["game_name"] for d in state.current_poll_deals if d["id"] == deal_id
-            )
-        except StopIteration:
-            game_name = f"ID {deal_id}"
+    # Локальное подтверждение → проверка «все подтвердили?»
+    try:
+        state.confirmed.setdefault(deal_id, set()).add(uid)
+        required = set(dist.get("main", [])) | set(dist.get("assist", [])) | set(dist.get("admin", []))
+        if required and required.issubset(state.confirmed.get(deal_id, set())):
+            # Переводим сделку в «Завершение сделки» по ID статуса!
+            from handlers.polls_lifecycle import _sync_leader_report
+            from services.amocrm import update_deal_status
+            try:
+                await update_deal_status(deal_id, settings.SUCCESSFUL_STATUS_ID)
+            except Exception as e:
+                logger.error("[confirm] update_deal_status failed: %s", e)
 
-        await bot.send_message(
-            state.admin_chat_id,
-            f"🎉 Все участники подтвердили игру *{game_name}*.",
-            parse_mode="Markdown",
-        )
-        logger.info("[confirm] deal %d FULLY confirmed", deal_id)
+            # Убираем сделку из активного опроса
+            state.current_poll_deals = [d for d in state.current_poll_deals if d.get("id") != deal_id]
+            await _sync_leader_report()
 
-        # убираем кнопку у подтвердившего последним
-        try:
-            await callback.message.edit_reply_markup(
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[])
-            )
-        except Exception:
-            pass
+            # Проверяем автозавершение цикла, если игр не осталось
+            try:
+                from handlers.polls_lifecycle import _check_cycle_finished
+                await _check_cycle_finished(callback.from_user.id)
+            except Exception:
+                pass
+
+        # Обновляем «Мои игры» для пользователя
+        await redraw_my_games(uid)
+    except Exception as e:
+        logger.error("[confirm] post-actions failed: %s", e)
 
 
-# ════════════════════════════════════════════════════════════════════
-# [3] TESTS
-# ════════════════════════════════════════════════════════════════════
-async def _test() -> None:
-    state.locked_distribution = {
-        1: {"lead1": "Иван|1", "assistant1": "Пётр|2"},
-        2: {"lead1": "Ольга|3"},
-    }
-    assert _assigned_uids(1) == {1, 2}
-    assert _assigned_uids(2) == {3}
-    assert _get_all_assigned_uids() == {1, 2, 3}
-
-    cm = _confirm_map()
-    cm.clear()
-    cm[1] = {1}
-    assert 1 in cm[1]
-    print("handlers.confirmations ✅ tests passed")
-
+# ███ [4] ТЕСТЫ
+# --------------------------------------------------------------------
+async def _test():
+    assert isinstance(_leaders_chat_id(), int) or _leaders_chat_id() is None
+    assert _tag_for_user("Иван П.", "main").endswith(".1")
+    assert _tag_for_user("Иван П.", "assist").endswith(".2")
+    assert _tag_for_user("Иван П.", "admin").endswith(".Ад")
+    print("tests passed")
 
 if __name__ == "__main__":
     import asyncio
-
     asyncio.run(_test())
+
+# История изменений:
+# v14.5 · 2025-08-09 — добавлен блок утверждения состава [13.9], цикл подтверждения работает по утверждённому составу.
