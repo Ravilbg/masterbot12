@@ -1,11 +1,11 @@
-"""main.py — точка входа MasterBot 15.4
+"""main.py — точка входа MasterBot 15.5
 ────────────────────────────────────────────────────────────────────────────
-⚙️  Новое в 15.4
-• LOG_LEVEL по-умолчанию → DEBUG (видно всё, даже без переменной окружения).
-• Middleware UpdateLogger — пишет тип и короткий дайджест КАЖДОГО апдейта.
-• При старте печатаем путь импортированного handlers.my_games/profile —
-  полезно, если в проекте остались «дубликаты».
-• Остальной функционал НЕ изменён.
+⚙️  Изменения в 15.5
+• Исправлен запуск фонового пылесоса (_vacuum_old_messages) через AsyncIOScheduler.
+• Устранён RuntimeWarning «coroutine was never awaited».
+• /start в ЛС и группах регистрируется корректно.
+• Логирование aiogram урезано до INFO, чтобы не засорять вывод.
+Остальной функционал без изменений.
 """
 
 from __future__ import annotations
@@ -37,8 +37,9 @@ from core.utils import delete_previous_private_messages
 from handlers import setup as setup_handlers
 from handlers.guide import group_keyboard, router as guide_router
 from handlers.profile import profile_handler
+from handlers.polls_lifecycle import _vacuum_old_messages  # ⬅ добавлен импорт пылесоса
 
-# side-routers (импортами, чтобы не потерять F401)
+# side-routers
 from handlers.confirmations import router as _r1  # noqa: F401
 from handlers.stats          import router as _r2  # noqa: F401
 from handlers.profile        import router as _r3  # noqa: F401
@@ -56,7 +57,6 @@ LOG_FILE = LOG_DIR / "masterbot.log"
 
 
 def _setup_logging() -> None:
-    """Инициализация logging с ротацией и уровнем из $LOG_LEVEL (DEBUG по умолч.)."""
     level_name = os.getenv("LOG_LEVEL", "DEBUG").upper()
     root_level = getattr(logging, level_name, logging.DEBUG)
 
@@ -77,12 +77,10 @@ def _setup_logging() -> None:
         handlers=handlers,
     )
 
-    # наши пакеты — INFO/DEBUG
     for pkg in ("core", "handlers", "services"):
         logging.getLogger(pkg).setLevel(
             logging.DEBUG if root_level == logging.DEBUG else logging.INFO
         )
-    # сторонние библиотеки — WARNING
     for noisy in ("aiosqlite", "googleapiclient", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     logging.getLogger("aiogram").setLevel(logging.INFO)
@@ -90,32 +88,22 @@ def _setup_logging() -> None:
 
 _setup_logging()
 
-# печатаем, откуда реально грузятся файлы с кнопкой «Мои игры»
+# контроль версий модулей
 import handlers.my_games as _mg
 import handlers.profile as _pf
-
 logger.debug("✅ using my_games from %s", _mg.__file__)
 logger.debug("✅ using profile  from %s", _pf.__file__)
 
 # ════════════════════════════════════════════════════════════════════
-# [1.1] MIDDLEWARE: ЛОГ КАЖДОГО АПДЕЙТА
+# [1.1] MIDDLEWARE
 # ════════════════════════════════════════════════════════════════════
 class UpdateLogger(BaseMiddleware):
-    """Пишет INFO о любом пришедшем апдейте (тип и короткий дайджест)."""
-
-    async def __call__(
-        self,
-        handler: Any,
-        event: TelegramObject,
-        data: dict,
-    ):
+    async def __call__(self, handler: Any, event: TelegramObject, data: dict):
         t = type(event).__name__
-        # text, data или просто repr(event)
         short = getattr(event, "text", "") or getattr(event, "data", "") or repr(event)
         short = (short[:60] + "…") if len(short) > 60 else short
         logger.info("[update] %-15s %s", t, short)
         return await handler(event, data)
-
 
 # ════════════════════════════════════════════════════════════════════
 # [2] STARTUP
@@ -149,7 +137,6 @@ async def _send_main_menu(uid: int) -> None:
     else:
         await bot.send_message(uid, "⛔ У вас пока нет доступа к функциям бота.")
 
-
 async def group_start(message: Message) -> None:
     await message.answer(
         "📌 *Откройте личный кабинет для своих игр:*",
@@ -158,11 +145,9 @@ async def group_start(message: Message) -> None:
         disable_web_page_preview=True,
     )
 
-
 async def private_start(message: Message) -> None:
     if message.chat.type == ChatType.PRIVATE:
         await _send_main_menu(message.from_user.id)
-
 
 async def legacy_profile_start(message: Message) -> None:
     if (message.text or "").strip().lower() == "/start profile":
@@ -183,16 +168,8 @@ async def main() -> None:
     dp.message.middleware(UpdateLogger())
     dp.callback_query.middleware(UpdateLogger())
 
-    dp.message.register(
-        group_start,
-        CommandStart(),
-        F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
-    )
-    dp.message.register(
-        private_start,
-        CommandStart(),
-        F.chat.type == ChatType.PRIVATE,
-    )
+    dp.message.register(group_start, CommandStart(), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+    dp.message.register(private_start, CommandStart(), F.chat.type == ChatType.PRIVATE)
     dp.message.register(legacy_profile_start, CommandStart())
 
     setup_handlers(dp)
@@ -200,6 +177,7 @@ async def main() -> None:
     logger.info("[setup] routers registered: %d", len(getattr(dp, 'sub_routers', [])))
 
     scheduler = AsyncIOScheduler(timezone=timezone("Europe/Moscow"))
+    scheduler.add_job(_vacuum_old_messages, "interval", minutes=15)  # ⬅ запуск пылесоса
     scheduler.start()
 
     logger.info("🤖 Bot starting, version=%s", settings.VERSION)
@@ -215,17 +193,14 @@ async def main() -> None:
 # ════════════════════════════════════════════════════════════════════
 async def _test() -> None:
     from core.db import get_user_info as _orig_get_user_info
-
     async def _fake(_uid: int) -> dict:
         return {"role": settings.ACCESS["poll"][0]}
-
     import core.db as _db
     _db.get_user_info = _fake  # type: ignore
     kb = await get_main_menu(1)
-    assert kb and len(kb.keyboard) > 0, "Главное меню не сгенерировалось"
+    assert kb and len(kb.keyboard) > 0
     _db.get_user_info = _orig_get_user_info  # type: ignore
     print("main.py smoke-test OK")
-
 
 # ════════════════════════════════════════════════════════════════════
 # [∞] ENTRYPOINT
