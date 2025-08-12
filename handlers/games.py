@@ -162,39 +162,6 @@ async def new_games_handler(message: types.Message) -> None:
     await _delete_trigger(message)
 
 
-@router.message(Command("assigned_games"))
-@router.message(lambda m: m.text and m.text.strip() == "✅ Распределённые игры")
-async def assigned_games_handler(message: types.Message) -> None:
-    uid = message.from_user.id
-    ui = await get_user_info(uid)
-    if ui and ui["role"] in settings.ACCESS["games"]:
-        await show_games(
-            message,
-            uid,
-            [settings.SUCCESSFUL_STATUS_ID],
-            "✅ Распределённые игры:",
-        )
-    else:
-        await message.answer("⛔ Нет доступа.")
-    await _delete_trigger(message)
-
-
-@router.message(Command("assigned_games"))
-@router.message(lambda m: m.text and m.text.strip() == "✅ Распределённые игры")
-async def assigned_games_handler(message: types.Message) -> None:
-    uid = message.from_user.id
-    ui = await get_user_info(uid)
-    if ui and ui["role"] in settings.ACCESS["games"]:
-        await show_games(
-            message,
-            uid,
-            [settings.SUCCESSFUL_STATUS_ID],
-            "✅ Распределённые игры:",
-        )
-    else:
-        await message.answer("⛔ Нет доступа.")
-    await _delete_trigger(message)
-
 
 @router.message(Command("assigned_games"))
 @router.message(lambda m: m.text and m.text.strip() == "✅ Распределённые игры")

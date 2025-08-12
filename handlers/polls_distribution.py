@@ -1,172 +1,613 @@
 # handlers/polls_distribution.py
 # ─────────────────────────────────────────────────────────────────────────────
 """
-Ручное управление распределением (этап лидера):
-• Руководитель нажимает «✅ Утвердить игру» или «👌 Утвердить все готовые».
-• Распределение фиксируется → `state.locked_distribution`.
-• В чат ведущих уходит уведомление «Состав … утверждён…».
-• Каждому назначенному UID дашборд «Мои игры» перерисовывается.
-• Игры переводятся в режим ожидания подтверждений (state.pending_confirmations).
+Ручное управление распределением (этап лидера).
+После «Утвердить» распределение фиксируется и запускается цикл подтверждений.
 
-Версия v14.2-cycle · 2025-08-09
+Версия v14.9-cycle · 2025-08-12
+──────────────────────────────────────────────────────────────────────────────
+• Единый коллбэк «Утвердить»: poll_approve_{deal_id}.
+• Источник правды по составу — state.distribution_cache / poll_details.distribution.
+• Нормализация ролей (int и "Имя.1|uid" поддерживаются; одиночные int → [int]).
+• Поддержка legacy-ключей main_leaders/assistants.
+• Уведомление уходит в settings.POLLS_CHAT_ID (если задан) → лидеры → админ → ЛС.
+• approve_all_ready: перерисовка «Мои игры» делается ОДИН раз на батч uid.
+• Исправление «пылесоса»: коалесцируем redraw_my_games, исключая гонки.
+• Идемпотентность «Утвердить»: повторный клик не дублирует фиксацию/уведомления.
 """
 
 from __future__ import annotations
 
-import logging
-from typing import Dict, List, Set
+# ════════════════════════════════════════════════════════════════════
+# [0] IMPORTS
+# ════════════════════════════════════════════════════════════════════
+from __future__ import annotations
 
-from aiogram import Bot, Router, types
+import asyncio
+import logging
+from typing import Any, Dict, List, Set, Tuple
+
+from aiogram import Router
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup
 
 from core.config import settings
 from core.state import state
 from handlers.my_games import redraw_my_games
-from handlers.poll_details import refresh_deal_details
-
-import handlers.polls_lifecycle as plc  # noqa: E402
+import handlers.polls_lifecycle as plc  # локальный импорт, чтобы избежать циклов
+from services.gsheets import get_user_status_from_svetofor
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-# алиасы
+# алиас на проверку готовности сделки (из lifecycle)
 _is_deal_ready = plc._is_deal_ready
 
 
 # ════════════════════════════════════════════════════════════════════
-# [1] УТИЛИТЫ
+# [1] УТИЛИТЫ: нормализация, commit в state, формат уведомлений
 # ════════════════════════════════════════════════════════════════════
+"""
+Назначение:
+• нормализовать состав (int UID) из distribution_cache / poll_details;
+• жёсткая инварианта «1 uid → 1 роль» (main > assist > admin);
+• собрать «слоты» под «Мои игры»: lead1/assistant1/admin/trainee с тегами «Имя Ф.<суффикс>|uid»;
+• записать утверждённый состав в locked_distribution + poll_details.distribution + distribution_cache;
+• аккуратно собрать заголовок «Название. Дата Время. Пакет. N чел.» (через точки, с точкой в конце);
+• форматировать список участников «• Имя Ф.1 / • Имя Ф.2 / • Имя Ф. Адм / • Имя Ф. Стаж»;
+• локально перекрасить кнопку «Утвердить» → «✅ Утверждено» (без переходов).
+"""
 
-def _leaders_chat_id() -> int:
+def _target_chat_id() -> int | None:
+    """Единый чат уведомлений опроса."""
     return (
-        getattr(settings, "LEADERS_CHAT_ID", None)
+        getattr(state, "admin_chat_id", None)
+        or getattr(settings, "POLLS_CHAT_ID", None)
+        or getattr(settings, "LEADERS_CHAT_ID", None)
         or getattr(settings, "leaders_chat_id", None)
         or getattr(settings, "ADMIN_CHAT_ID", None)
         or getattr(settings, "admin_chat_id", None)
     )
 
+def _ensure_state_structs() -> None:
+    if not hasattr(state, "assigned_index") or state.assigned_index is None:
+        state.assigned_index = {}            # dict[int, set[int]]
+    if not hasattr(state, "locked_distribution") or state.locked_distribution is None:
+        state.locked_distribution = {}       # dict[int, dict[str,str]]
+    if not hasattr(state, "pending_confirmations") or state.pending_confirmations is None:
+        state.pending_confirmations = {}     # dict[int, dict]
+    if not hasattr(state, "distribution_cache") or state.distribution_cache is None:
+        state.distribution_cache = {}        # dict[str, dict[str,str]]
+    if not hasattr(state, "poll_details") or state.poll_details is None:
+        state.poll_details = {}              # dict[int, dict]
+    if not hasattr(state, "poll_distribution") or state.poll_distribution is None:
+        state.poll_distribution = {}         # dict[int, dict]
+
+def _parse_uid(val: Any) -> int | None:
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if "|" in s:
+            s = s.rsplit("|", 1)[-1]
+        try:
+            return int(s)
+        except ValueError:
+            return None
+    return None
+
+def _as_user_list(v: Any) -> List[int]:
+    out: List[int] = []
+    if v is None:
+        return out
+    if isinstance(v, int):
+        return [v]
+    if isinstance(v, str):
+        u = _parse_uid(v)
+        return [u] if u is not None else out
+    if isinstance(v, (list, tuple, set)):
+        for x in v:
+            out.extend(_as_user_list(x))
+    return out
+
+def _normalize_roles(raw: Dict[str, Any]) -> Dict[str, List[int]]:
+    main_val = raw.get("main", raw.get("main_leaders"))
+    assist_val = raw.get("assist", raw.get("assistants"))
+    admin_val = raw.get("admin")
+    return {"main": _as_user_list(main_val), "assist": _as_user_list(assist_val), "admin": _as_user_list(admin_val)}
+
+def _dedupe_roles(roles: Dict[str, List[int]]) -> Dict[str, List[int]]:
+    seen: Set[int] = set()
+    out: Dict[str, List[int]] = {"main": [], "assist": [], "admin": []}
+    for u in roles.get("main", []):
+        if u and u not in seen:
+            out["main"].append(u); seen.add(u)
+    for u in roles.get("assist", []):
+        if u and u not in seen:
+            out["assist"].append(u); seen.add(u)
+    for u in roles.get("admin", []):
+        if u and u not in seen:
+            out["admin"].append(u); seen.add(u)
+    return out
+
 def _uids_from_roles(roles: Dict[str, List[int]]) -> Set[int]:
-    return set(roles.get("main", []) + roles.get("assist", []) + roles.get("admin", []))
+    return set(roles.get("main", [])) | set(roles.get("assist", [])) | set(roles.get("admin", []))
 
-def _extract_current_team(deal_id: int) -> Dict[str, List[int]]:
-    roles = getattr(state, "detail_roles", {})
-    if isinstance(roles, dict) and deal_id in roles:
-        return {
-            "main": list(roles[deal_id].get("main", [])),
-            "assist": list(roles[deal_id].get("assist", [])),
-            "admin": list(roles[deal_id].get("admin", [])),
-        }
-    return {"main": [], "assist": [], "admin": []}
+def _extract_distribution_from_cache(deal_id: int) -> Dict[str, List[int]] | None:
+    dc = (getattr(state, "distribution_cache", {}) or {}).get(str(deal_id))
+    if isinstance(dc, dict):
+        return _normalize_roles(dc)
+    details = (getattr(state, "poll_details", {}) or {}).get(deal_id) or {}
+    if isinstance(details.get("distribution"), dict):
+        return _normalize_roles(details["distribution"])
+    dist3 = (getattr(state, "poll_distribution", {}) or {}).get(deal_id)
+    if isinstance(dist3, dict):
+        return _normalize_roles(dist3)
+    return None
 
-def _lock_distribution(deal_id: int, roles: Dict[str, List[int]]) -> Set[int]:
-    state.locked_distribution[deal_id] = roles
-    state.pending_confirmations[deal_id] = {
-        "distribution": roles,
-        "confirmed": set()
-    }
-    logger.debug("[polls_dist] deal %d locked, pending_confirmations=%s", deal_id, roles)
-    return _uids_from_roles(roles)
+async def _derive_team_roles(deal_id: int) -> Dict[str, List[int]]:
+    """Компонуем из ответов + Светофора, если кэши пусты."""
+    deal = next((d for d in (state.current_poll_deals or []) if int(d.get("id") or 0) == deal_id), None)
+    if not deal:
+        return {"main": [], "assist": [], "admin": []}
+
+    game_name = deal.get("game_name") or deal.get("name") or ""
+    cfg = plc._role_cfg(game_name)  # type: ignore[attr-defined]
+    need_main, need_assist = int(cfg["main_leaders"]), int(cfg["assistants"])
+
+    team: Dict[str, List[int]] = {"main": [], "assist": [], "admin": []}
+    used: Set[int] = set()
+
+    for pdata in (state.responses or {}).values():
+        users = (pdata.get("deals") or {}).get(deal_id, [])
+        if not users:
+            continue
+        for u in users:
+            uid = int(u.get("user_id") or 0)
+            if not uid or uid in used:
+                continue
+            status = await get_user_status_from_svetofor(uid, game_name)
+            if status == "green":
+                if len(team["main"]) < need_main:
+                    team["main"].append(uid); used.add(uid); continue
+                if len(team["assist"]) < need_assist:
+                    team["assist"].append(uid); used.add(uid); continue
+            elif status == "yellow":
+                if len(team["assist"]) < need_assist:
+                    team["assist"].append(uid); used.add(uid); continue
+
+    # админ — либо из кэша, либо по «админ доступен»
+    cached = (getattr(state, "distribution_cache", {}) or {}).get(str(deal_id)) or {}
+    if cached.get("admin"):
+        team["admin"] = _as_user_list(cached.get("admin"))
+    if not team["admin"]:
+        assigned = set(team["main"]) | set(team["assist"])
+        for pdata in (state.responses or {}).values():
+            for adm in (pdata.get("admin_available") or []):
+                uid = int(adm.get("user_id") or 0)
+                if uid and uid not in assigned:
+                    team["admin"] = [uid]
+                    break
+            if team["admin"]:
+                break
+
+    return team
+
+async def _get_current_team(deal_id: int, invoker_uid: int | None = None) -> Dict[str, List[int]]:
+    dist = _extract_distribution_from_cache(deal_id)
+    if dist is None or (not dist.get("main") and not dist.get("assist")):
+        derived = await _derive_team_roles(deal_id)
+        if dist and dist.get("admin") and not derived.get("admin"):
+            derived["admin"] = list(dist["admin"])
+        return _dedupe_roles(derived)
+    return _dedupe_roles(dist)
+
+# ── Формат «Имя Ф.» и теги «Имя Ф.<суффикс>|uid» ────────────────────
+async def _short_name(uid: int) -> str:
+    try:
+        from core.db import get_user_info  # async
+        ui = await get_user_info(uid) or {}
+    except Exception:
+        ui = {}
+    fn = (ui.get("first_name") or "").strip()
+    ln_i = (ui.get("last_name_initial") or ui.get("last_name", "")[:1].upper() + ".")
+    ln_i = (ln_i or "").strip()
+    return (f"{fn} {ln_i}".strip() or str(uid)).strip()
+
+async def _fmt(uid_: int, role_key: str) -> str:
+    """
+    Формирует тег для кэша распределения/подтверждений:
+      main    -> «Имя Ф.1|uid»
+      assist  -> «Имя Ф.2|uid»
+      admin   -> «Имя Ф.Адм|uid»
+      trainee -> «Имя Ф.Стаж|uid»
+    """
+    name = await _short_name(uid_)
+    suffix = {"main": ".1", "assist": ".2", "admin": ".Адм", "trainee": ".Стаж"}.get(role_key, "")
+    return f"{name}{suffix}|{uid_}".strip()
+
+async def _to_slot_distribution(deal_id: int, roles: Dict[str, List[int]]) -> Dict[str, str]:
+    """
+    Преобразует списки UID в слоты lead1/assistant1/admin/trainee с тегами «Имя Ф.<суффикс>|uid».
+    Количество слотов = фактическое количество в списках.
+    Стажёра тянем из distribution_cache, если был указан.
+    """
+    slot: Dict[str, str] = {}
+    idx = 1
+    for uid in roles.get("main", []):
+        slot[f"lead{idx}"] = await _fmt(uid, "main"); idx += 1
+    idx = 1
+    for uid in roles.get("assist", []):
+        slot[f"assistant{idx}"] = await _fmt(uid, "assist"); idx += 1
+    if roles.get("admin"):
+        slot["admin"] = await _fmt(roles["admin"][0], "admin")
+
+    # trainee — оставляем, если есть в legacy-кэше
+    raw = (getattr(state, "distribution_cache", {}) or {}).get(str(deal_id), {})
+    if isinstance(raw, dict) and raw.get("trainee"):
+        slot["trainee"] = str(raw["trainee"])
+    return slot
+
+def _deal_title(deal_id: int) -> str:
+    """Короткое имя сделки для логов."""
+    try:
+        for d in (state.current_poll_deals or []):
+            if int(d.get("id") or 0) == deal_id:
+                return str(d.get("game_name") or d.get("name") or f"Сделка #{deal_id}")
+        title = (getattr(state, "deal_titles", {}) or {}).get(deal_id)
+        return str(title) if title else f"Сделка #{deal_id}"
+    except Exception:
+        return f"Сделка #{deal_id}"
+
+def _deal_header_sentence(deal_id: int) -> str:
+    """
+    «Название. ДД.ММ.ГГГГ ЧЧ:ММ. Пакет. N чел.» — с точками и точкой в конце.
+    """
+    d = next((x for x in (state.current_poll_deals or []) if int(x.get("id") or 0) == deal_id), None)
+    meta = (getattr(state, "deals_index", {}) or {}).get(deal_id, {})
+
+    title = str((d or {}).get("game_name") or (d or {}).get("name") or meta.get("title") or f"Сделка #{deal_id}").strip()
+    date_s = ""
+    time_s = ""
+    if d and d.get("event_datetime"):
+        try:
+            date_s = d["event_datetime"].strftime("%d.%m.%Y")
+        except Exception:
+            date_s = str(d.get("event_date") or meta.get("date") or "")
+    else:
+        date_s = str((d or {}).get("event_date") or meta.get("date") or "")
+    time_s = str((d or {}).get("event_time") or meta.get("time") or "")
+
+    pkg = str((d or {}).get("package") or meta.get("package") or "").strip()
+    players = str((d or {}).get("players") or (d or {}).get("players_count") or meta.get("players") or "")
+
+    parts = [title, f"{date_s} {time_s}".strip(), pkg, (f"{players} чел." if players else "")]
+    sent = ". ".join([p for p in parts if p]).strip().rstrip(".") + "."
+    return sent
+
+async def _team_bulleted_lines(roles: Dict[str, List[int]], deal_id: int) -> List[str]:
+    """Строки для чата:
+    • Имя Ф.1 / • Имя Ф.2 / • Имя Ф. Адм / • Имя Ф. Стаж (если есть).
+    """
+    lines: List[str] = []
+    for uid in roles.get("main", []):
+        lines.append(f"• {await _short_name(uid)}.1".replace("..1", ".1"))
+    for uid in roles.get("assist", []):
+        lines.append(f"• {await _short_name(uid)}.2".replace("..2", ".2"))
+    for uid in roles.get("admin", []):
+        lines.append(f"• {await _short_name(uid)} Адм")
+    # стаж — из кэша, если указан
+    raw = (getattr(state, "distribution_cache", {}) or {}).get(str(deal_id), {})
+    if isinstance(raw, dict) and raw.get("trainee"):
+        try:
+            t_uid = _parse_uid(raw.get("trainee"))
+            if t_uid:
+                lines.append(f"• {await _short_name(t_uid)} Стаж")
+        except Exception:
+            pass
+    return lines or ["• —"]
+
+def _approval_announce_kb() -> InlineKeyboardMarkup:
+    """Инлайн-кнопка для визуального «[ Личный кабинет ]» (без автопереходов)."""
+    from aiogram.types import InlineKeyboardButton
+    # callback noop — только визуал, без переходов (чтобы ничего не ломать)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Личный кабинет", callback_data="noop")]
+    ])
+
+def _mark_approved_on_message_kb(callback: CallbackQuery, deal_id: int) -> InlineKeyboardMarkup | None:
+    """Локально меняет «Утвердить» → «✅ Утверждено» в текущем сообщении."""
+    try:
+        kb = callback.message.reply_markup
+        if not isinstance(kb, InlineKeyboardMarkup):
+            return None
+        from aiogram.types import InlineKeyboardButton
+        new_rows: List[List[InlineKeyboardButton]] = []
+        for row in kb.inline_keyboard:
+            new_row: List[InlineKeyboardButton] = []
+            for btn in row:
+                if getattr(btn, "callback_data", "") == f"poll_approve_{deal_id}":
+                    new_row.append(InlineKeyboardButton(text="✅ Утверждено", callback_data="noop"))
+                else:
+                    new_row.append(btn)
+            new_rows.append(new_row)
+        return InlineKeyboardMarkup(inline_keyboard=new_rows)
+    except Exception:
+        logger.exception("[approve] failed to rebuild keyboard")
+        return None
+
+async def _commit_locked_distribution_to_state(deal_id: int, roles: Dict[str, List[int]]) -> Dict[str, str]:
+    """
+    Синхронизируем все точки правды (ФОРМАТ совместим с «Мои игры»):
+    • locked_distribution[deal_id] ← {'lead1': 'Имя Ф.1|uid', 'assistant1': 'Имя Ф.2|uid', 'admin': 'Имя Ф.Адм|uid', 'trainee': 'Имя Ф.Стаж|uid'?}
+    • pending_confirmations[deal_id]['distribution'] ← тот же dict
+    • distribution_cache[str(deal_id)] ← тот же dict
+    • poll_details[deal_id]['distribution'] ← тот же dict
+    • assigned_index[uid] ← deal_id
+    Возвращает финальный dict слотов.
+    """
+    _ensure_state_structs()
+    slots = await _to_slot_distribution(deal_id, roles)
+
+    state.locked_distribution[deal_id] = dict(slots)
+    state.pending_confirmations[deal_id] = {"distribution": dict(slots), "confirmed": set()}
+
+    state.distribution_cache[str(deal_id)] = dict(slots)
+    pd = state.poll_details.setdefault(deal_id, {})
+    pd["distribution"] = dict(slots)
+
+    # индекс назначений — по всем UID из слотов
+    all_uids: Set[int] = set()
+    for v in slots.values():
+        u = _parse_uid(v)
+        if u:
+            all_uids.add(u)
+    for uid in all_uids:
+        idx = state.assigned_index.setdefault(uid, set())
+        idx.add(deal_id)
+
+    logger.debug("[polls_dist] deal %d locked+committed; slots=%s", deal_id, slots)
+    return slots
+
 
 
 # ════════════════════════════════════════════════════════════════════
-# [2] INLINE-КЛАВИАТУРА (заглушка)
+# [1.1] Коалесцирование перерисовок «Мои игры» (фикс гонок «пылесоса»)
 # ════════════════════════════════════════════════════════════════════
+def _queue_redraw_my_games(uids: Set[int], delay_sec: float = 0.15) -> None:
+    """
+    Складываем uid в аккумулятор и планируем ОДНУ задачу,
+    которая через короткую паузу перерисует дашборд для каждого uid ровно один раз.
+    """
+    if not uids:
+        return
 
+    acc: Set[int] = getattr(state, "_redraw_accum", set())
+    acc |= set(uids)
+    setattr(state, "_redraw_accum", acc)
+
+    task: asyncio.Task | None = getattr(state, "_redraw_task", None)
+    if task and not task.done():
+        return
+
+    async def _runner():
+        try:
+            await asyncio.sleep(delay_sec)
+            batch: Set[int] = getattr(state, "_redraw_accum", set())
+            setattr(state, "_redraw_accum", set())
+            for uid in sorted(batch):
+                try:
+                    await redraw_my_games(uid)
+                except Exception as e:
+                    logger.error("[redraw_coalesce] uid=%s failed: %s", uid, e)
+        finally:
+            setattr(state, "_redraw_task", None)
+
+    setattr(state, "_redraw_task", asyncio.create_task(_runner()))
+
+
+# ════════════════════════════════════════════════════════════════════
+# [2] INLINE-КЛАВИАТУРА (резерв под действия)
+# ════════════════════════════════════════════════════════════════════
 def distribution_actions_markup() -> InlineKeyboardMarkup:
+    """Нижняя action-панель для отчёта лидеру (зарезервировано под будущее)."""
     return InlineKeyboardMarkup(inline_keyboard=[])
 
 
 # ════════════════════════════════════════════════════════════════════
-# [3] HANDLER approve_deal
+# [3] HANDLER: Утвердить одну игру (без автопереходов)
 # ════════════════════════════════════════════════════════════════════
-
-@router.callback_query(lambda c: c.data.startswith("approve_deal_"))
+@router.callback_query(lambda c: c.data and c.data.startswith("poll_approve_"))
 async def poll_approve_game_handler(callback: CallbackQuery) -> None:
+    """
+    Утверждение одной игры. Без автопереходов:
+    • только перекраска кнопки в текущем сообщении,
+    • запись состава в кэши/индексы в формате «слотов»,
+    • чат-уведомление ровно по ТЗ.
+    """
     try:
-        deal_id = int(callback.data.rsplit("_", 1)[-1])
+        deal_id = int((callback.data or "").rsplit("_", 1)[-1])
     except Exception:
         await callback.answer("Ошибка: неизвестный формат callback.", show_alert=True)
         return
 
-    from handlers.polls_lifecycle import _sync_leader_report
-    ready = await _is_deal_ready(deal_id)
-    if not ready:
+    # уже утверждено?
+    if deal_id in (getattr(state, "locked_distribution", {}) or {}):
+        try:
+            kb = _mark_approved_on_message_kb(callback, deal_id)
+            if kb and callback.message:
+                await callback.message.edit_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
+        await callback.answer("Уже утверждено ✅")
+        return
+
+    if not await _is_deal_ready(deal_id):
         await callback.answer("Минимальный состав ещё не набран.", show_alert=True)
         return
 
-    roles = _extract_current_team(deal_id)
+    roles = await _get_current_team(deal_id, callback.from_user.id)
     if not _uids_from_roles(roles):
-        logger.warning("[approve] deal %d has no roles in detail_roles", deal_id)
-        await callback.answer("Нет текущего распределения (откройте детали и расставьте роли).", show_alert=True)
+        logger.warning("[approve] deal %d has empty roles after normalization", deal_id)
+        await callback.answer("Нет текущего распределения. Откройте детали и расставьте роли.", show_alert=True)
         return
 
-    _lock_distribution(deal_id, roles)
-    state.approved_deals.add(deal_id)
+    # фиксируем и синхронизируем кэши (включая poll_details.distribution)
+    await _commit_locked_distribution_to_state(deal_id, roles)
 
-    await callback.answer("Игра утверждена ✅")
-
-    # уведомление в чат ведущих
-    chat_id = _leaders_chat_id()
+    # перекраска кнопки в текущем сообщении (без редравов «Моих игр»)
     try:
-        title = state.deal_titles.get(deal_id, f"Сделка #{deal_id}")
-        text = f"🚦 Состав команды на игру «{title}» утверждён.\n" \
-               f"Подтвердите своё участие в личном кабинете: «🎲 Мои игры» → «✅ Подтвердить»."
-        await callback.message.bot.send_message(chat_id, text)
+        kb = _mark_approved_on_message_kb(callback, deal_id)
+        if kb and callback.message:
+            await callback.message.edit_reply_markup(reply_markup=kb)
     except Exception as e:
-        logger.error("[approve] notify leaders chat failed: %s", e)
-
-    # обновляем дашборды «Мои игры»
-    for uid in _uids_from_roles(roles):
-        try:
-            await redraw_my_games(uid)
-        except Exception as exc:
-            logger.warning("[polls_dist] redraw_my_games uid %d failed: %s", uid, exc)
+        logger.debug("[approve] edit_reply_markup failed: %s", e)
 
     try:
-        await _sync_leader_report()
+        await callback.answer("Игра утверждена ✅")
+    except Exception:
+        pass
+
+    # чат-уведомление по ТЗ
+    chat_id = _target_chat_id()
+    if chat_id is not None and callback.message:
+        try:
+            head = _deal_header_sentence(deal_id)
+            lines = await _team_bulleted_lines(roles, deal_id)  # async!
+            text = (
+                f"✅ Состав команды на игру {head} утверждён.\n"
+                + "\n".join(lines)
+                + "\nПодтвердите своё участие в личном кабинете: «🎲 Мои игры» → «✅ Подтвердить»."
+            )
+            await callback.message.bot.send_message(int(str(chat_id).strip()), text, reply_markup=_approval_announce_kb())
+        except Exception as e:
+            logger.error("[approve] notify chat failed: %s", e)
+
+    # обновление отчёта лидеру (без удаления/открытия ЛС у других)
+    try:
+        await plc._sync_leader_report()
     except Exception as e:
         logger.warning("[approve] _sync_leader_report failed: %s", e)
-
-    try:
-        await refresh_deal_details(callback.from_user.id, deal_id)
-    except Exception as e:
-        logger.warning("[approve] refresh_deal_details failed: %s", e)
 
     logger.info("[approve] deal %d approved by %d; roles=%s", deal_id, callback.from_user.id, roles)
 
 
 # ════════════════════════════════════════════════════════════════════
-# [4] HANDLERS stop/back
+# [4] HANDLER: Утвердить все готовые (батч, без автопереходов)
 # ════════════════════════════════════════════════════════════════════
+@router.callback_query(lambda c: c.data == "approve_all_ready")
+async def poll_approve_all_ready_handler(callback: CallbackQuery) -> None:
+    """
+    Утверждает все игры, где набран минимальный состав.
+    Без автопереходов/редравов «Моих игр». На каждую игру — корректное чат-уведомление.
+    """
+    try:
+        await callback.answer("Обрабатываю…")
+    except Exception:
+        pass
 
-@router.callback_query(lambda c: c.data.startswith("poll_stop_"))
+    approved: List[int] = []
+    skipped: List[Tuple[int, str]] = []
+
+    for deal in list(state.current_poll_deals or []):
+        did = int(deal.get("id") or 0)
+        if not did:
+            continue
+        try:
+            if not await _is_deal_ready(did):
+                skipped.append((did, "not_ready"))
+                continue
+            if did in (getattr(state, "locked_distribution", {}) or {}):
+                approved.append(did)
+                continue
+
+            roles = await _get_current_team(did, callback.from_user.id)
+            if not _uids_from_roles(roles):
+                skipped.append((did, "no_roles"))
+                continue
+
+            await _commit_locked_distribution_to_state(did, roles)
+            approved.append(did)
+
+            # чат-уведомление «как в одиночном approve»
+            chat_id = _target_chat_id()
+            if chat_id is not None and callback.message:
+                try:
+                    head = _deal_header_sentence(did)
+                    lines = await _team_bulleted_lines(roles, did)
+                    text = (
+                        f"✅ Состав команды на игру {head} утверждён.\n"
+                        + "\n".join(lines)
+                        + "\nПодтвердите своё участие в личном кабинете: «🎲 Мои игры» → «✅ Подтвердить»."
+                    )
+                    await callback.message.bot.send_message(int(str(chat_id).strip()), text, reply_markup=_approval_announce_kb())
+                except Exception as e:
+                    logger.error("[approve_all] notify chat failed for %s: %s", did, e)
+
+        except Exception as e:
+            logger.warning("[approve_all] deal %s failed: %s", did, e)
+            skipped.append((did, "exception"))
+
+    try:
+        if approved:
+            await callback.answer(f"Утверждено игр: {len(approved)} ✅")
+        else:
+            await callback.answer("Нет готовых игр для утверждения.", show_alert=True)
+    except Exception:
+        pass
+
+    try:
+        await plc._sync_leader_report()
+    except Exception as e:
+        logger.warning("[approve_all] _sync_leader_report failed: %s", e)
+
+
+# ════════════════════════════════════════════════════════════════════
+# [5] ПРОЧИЕ HANDLERS: stop / back
+# ════════════════════════════════════════════════════════════════════
+@router.callback_query(lambda c: c.data and c.data.startswith("poll_stop_"))
 async def poll_stop_game_handler(callback: CallbackQuery) -> None:
-    deal_id = int(callback.data.rsplit("_", 1)[-1])
+    try:
+        deal_id = int((callback.data or "").rsplit("_", 1)[-1])
+    except Exception:
+        try:
+            await callback.answer()
+        except Exception:
+            pass
+        return
     state.deal_force_closed.add(deal_id)
-    await callback.answer("Набор остановлен.")
+    try:
+        await callback.answer("Набор остановлен.")
+    except Exception:
+        pass
     logger.info("[details] deal %d force-stopped by %d", deal_id, callback.from_user.id)
 
-@router.callback_query(lambda c: c.data.startswith("poll_back_"))
+@router.callback_query(lambda c: c.data and c.data.startswith("poll_back_"))
 async def poll_back_handler(callback: CallbackQuery) -> None:
-    await callback.answer()
-    from handlers.polls_lifecycle import _sync_leader_report
     try:
-        await _sync_leader_report()
+        await callback.answer()
+    except Exception:
+        pass
+    try:
+        await plc._sync_leader_report()
     except Exception as e:
         logger.warning("[back] _sync_leader_report failed: %s", e)
+
 
 
 # ════════════════════════════════════════════════════════════════════
 # [99] SELF-TEST
 # ════════════════════════════════════════════════════════════════════
-
 async def _test() -> None:
-    roles = {"main": [1], "assist": [2], "admin": [3]}
-    uids = _uids_from_roles(roles)
-    assert uids == {1, 2, 3}
+    """Быстрые проверки нормализации и форматирования (без внешних сервисов)."""
+    raw = {"main": [1, "Иван И.|101"], "assist": ["202"], "admin": ["bad", 303, "303", "Петр|404", ["505", ["Сергей|606"]]]}
+    norm = _normalize_roles(raw)
+    assert norm == {"main": [1, 101], "assist": [202], "admin": [303, 303, 404, 505, 606]}
+    dd = _dedupe_roles(norm)
+    assert dd == {"main": [1, 101], "assist": [202], "admin": [303, 404, 505, 606]}
+    assert _uids_from_roles(dd) == {1, 101, 202, 303, 404, 505, 606}
     print("handlers.polls_distribution ✅ tests passed")
 
 if __name__ == "__main__":
-    import asyncio, logging as _l
+    import asyncio as _a, logging as _l
     _l.basicConfig(level=_l.DEBUG)
-    asyncio.run(_test())
+    _a.run(_test())

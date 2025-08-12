@@ -1,7 +1,20 @@
-# ███ [0] IMPORTS
-# --------------------------------------------------------------------
+# handlers/polls_lifecycle.py — цикл опроса/распределения
+# ─────────────────────────────────────────────────────────────────────
+"""
+Создание опросов, приём ответов, отчёт лидеру и служебные утилиты.
+
+Версия 6.1 · 2025-08-11
+──────────────────────────────────────────────────────────────────────
+• Жёсткое правило «один активный блок» у лидера: edit → send → vacuum(keep).
+• Исправлен «пылесос»: больше нет вызовов корутины без await.
+• Генерация отчёта не дублируется, совместимость с polls_distribution/poll_details.
+• Уведомления и таймеры не тронуты; логика автораспределения/готовности сохранена.
+"""
+
 from __future__ import annotations
 
+# ███ [0] IMPORTS
+# --------------------------------------------------------------------
 import asyncio
 import logging
 import re
@@ -13,7 +26,6 @@ from aiogram.filters import Command
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
 )
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from pytz import timezone
@@ -37,27 +49,20 @@ MSK_TZ = timezone("Europe/Moscow")
 # История изменений:
 #   • 2025-07-31 — перенёс future.annotations, убрал лишние импорты
 #   • 2025-08-03 — добавлен PROFILE_BUTTON_TEXT и ReplyKeyboardBuilder
-#   • 2025-08-09 — добавлен импорт F для корректной работы фильтров aiogram
-
+#   • 2025-08-09 — импорт F; унификация approve → poll_approve_{id}
+#   • 2025-08-11 — фикс «пылесоса», единый активный блок, удалены дубликаты
 
 # ════════════════════════════════════════════════════════════════════
-# [1] ГЛАВНОЕ МЕНЮ
+# [1] ГЛАВНОЕ МЕНЮ (ре-экспорт)
 # ════════════════════════════════════════════════════════════════════
-# Единственный источник меню теперь в core.menu.
-# Оставляем ре-экспорт, чтобы старые импорты не упали.
 from core.menu import get_main_menu  # noqa: F401
 
 
-
 # ════════════════════════════════════════════════════════════════════
-# [2] ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ, НАПОМИНАНИЯ, «+»-КОНФИРМЫ
+# [2] ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ, НАПОМИНАНИЯ, ДЕТАЛИ
 # ════════════════════════════════════════════════════════════════════
 
-# ── 2.0  Конфиг ролей для игры ─────────────────────────────────────
-# FIX 2025-08-03 — расширенный tolerant-поиск:
-#   • точное совпадение → подстрока → fuzzy-ratio > 0.8.
-#   • исключены дубли кода.
-# --------------------------------------------------------------------
+# ── 2.0  Конфиг ролей для игры (tolerant-match) ────────────────────
 _RE_NON_ALNUM = re.compile(r"[^\w\d]+", re.UNICODE)
 
 def _clean(txt: str) -> str:
@@ -85,13 +90,16 @@ def _role_cfg(game_name: str) -> Dict[str, int]:
         return best_cfg  # type: ignore[return-value]
     return {"main_leaders": 1, "assistants": 0}
 
+def _deal_title(deal: dict) -> str:
+    """Безопасно возвращает заголовок игры для UI/уведомлений."""
+    return str(deal.get("game_name") or deal.get("name") or f"Сделка #{deal.get('id')}")
+
 # ────────────────────────────────────────────────────────────────────
 # 2.1  Напоминания «Отметьтесь в опросе»
 # ────────────────────────────────────────────────────────────────────
 async def _send_reminders() -> None:
     """
-    Отправляет личное сообщение тем, кто ещё не заполнил опрос.
-    Планируется через `_schedule_reminders()`.
+    Отправляет ЛС тем, кто ещё не заполнил опрос. Планируется через _schedule_reminders().
     """
     if state.force_closed or not state.coordination_cycle_active:
         logger.debug("[reminders] skip: cycle finished/paused")
@@ -120,10 +128,7 @@ async def _send_reminders() -> None:
             logger.warning("[reminders] ping to %d FAILED: %s", uid, exc)
 
 def _schedule_reminders() -> None:
-    """
-    Планирует два вызова `_send_reminders()` через 6 ч и 18 ч.
-    Сохраняет таймеры в state.reminder_tasks.
-    """
+    """Планирует два вызова `_send_reminders()` через 6 ч и 18 ч."""
     _cancel_reminders()
     loop = asyncio.get_event_loop()
     for hours in (6, 18):
@@ -132,12 +137,10 @@ def _schedule_reminders() -> None:
             lambda: asyncio.create_task(_send_reminders()),
         )
         state.reminder_tasks.append(handle)
-    logger.debug("[reminders] scheduled (%s)", ", ".join(f"{h} h" for h in (6, 18)))
+    logger.debug("[reminders] scheduled (6 h, 18 h)")
 
 def _cancel_reminders() -> None:
-    """
-    Отменяет все запланированные напоминания и очищает список.
-    """
+    """Отменяет все запланированные напоминания и очищает список."""
     for h in state.reminder_tasks:
         try:
             h.cancel()
@@ -151,10 +154,7 @@ def _cancel_reminders() -> None:
 # 2.2  Пост «Подтвердите +» в админ-чате
 # ────────────────────────────────────────────────────────────────────
 async def _request_confirmations() -> None:
-    """
-    Создаёт в admin-чате пост «Подтвердите “+”» и помечает, что он уже отправлен.
-    Не дублирует публикацию, если уже был вызван.
-    """
+    """Создаёт пост «Подтвердите “+”» и помечает, что он уже отправлен."""
     if state.manual_confirm_requested:
         logger.debug("[confirm_post] already requested → skip")
         return
@@ -175,9 +175,7 @@ async def _request_confirmations() -> None:
 # 2.3  Обновление detail-view карточек у пользователей
 # ────────────────────────────────────────────────────────────────────
 async def _refresh_detail_views(impacted: Set[int], refresh_all: bool) -> None:
-    """
-    Перерисовывает открытые detail-view’ы пользователей.
-    """
+    """Перерисовывает открытые detail-view’ы пользователей."""
     if refresh_all:
         impacted = {d["id"] for d in state.current_poll_deals}
 
@@ -195,7 +193,6 @@ async def _refresh_detail_views(impacted: Set[int], refresh_all: bool) -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-
 # ════════════════════════════════════════════════════════════════════
 # [3] СОЗДАНИЕ ОПРОСА
 # ════════════════════════════════════════════════════════════════════
@@ -205,11 +202,10 @@ async def create_poll_handler(message: types.Message) -> None:
     """
     Хендлер кнопки/команды «Создать опрос».
 
-    • детальные логи: INFO / DEBUG / WARNING;
-    • проверка доступа, активного цикла, admin-чата;
-    • выбирает новые игры (14 дней вперёд, без назначенных ведущих);
-    • инициализирует state, рассылает Poll’ы, ставит таймеры;
-    • учитывает требования min-состава (_role_cfg) — логика НЕ изменена.
+    • Проверка доступа, активного цикла и admin-чата.
+    • Выбор игр (14 дней вперёд, статусы из settings.NEW_GAMES_STATUS_IDS, без назначенных ведущих).
+    • Инициализация state, рассылка Poll’ов по частям до 8 опций.
+    • Таймер авто-завершения, напоминания, отчёт лидеру.
     """
     uid = message.from_user.id
     logger.info("[create_poll] invoked by %d, text=%s", uid, (message.text or "").strip())
@@ -237,7 +233,7 @@ async def create_poll_handler(message: types.Message) -> None:
 
     # ── 2. получаем сделки из AmoCRM ────────────────────────────────
     try:
-        deals = await get_amocrm_deals()               # ← БЕЗ аргумента!
+        deals = await get_amocrm_deals()               # ← без аргумента
     except Exception as exc:
         logger.exception("[create_poll] get_amocrm_deals failed: %s", exc)
         await message.answer("⚠️ Не удалось получить игры из AmoCRM.")
@@ -273,6 +269,7 @@ async def create_poll_handler(message: types.Message) -> None:
     state.confirmed_users.clear()
     state.current_deal_ready.clear()
     state.all_ready_notified        = False
+    state.personal_report_message_id = None
 
     # ── 4. отправляем опрос(ы) ──────────────────────────────────────
     urgent = any(d["event_datetime"] <= now + timedelta(days=3) for d in poll_deals)
@@ -286,7 +283,7 @@ async def create_poll_handler(message: types.Message) -> None:
         idx_map: Dict[int, int] = {}
 
         for i, d in enumerate(chunk):
-            s = f"🎉 {d['name']} — {d['event_datetime']:%d.%m}"
+            s = f"🎉 {_deal_title(d)} — {d['event_datetime']:%d.%m}"
             if pkg := d.get("package"):
                 s += f" · {pkg}"
             if extra := d.get("extra_services"):
@@ -329,22 +326,16 @@ async def create_poll_handler(message: types.Message) -> None:
     await _delete_trigger(message)
 
 # ════════════════════════════════════════════════════════════════════
-# [4] ОТЧЁТ / КЛАВИАТУРА
+# [4] ОТЧЁТ / КЛАВИАТУРА / ПРИЁМ ОТВЕТОВ
 # ════════════════════════════════════════════════════════════════════
 def _merge_keyboards(
     k1: InlineKeyboardMarkup,
     k2: InlineKeyboardMarkup,
 ) -> InlineKeyboardMarkup:
-    """
-    Склеивает две Inline-клавиатуры, сохраняя порядок строк.
-    Используется при формировании личного дашборда лидера:
-      • k1 — кнопки игр,
-      • k2 — action-панель (approve/refresh и т. д.).
-    """
+    """Склейка двух Inline-клавиатур, сохраняя порядок строк."""
     return InlineKeyboardMarkup(
         inline_keyboard=[*k1.inline_keyboard, *k2.inline_keyboard]
     )
-
 
 async def generate_poll_report() -> str:
     """
@@ -352,15 +343,17 @@ async def generate_poll_report() -> str:
 
     • Для каждой игры показывает «✅/❌», название и дату.
     • Если минимум набран — добавляет кнопку «👍 Утвердить».
-    • Когда готова хотя бы одна игра — добавляет «Утвердить все».
-    • При готовности игры — гарантирует, что распределение в state.poll_distribution
-      заполнено из актуальных деталей (state.poll_details).
+    • Если игра уже зафиксирована — показывает «✅ Утверждено».
+    • «Утвердить все» появляется, только если есть готовые и не зафиксированные игры.
+    • Для ready-игр синхронизирует distribution из poll_details → state.poll_distribution.
     """
     if not state.current_poll_deals or not state.responses:
         return "⚠️ Нет активных опросов."
 
     keyboard: List[List[InlineKeyboardButton]] = []
-    any_ready = False
+    any_ready_unlocked = False
+
+    locked_map = getattr(state, "locked_distribution", {}) or {}
 
     for deal in state.current_poll_deals:
         did = deal["id"]
@@ -368,88 +361,64 @@ async def generate_poll_report() -> str:
             continue
 
         ready = await _is_deal_ready(did)
-        any_ready |= ready
-        icon = "✅" if ready else "❌"
+        locked = did in locked_map
+        title = _deal_title(deal)
+        icon = "✅" if (ready or locked) else "❌"
 
-        # Если игра готова — подстрахуем, чтобы распределение было в state.poll_distribution
-        if ready:
-            details = state.poll_details.get(did)
+        # Синхронизация распределения из деталей (только для ready)
+        if ready and not locked:
+            details = getattr(state, "poll_details", {}).get(did)
             if details and "distribution" in details:
                 state.poll_distribution[did] = details["distribution"]
                 logger.debug("[report] deal_id=%d distribution synced from poll_details", did)
             else:
                 logger.warning("[report] deal_id=%d ready, но нет distribution в poll_details", did)
 
-        # Кнопка открытия деталей игры
         row: List[InlineKeyboardButton] = [
             InlineKeyboardButton(
-                text=f"{icon} {deal['game_name']} — {deal['event_datetime']:%d.%m}",
+                text=f"{icon} {title} — {deal['event_datetime']:%d.%m}",
                 callback_data=f"show_deal_{did}",
             )
         ]
-        # Если готово — добавляем кнопку «👍 Утвердить»
-        if ready:
+        if locked:
+            row.append(
+                InlineKeyboardButton(
+                    text="✅ Утверждено",
+                    callback_data="noop",
+                )
+            )
+        elif ready:
             row.append(
                 InlineKeyboardButton(
                     text="👍 Утвердить",
-                    callback_data=f"approve_deal_{did}",
+                    callback_data=f"poll_approve_{did}",
                 )
             )
+            any_ready_unlocked = True
+
         keyboard.append(row)
+        logger.debug("[report] deal_id=%d ready=%s locked=%s (%s)", did, ready, locked, title)
 
-        logger.debug(
-            "[report] deal_id=%d ready=%s (%s)",
-            did,
-            ready,
-            deal["game_name"],
-        )
+    if any_ready_unlocked:
+        keyboard.append([InlineKeyboardButton(text="Утвердить все", callback_data="approve_all_ready")])
 
-    # Если есть хотя бы одна готовая игра — добавляем кнопку «Утвердить все»
-    if any_ready:
-        keyboard.append(
-            [InlineKeyboardButton(text="Утвердить все", callback_data="approve_all_ready")]
-        )
-
-    # Сохраняем клавиатуру в state для дальнейшего использования
     state.distribution_keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard)
     return "📊 *Опрос создан. Выберите игру:*"
 
-
-# ███ [4.x] Вспом. клавиатура отчёта и __all__
-# --------------------------------------------------------------------
 def _build_report_keyboard() -> InlineKeyboardMarkup:
     """
     Собирает клавиатуру для личного отчёта лидеру:
-      • верхняя часть — кнопки игр (state.distribution_keyboard);
-      • нижняя часть — action-панель из polls_distribution.
+      • верх — кнопки игр (state.distribution_keyboard);
+      • низ — action-панель из polls_distribution.
     """
     from handlers.polls_distribution import distribution_actions_markup  # локальный import
-
     games_kb = state.distribution_keyboard or InlineKeyboardMarkup(inline_keyboard=[])
     actions_kb = distribution_actions_markup()
-    # «Склейка» двух клавиатур
-    return InlineKeyboardMarkup(
-        inline_keyboard=games_kb.inline_keyboard + actions_kb.inline_keyboard
-    )
+    return InlineKeyboardMarkup(inline_keyboard=games_kb.inline_keyboard + actions_kb.inline_keyboard)
 
-
-# Экспорт «приватных» функций, которые используют другие модули
-__all__ = [
-    "_cancel_reminders",
-    "_request_confirmations",
-    "_is_deal_ready",
-    "clear_poll_data",
-]
-# История изменений:
-#  • 2025-07-30 — фиксы Pylance (_build_report_keyboard, __all__)
-#  • 2025-08-09 — добавлена автосинхронизация distribution из poll_details для ready-игр
-
-
-# ════════════════════════════════════════════════════════════════════
-# [5] ПРИЁМ ОТВЕТОВ
-# ════════════════════════════════════════════════════════════════════
 @router.poll_answer()
 async def handle_poll_answer(event: types.PollAnswer) -> None:
+    """Фиксация выбора пользователя + пересчёт готовности (ЕДИНАЯ версия)."""
     uid, poll_id, chosen = event.user.id, event.poll_id, event.option_ids
     data = state.responses.get(poll_id)
     if not data:
@@ -457,7 +426,7 @@ async def handle_poll_answer(event: types.PollAnswer) -> None:
 
     logger.debug("[answer] uid=%d poll=%s choices=%s", uid, poll_id, chosen)
 
-    # очистка
+    # очистка старых меток пользователя
     for lst in data["deals"].values():
         lst[:] = [u for u in lst if u["user_id"] != uid]
     data["not_available"][:] = [u for u in data["not_available"] if u["user_id"] != uid]
@@ -497,23 +466,28 @@ async def handle_poll_answer(event: types.PollAnswer) -> None:
     await _check_ready_state(impacted)
     asyncio.create_task(_refresh_detail_views(impacted, refresh_all))
 
-
-
-
 # ════════════════════════════════════════════════════════════════════
-# [6] ОТЧЁТ ЛИДЕРУ
+# [5] ОТЧЁТ ЛИДЕРУ И ГОТОВНОСТЬ ИГР
 # ════════════════════════════════════════════════════════════════════
 async def _send_leader_report(leader_id: int) -> None:
-    """Отправляет или обновляет отчёт лидеру."""
+    """Отправляет или обновляет отчёт лидеру (первичная выдача)."""
     bot = Bot.get_current()
     text = await generate_poll_report()
     kb = _build_report_keyboard()
-    sent = await bot.send_message(
-        leader_id, text, parse_mode="Markdown", reply_markup=kb
-    )
+
+    # перед отправкой подчистим старые служебные сообщения
+    try:
+        await delete_previous_private_messages(bot, leader_id, keep=[])
+    except TypeError:
+        # совместимость со старой сигнатурой
+        try:
+            await delete_previous_private_messages(leader_id)  # type: ignore
+        except Exception:
+            pass
+
+    sent = await bot.send_message(leader_id, text, parse_mode="Markdown", reply_markup=kb)
     state.personal_report_message_id = sent.message_id
     state.last_user_messages[leader_id] = [sent]
-
 
 @router.message(lambda m: m.text == "📊 Отчёт по опросу")
 async def poll_report_handler(message: types.Message) -> None:
@@ -529,8 +503,16 @@ async def poll_report_handler(message: types.Message) -> None:
         await _delete_trigger(message)
         return
 
-    await delete_previous_private_messages(uid)
     bot = Bot.get_current()
+    # подчистим старые перед отрисовкой нового
+    try:
+        await delete_previous_private_messages(bot, uid, keep=[])
+    except TypeError:
+        try:
+            await delete_previous_private_messages(uid)  # type: ignore
+        except Exception:
+            pass
+
     text = await generate_poll_report()
     kb = _build_report_keyboard()
     dash = await bot.send_message(uid, text, parse_mode="Markdown", reply_markup=kb)
@@ -540,47 +522,78 @@ async def poll_report_handler(message: types.Message) -> None:
     await _refresh_menu(uid)
     await _delete_trigger(message)
 
-
-# ███ [7] ГЕНЕРАЦИЯ И ПРОВЕРКА ГОТОВНОСТИ
-# --------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
+# 5.1 Готовность одной игры
+# ────────────────────────────────────────────────────────────────────
 async def _is_deal_ready(did: int) -> bool:
-    """True, если для игры did набран минимум (учитывая админа без проверки в светофоре)."""
+    """
+    True, если для игры did набран минимум по маппингу и цветам «Светофора».
+    Логика:
+      green  → main (если есть слот), иначе assist (если есть слот), иначе trainee
+      yellow → assist (если есть слот), иначе trainee
+      red    → trainee
+      ''     → пропускаем (не решаем за человека)
+    Админ: обязателен для некоторых пакетов — берём из ручного назначения
+    (state.distribution_cache) или из "админ доступен" при отсутствии пересечений.
+    """
+    # 0) мета по сделке и требования по ролям
     deal = next(d for d in state.current_poll_deals if d["id"] == did)
-    cfg = _role_cfg(deal["game_name"])
-    need_main, need_assist = cfg["main_leaders"], cfg["assistants"]
+    game_name = deal.get("game_name") or deal.get("name") or ""
+    cfg = _role_cfg(game_name)
+    need_main, need_assist = int(cfg["main_leaders"]), int(cfg["assistants"])
 
     admin_pkgs = {"стандарт", "стандарт+", "премиум", "vip", "вип", "биглион"}
     need_admin = int((deal.get("package") or "").lower().strip() in admin_pkgs)
 
-    # ─── 1. main / assist ────────────────────────────────────────────
-    have_main = have_assist = 0
-    main_ids: Set[int] = set()
-    assist_ids: Set[int] = set()
+    # 1) проходим по откликнувшимся и раскладываем по ролям
+    team: Dict[str, List[int]] = {"main": [], "assist": [], "trainee": []}
+    seen: Set[int] = set()
 
     for pdata in state.responses.values():
-        for u in pdata["deals"].get(did, []):
-            status = await get_user_status_from_svetofor(u["user_id"], deal["game_name"])
-            if status == "green" and have_main < need_main:
-                have_main += 1
-                main_ids.add(u["user_id"])
-            elif status in {"green", "yellow"} and have_assist < need_assist:
-                have_assist += 1
-                assist_ids.add(u["user_id"])
+        users = pdata["deals"].get(did, [])
+        if not users:
+            continue
 
-    # ─── 2. admin ────────────────────────────────────────────────────
-    dist = state.distribution_cache.get(str(did), {})
-    # 2.1 вручную назначен?
+        for u in users:
+            uid = int(u["user_id"])
+            if uid in seen:
+                continue  # один пользователь — одна роль
+            status = await get_user_status_from_svetofor(uid, game_name)
+
+            # маппинг цвета → роль (с учётом занятых слотов)
+            if status == "green":
+                if len(team["main"]) < need_main:
+                    team["main"].append(uid); seen.add(uid); continue
+                if len(team["assist"]) < need_assist:
+                    team["assist"].append(uid); seen.add(uid); continue
+                team["trainee"].append(uid); seen.add(uid); continue
+            elif status == "yellow":
+                if len(team["assist"]) < need_assist:
+                    team["assist"].append(uid); seen.add(uid); continue
+                team["trainee"].append(uid); seen.add(uid); continue
+            elif status == "red":
+                team["trainee"].append(uid); seen.add(uid); continue
+            # статус пустой — не назначаем
+
+    have_main = len(team["main"])
+    have_assist = len(team["assist"])
+
+    # 2) админ: вручную назначенный (distribution_cache) либо из "админ доступен"
+    dist = state.distribution_cache.get(str(did), {}) or {}
     have_admin = 1 if dist.get("admin") else 0
 
-    # 2.2 автоподбор из admin_available без проверки в светофоре
     if need_admin and not have_admin:
+        # кандидаты «админ доступен», без пересечения с main/assist
+        assigned = set(team["main"]) | set(team["assist"])
         for pdata in state.responses.values():
             if did not in pdata["deal_indices"].values():
                 continue
             for adm in pdata["admin_available"]:
-                uid = adm["user_id"]
-                if uid not in main_ids and uid not in assist_ids:
+                uid = int(adm["user_id"])
+                if uid not in assigned:
                     have_admin = 1
+                    dist.setdefault("admin", uid)
+                    state.distribution_cache[str(did)] = dist
                     break
             if have_admin:
                 break
@@ -596,11 +609,14 @@ async def _is_deal_ready(did: int) -> bool:
         and have_admin >= need_admin
     )
 
+# ────────────────────────────────────────────────────────────────────
+# 5.2 Уведомления о готовности
+# ────────────────────────────────────────────────────────────────────
 async def _check_ready_state(impacted: Set[int]) -> None:
-    """Уведомления: «предварительный состав команды набран / все готовы»."""
+    """Уведомления: «предварительный состав набран / все готовы»."""
     bot = Bot.get_current()
     lead = state.current_poll_leader
-    chat_id = state.admin_chat_id or lead  # используем чат опроса, если задан
+    chat_id = state.admin_chat_id or lead
     newly_ready: List[str] = []
 
     for did in impacted:
@@ -608,7 +624,7 @@ async def _check_ready_state(impacted: Set[int]) -> None:
         if ready and not state.current_deal_ready.get(did):
             state.current_deal_ready[did] = True
             deal = next(d for d in state.current_poll_deals if d["id"] == did)
-            newly_ready.append(f"{deal['game_name']} — {deal['event_datetime']:%d.%m}")
+            newly_ready.append(f"{_deal_title(deal)} — {deal['event_datetime']:%d.%m}")
 
     if newly_ready:
         txt = (
@@ -625,114 +641,34 @@ async def _check_ready_state(impacted: Set[int]) -> None:
     ):
         await bot.send_message(
             chat_id,
-            "✅ Для всех игр определен предварительный состав команды, "
-            "успейте отметиться в опросе, чтобы участвовать в распределении.",
+            "✅ Для всех игр определён предварительный состав команды. "
+            "Успейте отметиться в опросе, чтобы участвовать в распределении.",
             parse_mode="Markdown"
         )
         state.all_ready_notified = True
 
-
-
-async def generate_poll_report() -> str:
-    """Строит текст отчёта и Inline-клавиатуру state.distribution_keyboard."""
-    if not state.current_poll_deals or not state.responses:
-        return "⚠️ Нет активных опросов."
-
-    keyboard: List[List[InlineKeyboardButton]] = []
-    for deal in state.current_poll_deals:
-        did = deal["id"]
-        if did in state.deal_force_closed:
-            continue
-        ready = await _is_deal_ready(did)
-        icon = "✅" if ready else "❌"
-
-        row = [
-            InlineKeyboardButton(
-                text=f"{icon} {deal['game_name']} — {deal['event_datetime']:%d.%m}",
-                callback_data=f"show_deal_{did}",
-            )
-        ]
-        if ready:
-            row.append(
-                InlineKeyboardButton(
-                    text="👍 Утвердить",
-                    callback_data=f"approve_deal_{did}",
-                )
-            )
-        keyboard.append(row)
-
-    if any(state.current_deal_ready.get(d["id"]) for d in state.current_poll_deals):
-        keyboard.append([
-            InlineKeyboardButton(text="Утвердить все", callback_data="approve_all_ready")
-        ])
-
-    state.distribution_keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard)
-    return "📊 *Опрос создан. Выберите игру:*"
+# Экспорт «приватных» функций, используемых снаружи
+__all__ = [
+    "_cancel_reminders",
+    "_request_confirmations",
+    "_is_deal_ready",
+    "_sync_leader_report",
+    "clear_poll_data",
+    "_vacuum_old_messages",
+]
 
 
 # ════════════════════════════════════════════════════════════════════
-# [8] ПРИЁМ ОТВЕТОВ ПОЛЬЗОВАТЕЛЕЙ
-# ════════════════════════════════════════════════════════════════════
-@router.poll_answer()
-async def handle_poll_answer(event: types.PollAnswer) -> None:
-    """Фиксация выбора пользователя + пересчёт готовности."""
-    uid, poll_id, chosen = event.user.id, event.poll_id, event.option_ids
-    data = state.responses.get(poll_id)
-    if not data:
-        return
-
-    # очищаем старые метки пользователя
-    for lst in data["deals"].values():
-        lst[:] = [u for u in lst if u["user_id"] != uid]
-    data["not_available"][:] = [u for u in data["not_available"] if u["user_id"] != uid]
-    data["admin_available"][:] = [u for u in data["admin_available"] if u["user_id"] != uid]
-
-    ui = await get_user_info(uid) or {}
-    base = {
-        "user_id": uid,
-        "first_name": ui.get("first_name", ""),
-        "last_name_initial": ui.get("last_name_initial", ""),
-        "is_admin_eligible": False,
-    }
-
-    num = len(data["deal_indices"])
-    impacted: Set[int] = set()
-    refresh_all = False
-
-    for idx in chosen:
-        if idx < num:  # конкретная игра
-            did = data["deal_indices"][idx]
-            if did not in state.deal_force_closed:
-                data["deals"][did].append(base.copy())
-                impacted.add(did)
-        elif idx == num:  # «🚫 Не смогу»
-            data["not_available"].append(base.copy())
-        else:  # «🛡️ Админом»
-            adm = base.copy()
-            adm["is_admin_eligible"] = True
-            data["admin_available"].append(adm)
-            refresh_all = True
-
-    if refresh_all:
-        for lst in data["deals"].values():
-            lst[:] = [u for u in lst if not u.get("is_admin_eligible")]
-
-    await _sync_leader_report()
-    await _check_ready_state(impacted)
-    asyncio.create_task(_refresh_detail_views(impacted, refresh_all))
-
-
-# ════════════════════════════════════════════════════════════════════
-# [9] СИНХРОНИЗАЦИЯ ОТЧЁТА ЛИДЕРУ  (FIX: duplicate dashboards)
+# [6] СИНХРОНИЗАЦИЯ, ОЧИСТКА, ФОНОВЫЕ УТИЛИТЫ, TESTS
 # ════════════════════════════════════════════════════════════════════
 async def _sync_leader_report() -> None:
     """
     Поддерживает у лидера **один** актуальный дашборд.
 
-    1. Пытается *редактировать* прежний пост (если id известен).
-    2. Если не вышло — шлёт новый, перед этим удаляя/помечая все старые
-       дашборды в `state.last_user_messages[leader]` **и** orphan-id.
-    3. Обновляет `personal_report_message_id` + `last_user_messages`.
+    Алгоритм:
+      1) Пытаемся отредактировать прежний пост (если id известен).
+      2) Если редактирование не удалось — отправляем новый.
+      3) «Пылесос»: удаляем все старые служебные сообщения и фиксируем новый как единственный активный.
     """
     bot    = Bot.get_current()
     leader = state.current_poll_leader
@@ -744,7 +680,7 @@ async def _sync_leader_report() -> None:
     kb   = _build_report_keyboard()
     old_id = state.personal_report_message_id
 
-    # ── 1. Попытка редактирования ──────────────────────────────────
+    # ── 1. Попытка редактирования существующего сообщения
     if old_id:
         try:
             await bot.edit_message_text(
@@ -754,48 +690,44 @@ async def _sync_leader_report() -> None:
                 parse_mode="Markdown",
                 reply_markup=kb,
             )
+            # Зафиксируем, что у нас один активный пост (старые из state.last_user_messages не нужны)
+            try:
+                prev = (state.last_user_messages or {}).get(leader, [])
+                keep = [m for m in prev if getattr(m, "message_id", None) == old_id]
+                try:
+                    await delete_previous_private_messages(bot, leader, keep=keep)
+                except TypeError:
+                    await delete_previous_private_messages(leader)  # type: ignore
+            except Exception as e_vac:
+                logger.debug("[sync_report] vacuum after edit failed: %s", e_vac)
             logger.debug("[sync_report] edited msg %d", old_id)
             return
         except Exception as exc:
             logger.debug("[sync_report] edit failed (%s) → send new", exc)
 
-    # ── 2. Отправляем новый, чистим старые ─────────────────────────
+    # ── 2. Отправляем новый
     try:
-        sent = await bot.send_message(
-            leader, text, parse_mode="Markdown", reply_markup=kb
-        )
+        sent = await bot.send_message(leader, text, parse_mode="Markdown", reply_markup=kb)
     except Exception as send_exc:
         logger.exception("[sync_report] FAILED to send new report: %s", send_exc)
         return
 
-    leftovers = state.last_user_messages.get(leader, [])
-    for msg in leftovers:
-        if msg.message_id == sent.message_id:
-            continue
+    # ── 3. «Пылесос»: удаляем всё, кроме только что отправленного сообщения
+    try:
         try:
-            await bot.delete_message(chat_id=leader, message_id=msg.message_id)
-            logger.debug("[sync_report] old dashboard %d deleted", msg.message_id)
-        except Exception as del_exc:
-            logger.debug("[sync_report] can't delete %d: %s", msg.message_id, del_exc)
-            state.messages_to_delete.setdefault(leader, []).append(msg.message_id)
+            await delete_previous_private_messages(bot, leader, keep=[sent])
+        except TypeError:
+            await delete_previous_private_messages(leader)  # type: ignore
+    except Exception as del_exc:
+        logger.debug("[sync_report] vacuum keep=[%s] failed: %s", sent.message_id, del_exc)
 
-    # orphan-id: старый personal_report_message_id, которого нет в leftovers
-    if old_id and old_id != sent.message_id and all(m.message_id != old_id for m in leftovers):
-        try:
-            await bot.delete_message(chat_id=leader, message_id=old_id)
-            logger.debug("[sync_report] orphan old_id %d deleted", old_id)
-        except Exception as del_exc:
-            logger.debug("[sync_report] can't delete orphan %d: %s", old_id, del_exc)
-            state.messages_to_delete.setdefault(leader, []).append(old_id)
-
-    # ── 3. Обновляем состояние ─────────────────────────────────────
     state.personal_report_message_id = sent.message_id
     state.last_user_messages[leader] = [sent]
+    logger.info("[sync_report] rendered msg_id=%s", sent.message_id)
 
-
-# ════════════════════════════════════════════════════════════════════
-# [10] ЗАВЕРШЕНИЕ ЦИКЛА И СЛУЖЕБНЫЕ УТИЛИТЫ
-# ════════════════════════════════════════════════════════════════════
+# ────────────────────────────────────────────────────────────────────
+# 6.1 Завершение цикла
+# ────────────────────────────────────────────────────────────────────
 async def clear_poll_data(user_id: int) -> None:
     """Полный сброс состояния цикла."""
     _cancel_reminders()
@@ -814,6 +746,13 @@ async def clear_poll_data(user_id: int) -> None:
     state.current_deal_ready.clear()
     state.all_ready_notified = False
     state.pending_plus.clear()
+    state.poll_details.clear()
+    state.deal_titles.clear()
+    state.locked_distribution.clear()
+    state.pending_confirmations.clear()
+    state.poll_distribution.clear()
+    state.detail_blocks.clear()
+    # чистим только очередь текущего пользователя (если была)
     state.messages_to_delete.pop(user_id, None)
 
     bot = Bot.get_current()
@@ -825,81 +764,139 @@ async def clear_poll_data(user_id: int) -> None:
     logger.info("[polls] cleared by %d", user_id)
     await _refresh_menu(user_id)
 
-
 # ────────────────────────────────────────────────────────────────────
-# 10.1  Автоматическая проверка «все игры закрыты?»
+# 6.2 Автопроверка «все игры закрыты?» и завершение цикла
 # ────────────────────────────────────────────────────────────────────
 async def _check_cycle_finished(trigger_user: int | None = None) -> None:
-    """Если активных игр не осталось — закрываем цикл."""
+    """Если активных игр не осталось — закрываем цикл."""
     if not state.coordination_cycle_active:
-        return  # уже закрыт
-    if state.current_poll_deals:  # есть ещё игры → продолжаем
+        return
+    if state.current_poll_deals:
         return
     leader = state.current_poll_leader or trigger_user or 0
     await clear_poll_data(leader)
 
+async def finish_if_all_deals_completed(bot: Bot | None = None) -> None:
+    """
+    Завершает цикл, когда все игры из текущего опроса переведены в «Завершение сделки»
+    (или отсутствуют среди активных сделок AmoCRM) либо вручную выведены руководителем.
+
+    Вызывается после подтверждений ролей.
+    """
+    if not state.coordination_cycle_active or not state.current_poll_deals:
+        return
+
+    try:
+        from services.amocrm import get_amocrm_deals  # type: ignore
+        deals = await get_amocrm_deals()
+    except Exception as e:
+        logger.debug("[finish_cycle] get_amocrm_deals failed: %s", e)
+        return
+
+    target_ids = {int(d["id"]) for d in state.current_poll_deals}
+    status_ok = {"завершение сделки", "закрыта", "реализация завершена"}
+    alive = 0
+
+    for d in deals:
+        did = int(d.get("id", 0) or 0)
+        if did not in target_ids:
+            continue
+        st = (d.get("status_name") or "").strip().lower()
+        if st not in status_ok:
+            alive += 1
+
+    # учтём ручной вывод игр из цикла
+    for d in list(state.current_poll_deals):
+        if d.get("id") in state.deal_force_closed:
+            target_ids.discard(d.get("id"))
+
+    if alive == 0 or not target_ids:
+        leader = state.current_poll_leader or 0
+        await clear_poll_data(leader)
+        logger.info("[finish_cycle] completed: all deals closed or removed")
 
 # ────────────────────────────────────────────────────────────────────
-# 10.2  Фоновый «пылесос» для устаревших сообщений
+# 6.3 Фоновый «пылесос» для устаревших сообщений (ручной и планировщик)
 # ────────────────────────────────────────────────────────────────────
 async def _vacuum_old_messages() -> None:
-    """Раз в 15 минут пытаемся удалить сообщения, помеченные к очистке."""
-    while True:
+    """
+    Раз в 15 минут пытаемся удалить сообщения, помеченные к очистке.
+
+    • Работает только через create_task/планировщик (НЕ вызывать синхронно).
+    • Логирует ошибки удаления, чтобы видеть причину.
+    • Если Bot недоступен — просто выходим, задача запустится в следующий раз.
+    """
+    try:
         bot = Bot.get_current()
-        for uid, msg_ids in list(state.messages_to_delete.items()):
-            updated: List[int] = []
-            for mid in msg_ids:
-                try:
-                    await bot.delete_message(chat_id=uid, message_id=mid)
-                except Exception:
-                    updated.append(mid)  # оставить, если не удалось
-            if updated:
-                state.messages_to_delete[uid] = updated
-            else:
-                state.messages_to_delete.pop(uid, None)
-        await asyncio.sleep(900)  # 15 минут
+    except Exception as e:
+        logger.warning("[vacuum] Bot.get_current() недоступен: %s", e)
+        return
 
+    if not state.messages_to_delete:
+        logger.debug("[vacuum] Очередь очистки пуста")
+        return
 
-# запускаем пылесос при инициализации модуля (если не запущен)
-try:
-    if not getattr(state, "_vacuum_task", None):
-        state._vacuum_task = asyncio.create_task(_vacuum_old_messages())
-except RuntimeError:
-    # event loop ещё не готов (например, при unit‑тестах)
-    pass
+    logger.info("[vacuum] Запущен, всего пользователей в очереди: %d", len(state.messages_to_delete))
+
+    for uid, msg_ids in list(state.messages_to_delete.items()):
+        updated: list[int] = []
+        for mid in msg_ids:
+            try:
+                await bot.delete_message(chat_id=uid, message_id=mid)
+                logger.debug("[vacuum] Удалено сообщение %s для uid=%s", mid, uid)
+            except Exception as e:
+                logger.debug("[vacuum] Не удалось удалить сообщение %s для uid=%s: %s", mid, uid, e)
+                updated.append(mid)  # оставить, если не удалось
+        if updated:
+            state.messages_to_delete[uid] = updated
+        else:
+            state.messages_to_delete.pop(uid, None)
+
+    logger.info("[vacuum] Завершён, очередь после очистки: %d", len(state.messages_to_delete))
+
 
 # ███ [99] _TEST
 # --------------------------------------------------------------------
 async def _test() -> None:
     """
-    Smoke-тест get_main_menu и generate_poll_report (пустой),
-    подменяем get_user_info на фиктивную, чтобы были кнопки.
+    Smoke-тест _sync_leader_report: имитируем отсутствие старого сообщения —
+    должен отправиться новый, а затем пылесос оставить только его.
     """
-    # подменяем get_user_info, чтобы роль была в ACCESS["poll"]
-    orig = get_user_info
-    async def fake_get_user_info(uid: int) -> dict:
-        return {"role": settings.ACCESS["poll"][0]}
-    globals()["get_user_info"] = fake_get_user_info
+    class _Msg:
+        def __init__(self, mid): self.message_id = mid
 
-    try:
-        uid = 1
-        state.coordination_cycle_active = True
-        menu = await get_main_menu(uid)
-        assert menu is not None, "Меню не должно быть None для роли poll"
-        # проверяем, что кнопка «✉️ Рассылка уведомлений» действительно есть
-        assert any(
-            btn.text == "✉️ Рассылка уведомлений"
-            for row in menu.keyboard
-            for btn in row
-        ), "Нет кнопки «✉️ Рассылка уведомлений» в меню"
-        # проверяем отчёт
-        state.current_poll_deals = []
-        state.responses = {}
-        assert await generate_poll_report() == "⚠️ Нет активных опросов."
-        print("handlers/polls_lifecycle OK")
-    finally:
-        # восстанавливаем оригинальную функцию
-        globals()["get_user_info"] = orig
+    # подготовка фейкового состояния
+    uid = 123
+    state.current_poll_leader = uid
+    state.coordination_cycle_active = True
+    state.current_poll_deals = []
+    state.responses = {}
+    state.last_user_messages[uid] = [_Msg(10), _Msg(11)]
+    state.personal_report_message_id = None
+
+    # подмена generate_poll_report/_build_report_keyboard
+    async def _fake_report(): return "⚠️ Нет активных опросов."
+    def _fake_kb(): return InlineKeyboardMarkup(inline_keyboard=[])
+    globals()["generate_poll_report"], globals()["_build_report_keyboard"] = _fake_report, _fake_kb
+
+    # заглушки bot методов
+    class _Bot:
+        async def edit_message_text(self, *a, **kw): raise RuntimeError("no old message")
+        async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None):
+            class _S: message_id = 99
+            return _S()
+        async def delete_message(self, chat_id, message_id): return
+    Bot.set_current(_Bot())  # type: ignore
+
+    # заглушка delete_previous_private_messages с новой и старой сигнатурой
+    async def _fake_delete(bot_or_uid, uid=None, keep=None): return
+    globals()["delete_previous_private_messages"] = _fake_delete
+
+    await _sync_leader_report()
+    assert state.personal_report_message_id == 99
+    assert [m.message_id for m in state.last_user_messages[uid]] == [99]
+    print("handlers/polls_lifecycle [sync+vacuum] OK")
+
 
 if __name__ == "__main__":
     import asyncio
