@@ -1,12 +1,22 @@
+# core/config.py — Конфиг MasterBot
+# ─────────────────────────────────────────────────────────────────────
+"""
+Единая точка конфигурации бота.
+
+Особенности:
+• Значения могут подхватываться из config.json (в корне) -> env.
+• Поддержан запуск без pydantic (заглушки BaseSettings/Field/validator).
+• Для Google Sheets задан безопасный дефолт scope (read-only) + валидация.
+"""
+
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Callable, Any, TypeVar
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 # ── пути ---------------------------------------------------------------------
-# Определяем BASE_DIR в любых окружениях (интерактивных и файловых)
 try:
     BASE_DIR = Path(__file__).resolve().parent.parent
 except NameError:
@@ -23,9 +33,10 @@ if CONFIG_JSON.exists():
             if env_key not in os.environ and not isinstance(_v, (dict, list)):
                 os.environ[env_key] = str(_v)
     except Exception:
+        # не мешаем запуску, просто игнорируем битый config.json
         pass
 
-# ── dual-import для Pydantic или заглушек -------------------------------------
+# ── dual-import для Pydantic или заглушек ------------------------------------
 _T = TypeVar("_T")
 try:
     from pydantic_settings import BaseSettings
@@ -33,21 +44,21 @@ try:
     _V2 = True
 except (ModuleNotFoundError, ImportError):
     # Заглушки для среды без pydantic
-    class BaseSettings:
-        def __init_subclass__(cls, **kwargs):
+    class BaseSettings:  # type: ignore
+        def __init_subclass__(cls, **kwargs):  # noqa: D401
             super().__init_subclass__(**kwargs)
         def __init__(self, **kwargs):
-            for k, v in kwargs.items(): setattr(self, k, v)
-    def Field(default: Any = None, env: str = "", default_factory: Callable[[], Any] = None) -> Any:
-        # поддержка default и default_factory
-        if default_factory is not None:
-            return default_factory()
-        return default
-    def validator(field_name: str, pre: bool = False, always: bool = False) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        def wrap(fn: Callable[..., Any]) -> Callable[..., Any]: return fn
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+    def Field(default: Any = None, env: str = "", default_factory: Callable[[], Any] | None = None) -> Any:  # type: ignore
+        return default_factory() if default_factory is not None else default
+    def validator(field_name: str, pre: bool = False, always: bool = False):  # type: ignore
+        def wrap(fn: Callable[..., Any]) -> Callable[..., Any]:
+            return fn
         return wrap
-    def field_validator(field_name: str, mode: str = "before") -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        def wrap(fn: Callable[..., Any]) -> Callable[..., Any]: return fn
+    def field_validator(field_name: str, mode: str = "before"):  # type: ignore
+        def wrap(fn: Callable[..., Any]) -> Callable[..., Any]:
+            return fn
         return wrap
     _V2 = False
 
@@ -62,6 +73,8 @@ def _make_validator(field_name: str) -> Callable[[Callable[..., Any]], Callable[
             return validator(field_name, pre=True, always=True)(fn)  # type: ignore
         return wrap
 
+
+# ── Settings -----------------------------------------------------------------
 class Settings(BaseSettings):
     """Все конфигурационные параметры бота."""
 
@@ -81,7 +94,7 @@ class Settings(BaseSettings):
     PIPELINE_ID: Optional[int] = None
     SVETOFOR_SPREAD_ID: str = Field(..., env="SVETOFOR_SPREAD_ID")
 
-    # — новые параметры для интеграции чата и базы знаний —
+    # — интеграция чатов / справки —
     POLLS_CHAT_ID: int = Field(-1001234567890, env="POLLS_CHAT_ID")
     GUIDE_BOT_LINK: str = Field("https://t.me/guide_bot_link", env="GUIDE_BOT_LINK")
 
@@ -92,7 +105,10 @@ class Settings(BaseSettings):
     GOOGLE_API_RATE_LIMIT_SECONDS: int = 180
 
     # — Google Sheets scopes —
-    GOOGLE_SHEETS_SCOPES: List[str] = Field(default_factory=list)
+    # ВАЖНО: по умолчанию только readonly — это устраняет invalid_scope.
+    GOOGLE_SHEETS_SCOPES: List[str] = Field(
+        default_factory=lambda: ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    )
 
     # — role-mapping, statuses —
     GAME_ROLE_MAPPING: Dict[str, Dict[str, int]] = Field(default_factory=dict)
@@ -107,13 +123,14 @@ class Settings(BaseSettings):
         "distribution": ["руководитель", "администратор"],
     })
 
-    # — AmoCRM fields —
+    # — AmoCRM fields (ID кастом-полей) —
     AMOCRM_FIELDS: Dict[str, str] = Field(default_factory=dict)
 
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
 
+    # ── validators ------------------------------------------------------------
     @_make_validator("GOOGLE_CREDENTIALS_FILE")
     def _detect_creds(cls, v: Optional[str]) -> str:
         if v:
@@ -124,6 +141,31 @@ class Settings(BaseSettings):
                 return str(p)
         return ""
 
+    @_make_validator("GOOGLE_SHEETS_SCOPES")
+    def _normalize_scopes(cls, v: Any) -> List[str]:
+        """
+        Принимаем:
+          • None/пусто → readonly
+          • "a,b,c"    → ["a","b","c"]
+          • ["a","b"]  → как есть
+        Любые невалидные/чужие скоупы → принудительно readonly.
+        """
+        readonly = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+        if not v:
+            return readonly
+        if isinstance(v, str):
+            scopes = [s.strip() for s in v.split(",") if s.strip()]
+        elif isinstance(v, (list, tuple)):
+            scopes = [str(s).strip() for s in v if str(s).strip()]
+        else:
+            return readonly
+
+        allowed_prefix = "https://www.googleapis.com/auth/spreadsheets"
+        if not scopes or any(not s.startswith(allowed_prefix) for s in scopes):
+            # защищаемся от 'drive.*', 'userinfo.*' и т.п.
+            return readonly
+        return scopes
+
     @_make_validator("GAME_ROLE_MAPPING")
     def _load_role_map(cls, v: Dict | None) -> Dict[str, Dict[str, int]]:
         if v:
@@ -132,9 +174,10 @@ class Settings(BaseSettings):
             try:
                 data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
                 if isinstance(data.get("GAME_ROLE_MAPPING"), dict):
-                    return data["GAME_ROLE_MAPPING"]
+                    return data["GAME_ROLE_MAPPING"]  # type: ignore[return-value]
             except Exception:
                 pass
+        # дефолтные требования по ролям
         return {
             "Петля времени": {"main_leaders": 1, "assistants": 1},
             "Хранители волшебства": {"main_leaders": 1, "assistants": 1},
@@ -154,9 +197,10 @@ class Settings(BaseSettings):
             try:
                 data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
                 if isinstance(data.get("AMOCRM_FIELDS"), dict):
-                    return data["AMOCRM_FIELDS"]
+                    return data["AMOCRM_FIELDS"]  # type: ignore[return-value]
             except Exception:
                 pass
+        # дефолтные ID кастом-полей
         return {
             "event_date": "87751",
             "event_time": "88565",
@@ -171,26 +215,25 @@ class Settings(BaseSettings):
             "package": "71673",
         }
 
+
 # ── экспорт singleton --------------------------------------------------------
 settings = Settings()
-# Создаем директорию для логов, если не существует
 os.makedirs(settings.LOG_DIR, exist_ok=True)
 
 
 # ════════════════════════════════════════════════════════════════
 #                              ТЕСТЫ
 # ════════════════════════════════════════════════════════════════
-
 def _test():
-    # Проверяем, что настройки загружаются без ошибок
     s = Settings()
-    assert isinstance(s.VERSION, str), "VERSION должен быть строкой"
-    assert isinstance(s.POLLS_CHAT_ID, int), "POLLS_CHAT_ID должен быть int"
-    assert s.POLLS_CHAT_ID < 0, "ID чата группы должен быть отрицательным"
-    assert s.GUIDE_BOT_LINK.startswith("https://t.me/"), "Некорректная ссылка на GUIDE_BOT_LINK"
-    # Проверяем работу валидаторов
-    assert isinstance(s.GAME_ROLE_MAPPING, dict), "GAME_ROLE_MAPPING должен быть словарём"
-    assert isinstance(s.AMOCRM_FIELDS, dict), "AMOCRM_FIELDS должен быть словарём"
+    assert isinstance(s.VERSION, str)
+    assert isinstance(s.POLLS_CHAT_ID, int) and s.POLLS_CHAT_ID < 0
+    assert s.GUIDE_BOT_LINK.startswith("https://t.me/")
+    assert isinstance(s.GAME_ROLE_MAPPING, dict)
+    assert isinstance(s.AMOCRM_FIELDS, dict)
+    # scopes должны быть spreadsheets.* и не пустыми
+    assert isinstance(s.GOOGLE_SHEETS_SCOPES, list) and s.GOOGLE_SHEETS_SCOPES
+    assert all(str(x).startswith("https://www.googleapis.com/auth/spreadsheets") for x in s.GOOGLE_SHEETS_SCOPES)
     print("✅ core/config.py tests passed")
 
 
