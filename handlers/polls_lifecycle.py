@@ -192,6 +192,34 @@ async def _refresh_detail_views(impacted: Set[int], refresh_all: bool) -> None:
                  len(tasks), ", ".join(map(str, impacted)))
     await asyncio.gather(*tasks, return_exceptions=True)
 
+# ────────────────────────────────────────────────────────────────────
+# 2.4  Светофор-адаптер (совместимость sync/async, безопасные ошибки)
+# ────────────────────────────────────────────────────────────────────
+async def _sv_status(user_id: int, game_name: str) -> str:
+    """
+    Универсальный вызов статуса «Светофора».
+
+    • Поддерживает как синхронную, так и асинхронную реализацию
+      services.gsheets.get_user_status_from_svetofor.
+    • На любых исключениях возвращает '' и пишет предельно информативный лог.
+    """
+    try:
+        res = get_user_status_from_svetofor(user_id, game_name)
+        if asyncio.iscoroutine(res):
+            status = await res  # type: ignore[func-returns-value]
+        else:
+            status = res
+        status = (status or "").strip().lower()
+        if status not in {"green", "yellow", "red", ""}:
+            logger.debug("[svetofor] normalize unknown status '%s' → '' (uid=%s, game=%s)",
+                         status, user_id, game_name)
+            return ""
+        return status
+    except Exception as exc:
+        logger.warning("[svetofor] status fetch failed (uid=%s, game=%s): %s",
+                       user_id, game_name, exc)
+        return ""
+
 
 # ════════════════════════════════════════════════════════════════════
 # [3] СОЗДАНИЕ ОПРОСА
@@ -206,6 +234,7 @@ async def create_poll_handler(message: types.Message) -> None:
     • Выбор игр (14 дней вперёд, статусы из settings.NEW_GAMES_STATUS_IDS, без назначенных ведущих).
     • Инициализация state, рассылка Poll’ов по частям до 8 опций.
     • Таймер авто-завершения, напоминания, отчёт лидеру.
+    • ВАЖНО: при старте цикла немедленно меняем пункт меню «📋 Создать опрос» → «📊 Отчёт по опросу».
     """
     uid = message.from_user.id
     logger.info("[create_poll] invoked by %d, text=%s", uid, (message.text or "").strip())
@@ -219,15 +248,21 @@ async def create_poll_handler(message: types.Message) -> None:
         await _delete_trigger(message)
         return
 
+    # если цикл уже активен — сразу показываем «Отчёт по опросу» и обновляем меню
     if state.coordination_cycle_active:
         logger.warning("[create_poll] cycle already active, uid=%d", uid)
-        await message.answer("⚠️ Уже есть активный опрос.")
+        await message.answer("⚠️ Уже есть активный опрос.", reply_markup=await get_main_menu(uid))
+        # гарантируем замену пункта меню на «📊 Отчёт по опросу»
+        try:
+            await _refresh_menu(uid)
+        except Exception as e:
+            logger.debug("[create_poll] _refresh_menu on active cycle failed: %s", e)
         await _delete_trigger(message)
         return
 
     if not state.admin_chat_id:
         logger.warning("[create_poll] admin_chat_id not set, uid=%d", uid)
-        await message.answer("⚠️ Чат не настроен.")
+        await message.answer("⚠️ Чат не настроен.", reply_markup=await get_main_menu(uid))
         await _delete_trigger(message)
         return
 
@@ -246,7 +281,7 @@ async def create_poll_handler(message: types.Message) -> None:
         d for d in deals
         if d["status_id"] in settings.NEW_GAMES_STATUS_IDS
         and now <= d["event_datetime"] <= window
-        and not d["team_leads"]
+        and not d.get("team_leads")
     ]
     logger.debug("[create_poll] %d deals fetched, %d suitable for poll",
                  len(deals), len(poll_deals))
@@ -258,18 +293,24 @@ async def create_poll_handler(message: types.Message) -> None:
         return
 
     # ── 3. инициализация state ─────────────────────────────────────
-    state.current_poll_deals        = poll_deals
-    state.current_poll_leader       = uid
+    state.current_poll_deals         = poll_deals
+    state.current_poll_leader        = uid
     state.responses.clear()
     state.distribution_cache.clear()
-    state.coordination_cycle_active = True
-    state.force_closed              = False
+    state.coordination_cycle_active  = True
+    state.force_closed               = False
     state.deal_force_closed.clear()
-    state.manual_confirm_requested  = False
+    state.manual_confirm_requested   = False
     state.confirmed_users.clear()
     state.current_deal_ready.clear()
-    state.all_ready_notified        = False
+    state.all_ready_notified         = False
     state.personal_report_message_id = None
+
+    # немедленная замена пункта меню на «📊 Отчёт по опросу» (не ждём конца процедуры)
+    try:
+        await _refresh_menu(uid)
+    except Exception as e:
+        logger.debug("[create_poll] _refresh_menu after init failed: %s", e)
 
     # ── 4. отправляем опрос(ы) ──────────────────────────────────────
     urgent = any(d["event_datetime"] <= now + timedelta(days=3) for d in poll_deals)
@@ -311,7 +352,12 @@ async def create_poll_handler(message: types.Message) -> None:
 
     # ── 5. завершаем ────────────────────────────────────────────────
     await message.answer("✅ Опросы отправлены.")
-    await _refresh_menu(uid)
+    # меню ещё раз — на случай, если пользователь успел уйти в другое окно
+    try:
+        await _refresh_menu(uid)
+    except Exception as e:
+        logger.debug("[create_poll] _refresh_menu at finalize failed: %s", e)
+
     await _send_leader_report(uid)
 
     # авто-завершение через N часов
@@ -324,6 +370,9 @@ async def create_poll_handler(message: types.Message) -> None:
     logger.info("[create_poll] poll created successfully, leader=%d, parts=%d",
                 uid, len(chunks))
     await _delete_trigger(message)
+# История изменений [3]:
+# 2025-08-12 — немедленная замена пункта меню «📋 Создать опрос» → «📊 Отчёт по опросу»
+#              при старте цикла и при повторном вызове в активном цикле; все await сохранены.
 
 # ════════════════════════════════════════════════════════════════════
 # [4] ОТЧЁТ / КЛАВИАТУРА / ПРИЁМ ОТВЕТОВ
@@ -451,16 +500,17 @@ async def handle_poll_answer(event: types.PollAnswer) -> None:
                 data["deals"][did].append(base.copy())
                 impacted.add(did)
         elif idx == num:
+            # «🚫 Не смогу»
             data["not_available"].append(base.copy())
         else:
+            # «🛡️ Админом» — ДОПОЛНИТЕЛЬНО к выбору игр, не вычищаем из deals
             adm = base.copy()
             adm["is_admin_eligible"] = True
             data["admin_available"].append(adm)
-            refresh_all = True
+            refresh_all = True  # обновим админ-блоки в деталях
 
-    if refresh_all:
-        for lst in data["deals"].values():
-            lst[:] = [u for u in lst if not u.get("is_admin_eligible")]
+    # ВНИМАНИЕ: преднамеренно НЕ удаляем пользователя из выбранных игр,
+    # даже если он отметил «🛡️ Админом». Это фикс текущей ошибки распределения.
 
     await _sync_leader_report()
     await _check_ready_state(impacted)
@@ -532,7 +582,7 @@ async def _is_deal_ready(did: int) -> bool:
       green  → main (если есть слот), иначе assist (если есть слот), иначе trainee
       yellow → assist (если есть слот), иначе trainee
       red    → trainee
-      ''     → пропускаем (не решаем за человека)
+      ''     → трактуем как 'yellow' (мягкий фолбэк, если таблица ответила пусто)
     Админ: обязателен для некоторых пакетов — берём из ручного назначения
     (state.distribution_cache) или из "админ доступен" при отсутствии пересечений.
     """
@@ -558,7 +608,10 @@ async def _is_deal_ready(did: int) -> bool:
             uid = int(u["user_id"])
             if uid in seen:
                 continue  # один пользователь — одна роль
-            status = await get_user_status_from_svetofor(uid, game_name)
+
+            status = await _sv_status(uid, game_name)  # 'green'|'yellow'|'red'|''
+            if not status:
+                status = "yellow"  # мягкий фолбэк (ключ валиден, но ячейка могла быть белой)
 
             # маппинг цвета → роль (с учётом занятых слотов)
             if status == "green":
@@ -567,23 +620,32 @@ async def _is_deal_ready(did: int) -> bool:
                 if len(team["assist"]) < need_assist:
                     team["assist"].append(uid); seen.add(uid); continue
                 team["trainee"].append(uid); seen.add(uid); continue
-            elif status == "yellow":
+
+            if status == "yellow":
                 if len(team["assist"]) < need_assist:
                     team["assist"].append(uid); seen.add(uid); continue
                 team["trainee"].append(uid); seen.add(uid); continue
-            elif status == "red":
-                team["trainee"].append(uid); seen.add(uid); continue
-            # статус пустой — не назначаем
 
+            # status == 'red'
+            team["trainee"].append(uid); seen.add(uid); continue
+
+    # ── промо ассистента в основного, если не хватило main
     have_main = len(team["main"])
     have_assist = len(team["assist"])
+    if have_main < need_main and have_assist > 0:
+        promote_cnt = min(need_main - have_main, have_assist)
+        promoted = team["assist"][:promote_cnt]
+        team["assist"] = team["assist"][promote_cnt:]
+        team["main"].extend(promoted)
+        have_main = len(team["main"])
+        have_assist = len(team["assist"])
+        logger.debug("[deal_ready] promote %d assist → main (fallback)", promote_cnt)
 
     # 2) админ: вручную назначенный (distribution_cache) либо из "админ доступен"
     dist = state.distribution_cache.get(str(did), {}) or {}
     have_admin = 1 if dist.get("admin") else 0
 
     if need_admin and not have_admin:
-        # кандидаты «админ доступен», без пересечения с main/assist
         assigned = set(team["main"]) | set(team["assist"])
         for pdata in state.responses.values():
             if did not in pdata["deal_indices"].values():

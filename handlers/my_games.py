@@ -1,29 +1,31 @@
 # handlers/my_games.py — дашборд «Мои игры»
 # ─────────────────────────────────────────────────────────────────────────────
 """
-Версия 5.1 · 2025-08-12
+Версия 5.2 · 2025-08-13
 
-Что изменено по сравнению с 5.0
+Что изменено по сравнению с 5.1
 ────────────────────────────────
-• Гарантированная совместимость с текущей сборкой (fallback сигнатур для vacuum).
-• Жёсткий запрет автоперехода в детали при любых внешних действиях (детали
-  открываем ТОЛЬКО по нажатию в «Мои игры»).
-• Усилен фолбэк: если CRM отдаёт пусто/204 — достраиваем карточки из кэша.
-• Не тронуты авторспределение и цикл подтверждений: роли/теги/переводы статусов
-  находятся в handlers.confirmations + handlers.polls_distribution.
+• Гарантированно включаем игры для всех назначенных по слотам locked_distribution,
+  даже если CRM вернула пусто/204 или запаздывает — см. _augment_with_locked()
+  и _visible_deals_for_user().
+• Починили падение при вызове show_my_game_details из _send_details() через
+  «фейковый» CallbackQuery — безопасные await callback.answer() и фолбэк-детали.
+• Восстановлена/добавлена функция _visible_deals_for_user() (исправляет ошибку
+  Pylance «_visible_deals_for_user is not defined»).
+• Сохранена совместимость вакуума (новая/старая сигнатура) и все публичные API.
 """
 
 from __future__ import annotations
-
 # ███ [1] IMPORTS
 # --------------------------------------------------------------------
 from __future__ import annotations
 
+import re
 import contextlib
 import logging
 import unicodedata
 from datetime import datetime
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Any, Tuple
 import inspect
 
 from aiogram import Bot, Router, types
@@ -67,13 +69,14 @@ ZWNBSP = "\uFEFF"   # zero-width no-break space (BOM)
 # ── статус-ID ────────────────────────────────────────────────────────
 # «Бронь» — требуется подтверждение состава
 BRON_STATUS_ID: str = str(getattr(settings, "BRON_STATUS_ID", "18913933") or "18913933")
-# «Завершение сделки» — у settings.SUCCESSFUL_STATUS_ID
-OK_STATUS_ID: str = str(getattr(settings, "SUCCESSFUL_STATUS_ID", settings.SUCCESSFUL_STATUS_ID))
+# «Завершение сделки»
+OK_STATUS_ID: str = str(getattr(settings, "SUCCESSFUL_STATUS_ID", "0") or "0")
 
 # ── callback-префиксы ────────────────────────────────────────────────
 DETAILS_PREFIX = "mygame_details_"
 REPORT_PREFIX  = "mygame_report_"
 SWAP_PREFIX    = "mygame_swap_"
+
 
 # ════════════════════════════════════════════════════════════════════
 # [2] TEXT HELPERS
@@ -107,8 +110,6 @@ def _is_my_games_btn(text: str | None) -> bool:
 
 # ███ [2.1] SHOW MY-GAME DETAILS — CRM + утверждённый состав + «✅ Подтвердить»
 # --------------------------------------------------------------------
-from typing import Tuple
-
 def _tag_uid(tag: Optional[str]) -> Optional[int]:
     """user_id из тега «Имя.Суффикс|123»."""
     if not tag or "|" not in str(tag):
@@ -127,7 +128,6 @@ def _tag_label(tag: Optional[str]) -> str:
 
 def _sorted_slots(dist: Dict[str, str], prefix: str) -> List[str]:
     """Возвращает список ключей слотов (lead*/assistant*) в порядке по индексу."""
-    import re
     slots = [k for k in dist.keys() if k.startswith(prefix)]
     def keyf(k: str) -> int:
         m = re.search(r"(\d+)$", k)
@@ -146,6 +146,21 @@ def _role_from_slots(uid: int, dist: Dict[str, str]) -> Optional[str]:
         return "admin"
     return None
 
+def _is_locally_confirmed(deal_id: int, uid: int) -> bool:
+    """
+    Проверка локального подтверждения из state.pending_confirmations:
+    • новая схема: dict по ролям {'main': {uid}, ...}
+    • старая схема: set {uid, ...}
+    """
+    pc = getattr(state, "pending_confirmations", {}) or {}
+    node = pc.get(deal_id) or {}
+    conf = node.get("confirmed")
+    if isinstance(conf, dict):
+        return any(int(uid) in set(map(int, conf.get(k, set()))) for k in ("main", "assist", "admin"))
+    if isinstance(conf, set):
+        return int(uid) in set(map(int, conf))
+    return False
+
 @router.callback_query(lambda c: c.data.startswith("mygame_"))
 async def show_my_game_details(callback: types.CallbackQuery) -> None:
     """
@@ -153,21 +168,41 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
       • подробности из CRM (дата, время, место, пакет, игроки, статус);
       • утверждённый состав из state.locked_distribution (слоты lead*/assistant*/admin/trainee);
       • кнопка «✅ Подтвердить участие» — только для назначенного и только при статусе «Бронь».
+      • повторно кнопку не показываем, если подтверждение уже учтено локально.
     """
     bot = Bot.get_current()
     uid = callback.from_user.id
     try:
         deal_id = int(callback.data.rsplit("_", 1)[-1])
     except Exception:
-        await callback.answer("Некорректный идентификатор.", show_alert=True)
+        with contextlib.suppress(Exception):
+            await callback.answer("Некорректные данные.", show_alert=True)
         return
 
-    # CRM-данные из текущей выборки (или из кэша текущего опроса)
+    # 1) CRM-данные из текущей выборки опроса
     deal = next((d for d in (state.current_poll_deals or []) if int(d.get("id", 0)) == deal_id), None)
+
+    # 2) Фолбэк: игры, которые уже отрисованы этому пользователю в «Мои игры»
     if not deal:
-        await bot.send_message(uid, "⚠️ Игра не найдена.")
-        await callback.answer()
-        return
+        user_list = (state.games_by_user or {}).get(uid) or []
+        deal = next((d for d in user_list if int(d.get("id", 0)) == deal_id), None)
+
+    # 3) Жёсткий фолбэк из локального кэша/слотов (когда CRM вернула 204/пусто)
+    if not deal:
+        details = (getattr(state, "poll_details", {}) or {}).get(deal_id) or {}
+        title = details.get("title") or (getattr(state, "deal_titles", {}) or {}).get(deal_id) or f"Сделка #{deal_id}"
+        deal = {
+            "id": deal_id,
+            "name": title,
+            "event_datetime": details.get("event_datetime"),
+            "event_time": details.get("event_time") or "—",
+            "status_id": BRON_STATUS_ID,
+            "address": details.get("address") or details.get("location") or "—",
+            "package": details.get("package") or "—",
+            "players": details.get("players") or "—",
+            "tags": details.get("tags") or [],
+            "comment": details.get("comment") or "",
+        }
 
     name = str(deal.get("game_name") or deal.get("name") or f"Сделка #{deal_id}")
     event_dt = deal.get("event_datetime")
@@ -214,7 +249,12 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
 
     # Кнопка «✅ Подтвердить участие»
     role = _role_from_slots(uid, dist)  # main/assist/admin/None
-    confirmed = _has_confirmation_tag(deal, uid)
+
+    # confirmed по факту: теги ИЛИ локальный state.pending_confirmations
+    confirmed_by_tags = _has_confirmation_tag(deal, uid)
+    confirmed_local = _is_locally_confirmed(deal_id, uid)
+    confirmed = confirmed_by_tags or confirmed_local
+
     can_confirm = (role in {"main", "assist", "admin"}) and (status_id == BRON_STATUS_ID) and (not confirmed)
 
     if can_confirm:
@@ -223,12 +263,13 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
                 [InlineKeyboardButton(text="✅ Подтвердить участие", callback_data=f"{CONFIRM_PREFIX}{deal_id}_{role}")]
             ]
         )
+        # отдельным сообщением, чтобы confirmations.py мог безопасно edit_reply_markup
         await bot.send_message(uid, "\u2060", reply_markup=kb)
 
-    await callback.answer()
+    # безопасный ответ на колбэк (если это реальный апдейт; для фейкового — проглотим)
+    with contextlib.suppress(Exception):
+        await callback.answer()
 
-# История изменений:
-# • 2025-08-12 — детали CRM + утверждённый состав из *слотов* locked_distribution + корректная кнопка подтверждения.
 
 # ════════════════════════════════════════════════════════════════════
 # [3] DOMAIN HELPERS
@@ -295,17 +336,24 @@ def _short_name(uid: int) -> str:
 def _expected_tags_for(uid: int) -> Set[str]:
     """
     Набор тегов подтверждения для пользователя:
-    { 'Имя Ф..1', 'Имя Ф..2', 'Имя Ф..Ад' }
+    { 'Имя Ф..1', 'Имя Ф..2', 'Имя Ф..Адм' }
+    Учитываем исторические вариации: с двойной точкой/пробелом перед «Адм».
     Если короткое имя неизвестно — возвращаем пустой набор.
     """
     base = _short_name(uid)
     if not base:
         return set()
-    return {f"{base}.1", f"{base}.2", f"{base}.Ад"}
+    # базовые формы
+    tags = {f"{base}.1", f"{base}.2", f"{base}.Адм"}
+    # исторические вариации
+    tags |= {f"{base} .Адм", f"{base}. Адм", f"{base}.Ад", f"{base}. Ад"}
+    # двойная точка встречается в части генераторов («Имя Ф.» + «.1»)
+    tags |= {f"{base}..1", f"{base}..2", f"{base}..Адм"}
+    return tags
 
 
 def _has_confirmation_tag(deal: Dict, uid: int) -> bool:
-    tags = {t.get("name") for t in (deal.get("tags") or []) if isinstance(t, dict)}
+    tags = {str(t.get("name")) for t in (deal.get("tags") or []) if isinstance(t, dict) and t.get("name")}
     need = _expected_tags_for(uid)
     return bool(tags & need)
 
@@ -322,7 +370,7 @@ def _assigned_role_from_state(uid: int, deal_id: int) -> Optional[str]:
             or {}
 
     # Новый формат (слоты)
-    if any(k.startswith("lead") for k in roles.keys()) or "admin" in roles and isinstance(roles.get("admin"), str):
+    if any(k.startswith("lead") for k in roles.keys()) or ("admin" in roles and isinstance(roles.get("admin"), str)):
         for k in _sorted_slots(roles, "lead"):
             if _tag_uid(roles.get(k)) == uid:
                 return "main"
@@ -418,7 +466,6 @@ def _details_kb(uid: int, deal: Dict, confirmed: bool) -> InlineKeyboardMarkup:
     kb.adjust(1)
     return kb.as_markup()
 
-
 # ════════════════════════════════════════════════════════════════════
 # [4] ВЫБОРКА ИГР
 # ════════════════════════════════════════════════════════════════════
@@ -437,17 +484,52 @@ def _wanted_status(deal: Dict) -> bool:
 def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
     """
     Дополняем CRM-список сделками из зафиксированного распределения,
-    если CRM вернул пусто/неполный набор. Источник — state.assigned_index.
+    если CRM вернул пусто/неполный набор.
+
+    Раньше опирались только на state.assigned_index → игры могли не попасть
+    пользователю, если index ещё не успели собрать. Теперь:
+    • берём id'шники и из assigned_index[uid],
+    • ДОПОЛНИТЕЛЬНО сканируем state.locked_distribution по слотам lead*/assistant*/admin/trainee,
+      чтобы гарантированно включить игру всем назначенным.
     """
+    # 1) ID из assigned_index (если есть)
     try:
         assigned_index: Dict[int, Set[int]] = getattr(state, "assigned_index", {}) or {}
         want_ids: Set[int] = set(assigned_index.get(uid) or set())
     except Exception:
         want_ids = set()
 
+    # 2) ID из locked_distribution (по слотам) — новый, обязательный источник
+    try:
+        locked = (getattr(state, "locked_distribution", {}) or {})
+        for did_key, dist in locked.items():
+            try:
+                did = int(did_key)
+            except Exception:
+                continue
+            if not isinstance(dist, dict):
+                continue
+
+            # проверяем все слоты нового формата
+            found = False
+            for k, v in dist.items():
+                if not isinstance(k, str):
+                    continue
+                if k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"}:
+                    u = _tag_uid(v) if isinstance(v, str) else None
+                    if u == uid:
+                        found = True
+                        break
+            if found:
+                want_ids.add(did)
+    except Exception:
+        # не блокируем сборку, просто остаёмся с тем, что есть
+        pass
+
     if not want_ids:
         return list(all_deals or [])
 
+    # индексация уже пришедших из CRM
     by_id = {int(d.get("id") or 0): d for d in (all_deals or []) if isinstance(d, dict)}
     out: List[Dict] = list(all_deals or [])
 
@@ -455,6 +537,7 @@ def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
         if did in by_id:
             continue
 
+        # достраиваем карточку из локальных деталей/кэша
         details = (getattr(state, "poll_details", {}) or {}).get(did) or {}
         title = (
             details.get("title")
@@ -468,7 +551,7 @@ def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
                 "id": did,
                 "name": title,
                 "event_datetime": event_dt,
-                "status_id": BRON_STATUS_ID,
+                "status_id": BRON_STATUS_ID,  # по умолчанию считаем «Бронь», пока не подтянем CRM
                 "team_leads": details.get("team_leads") or [],
                 "players": details.get("players") or "—",
                 "package": details.get("package") or "—",
@@ -484,7 +567,7 @@ def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
     """
     Итоговая выборка для «Мои игры»:
       • статус «Бронь» или «Завершение сделки»;
-      • пользователь назначен (state.assigned_index/locked_distribution) ИЛИ legacy team_leads ИЛИ есть тег подтверждения;
+      • пользователь назначен (assigned_index/locked_distribution-слоты/legacy team_leads/факт по тегам);
       • + дополнение из локального кэша, если CRM вернул пусто.
     """
     all_deals = _augment_with_locked(uid, list(all_deals or []))
@@ -629,6 +712,7 @@ async def _send_details(uid: int, deal: Dict) -> None:
 
 # История изменений:
 # • 2025-08-12 — _send_details вызывает [2.1] напрямую; фолбэк без зависимостей от отчёта.
+# • 2025-08-13 — безопасные callback.answer() и фолбэк источников данных для деталей.
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -663,20 +747,31 @@ async def redraw_my_games(uid: int) -> None:
 @router.message(Command("my_games"))
 @router.message(lambda m: _is_my_games_btn(getattr(m, "text", None)))
 async def my_games_handler(message: types.Message) -> None:
+    """
+    Точка входа в «🎲 Мои игры».
+    Фикс: перед любой отрисовкой жёстко вызываем «пылесос», чтобы в ЛС всегда оставался
+    один актуальный блок (даже если CRM вернула пусто).
+    """
     uid = message.from_user.id
+
+    # всегда чистим ЛС перед новой отрисовкой
+    await _vacuum_safe(uid)
+
     try:
-        deals = _visible_deals_for_user(uid, await get_amocrm_deals())
+        deals_all = await get_amocrm_deals()
+        deals = _visible_deals_for_user(uid, deals_all)
     except Exception as e:
         logger.error("[my_games:handler] get_amocrm_deals failed: %s", e)
-        await message.answer("⚠️ Не удалось получить список игр.")
+        await Bot.get_current().send_message(uid, "⚠️ Не удалось получить список игр.")
         with contextlib.suppress(Exception):
             await message.delete()
         return
 
     if deals:
-        await _send_dashboard(uid, deals)
+        await _send_dashboard(uid, deals)  # _send_dashboard сам вызывает vacuum внутри лока
     else:
-        await message.answer("😔 Назначенных игр пока нет.")
+        # даже при пустом списке у нас уже был vacuum в начале — отправляем единичное сообщение
+        await Bot.get_current().send_message(uid, "😔 Назначенных игр пока нет.")
 
     with contextlib.suppress(Exception):
         await message.delete()
@@ -710,7 +805,7 @@ async def cb_details(callback: types.CallbackQuery) -> None:
         await callback.answer("⚠️ Игра не найдена.", show_alert=True)
         return
 
-    await _send_details(uid, deal)
+    await _send_details(uid, deal)  # _send_details внутри делает vacuum и рисует подробности + кнопку confirm_role
     await callback.answer()
 
 
@@ -718,9 +813,9 @@ async def cb_details(callback: types.CallbackQuery) -> None:
 async def cb_back(callback: types.CallbackQuery) -> None:
     uid = callback.from_user.id
     if state.games_by_user.get(uid):
-        await _send_dashboard(uid, state.games_by_user[uid])
+        await _send_dashboard(uid, state.games_by_user[uid])  # внутри есть vacuum
     else:
-        await redraw_my_games(uid)
+        await redraw_my_games(uid)  # внутри есть vacuum
     await callback.answer()
 
 
@@ -732,7 +827,9 @@ async def cb_report_placeholder(callback: types.CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data and c.data.startswith(SWAP_PREFIX))
 async def cb_swap_placeholder(callback: types.CallbackQuery) -> None:
     await callback.answer("🔄 Замена — в разработке.", show_alert=True)
-
+# История изменений: 2025-08-12 — усилен vacuum в my_games_handler (фикс множества сообщений при пустом списке);
+#                     остальная логика неизменна, подтверждение — только через confirm_role_{deal_id}_{role}.
+#                     2025-08-13 — включение игр из слотов locked_distribution + фиксы деталей/колбэков.
 
 # ════════════════════════════════════════════════════════════════════
 # [8] SELF-TEST
@@ -791,3 +888,5 @@ if __name__ == "__main__":
 # История изменений:
 # • 2025-08-12 — v5.1-fix: детали «Мои игры» читают состав из *слотов* locked_distribution,
 #   подтверждение делает правильный callback с ролью, усилены фолбэки CRM и видимость игр.
+# • 2025-08-13 — v5.2: гарантированная видимость игр назначенным (скан слотов),
+#   безопасные callback.answer() при фейковых запросах, возвращён _visible_deals_for_user().

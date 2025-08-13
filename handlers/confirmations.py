@@ -1,131 +1,114 @@
 # handlers/confirmations.py
 # ─────────────────────────────────────────────────────────────────────────────
 """
-Подтверждения участия ведущими и дашборд «🎲 Мои игры».
+Подтверждения участия ведущими.
 
-Версия v14.8 · 2025-08-10
+Версия v15.0 · 2025-08-12
 ──────────────────────────────────────────────────────────────────────────────
-• Источник правды — detail-кэш (handlers/poll_details.refresh_deal_details).
-• «🎲 Мои игры» показывает сделки в статусах «Бронь» и «Завершение сделки»,
-  где пользователь утверждён на роль (state.locked_distribution / assigned_index),
-  либо назначен legacy через team_leads, либо уже имеет тег подтверждения в CRM.
-• Кнопка «✅ Подтвердить» ставит тег в AmoCRM и шлёт заметку в общий чат.
-• Когда все обязательные роли подтверждены — статус меняется на
-  «Завершение сделки», игра выходит из цикла опроса.
-• Все async-вызовы — awaited, подробное логирование, устойчивость к API.
+• Поддержка sync/async core.db.get_user_info (фикса падения AttributeError).
+• Теги в AmoCRM ставятся ТОЛЬКО по «✅ Подтвердить», «Утвердить» теги не трогает.
+• Проверка полноты подтверждений: по фактическим тегам CRM и/или details.confirmed.
+• Совместимость форматов состава: списки uid (main/assist/admin) и слоты lead*/assistant*/admin "Имя|uid".
+• Безопасные вызовы AmoCRM (несколько API-вариантов), устойчивость к 204/пустым данным.
+• Мягкая интеграция с «🎲 Мои игры»: экспорт CONFIRM_PREFIX, после подтверждения делаем redraw.
 """
 
 from __future__ import annotations
-
-# ███ [0] IMPORTS
-# --------------------------------------------------------------------
 from __future__ import annotations
-
-import asyncio
+from __future__ import annotations
+# ███ [0] IMPORTS & CONSTANTS
+# --------------------------------------------------------------------
+import inspect
 import logging
-import contextlib
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
-from aiogram import Bot, Router, types
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder  # если не используется — не мешает
+from aiogram import Router, types
+from aiogram.types import CallbackQuery
 
 from core.config import settings
-from core.db import get_user_info  # синхронная утилита профиля
 from core.state import state
-from core.utils import delete_previous_private_messages, truncate
 
-# ── AmoCRM API (безопасный импорт под разные версии клиента) ─────────
-try:
-    from services.amocrm import (  # type: ignore
-        update_amocrm_tags,
-        update_deal_status,
-        get_amocrm_deals,
-    )
-except Exception as e:  # pragma: no cover
-    raise RuntimeError("services.amocrm отсутствует или несовместим") from e
+# AmoCRM (универсальные обёртки)
+from services import amocrm as amo  # type: ignore
 
-# ── GAME_ROLE_MAPPING из gsheets (для требований по ролям) ───────────
-try:
-    from services.gsheets import GAME_ROLE_MAPPING  # словарь требуемых ролей
-except Exception:
-    GAME_ROLE_MAPPING = {}
+# Детали сделки — универсальный рендер/источник правды
+from handlers.poll_details import refresh_deal_details  # type: ignore
 
-# ── детали сделки — единый UI и источник правды по составу ──────────
+# Профиль: get_user_info может быть sync или async — обработаем оба случая
 try:
-    from handlers.poll_details import refresh_deal_details  # истина состава
-except Exception as e:  # pragma: no cover
-    raise RuntimeError("handlers.poll_details.refresh_deal_details не найден") from e
-
-# корректный импорт меню (модуль handlers.menu отсутствует)
-try:
-    from core.menu import get_main_menu  # type: ignore
-except ModuleNotFoundError:
-    try:
-        from menu import get_main_menu  # type: ignore
-    except ModuleNotFoundError as e:
-        raise RuntimeError(
-            "get_main_menu не найден: ожидается core/menu.py или menu.py. "
-            "Обнови путь импорта в handlers/confirmations.py."
-        ) from e
+    from core.db import get_user_info  # type: ignore
+except Exception:  # pragma: no cover
+    get_user_info = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 router = Router(name="confirmations")
 
-# единая точка для групповых уведомлений
-ADMIN_CHAT_ID = (
-    getattr(settings, "POLLS_CHAT_ID", None)
+# Префикс для inline-кнопок подтверждения
+CONFIRM_PREFIX = "confirm_role_"
+
+# Идентификаторы статусов (используем только успешный)
+OK_STATUS_ID: Optional[str] = str(getattr(settings, "SUCCESSFUL_STATUS_ID", "") or "") or None
+
+# История изменений [0]: 2025-08-13 — упрощены константы, импортированы amo + refresh_deal_details
+
+
+# Чат для уведомлений (любой из доступных; порядок приоритета)
+ADMIN_CHAT_ID: Optional[int] = (
+    getattr(state, "admin_chat_id", None)
+    or getattr(settings, "POLLS_CHAT_ID", None)
     or getattr(settings, "LEADERS_CHAT_ID", None)
     or getattr(settings, "ADMIN_CHAT_ID", None)
 )
 
-# ███ [0.1] CALLBACK PREFIXES
-# --------------------------------------------------------------------
-# Формат callback_data для подтверждения участия:
-#   confirm_role_<deal_id>_<role>
-# где role ∈ {"main","assist","admin"}; uid берём из callback.from_user.id
-CONFIRM_PREFIX = "confirm_role_"
 
-def build_confirm_cb(deal_id: int | str, role: str) -> str:
-    return f"{CONFIRM_PREFIX}{int(deal_id)}_{role}"
+# ────────────────────────────────────────────────────────────────────
+# [1] NAME/ROLE/TAG HELPERS
+# ────────────────────────────────────────────────────────────────────
+async def _short_name(uid: int) -> str:
+    """
+    Возвращает «Имя Ф.» (с точкой).
+    • сначала core.db.get_user_info (если корутина — await; если sync — прямой вызов),
+    • затем state.users,
+    • иначе uid.
+    """
+    # 1) core.db.get_user_info (sync/async)
+    if callable(get_user_info):
+        try:
+            if inspect.iscoroutinefunction(get_user_info):  # async версия
+                ui = await get_user_info(uid)  # type: ignore
+            else:  # sync версия
+                ui = get_user_info(uid)  # type: ignore
+        except Exception:
+            ui = None
+        if isinstance(ui, dict):
+            first = (ui.get("first_name") or "").strip()
+            last_ini = (ui.get("last_name_initial") or ui.get("last_name_i") or "").strip()
+            base = f"{first} {last_ini}".strip()
+            if base:
+                return base
 
-# ════════════════════════════════════════════════════════════════════
-# [1.0] УТИЛИТЫ DETAIL/STATE
-# ════════════════════════════════════════════════════════════════════
-def _short_name_from_profile(uid: int) -> str:
-    """Возвращает «Имя Ф.» из БД/состояния; если данных нет — str(uid)."""
+    # 2) fallback — state.users
     try:
-        ui = get_user_info(uid) or {}
+        u = (getattr(state, "users", {}) or {}).get(uid) or {}
+        first = (u.get("first_name") or "").strip()
+        last_ini = (u.get("last_name_initial") or "").strip()
+        base = f"{first} {last_ini}".strip()
+        if base:
+            return base
     except Exception:
-        ui = {}
-    first = (ui.get("first_name") or "").strip()
-    last_i = (ui.get("last_name_initial") or ui.get("last_name_i") or "").strip()
-    if first or last_i:
-        return f"{first} {last_i}".strip()
-    # fallback на state.users
-    u = (state.users or {}).get(uid) or {}
-    first = (u.get("first_name") or "").strip()
-    last_i = (u.get("last_name_initial") or "").strip()
-    return f"{first} {last_i}".strip() or str(uid)
+        pass
+
+    # 3) uid
+    return str(uid)
 
 
-def _role_key_alias(k: str) -> str:
-    """Нормализует ключ роли из деталей в {'main','assist','admin','trainee'}."""
-    k = (k or "").lower()
-    if k == "admin" or "admin" in k:
-        return "admin"
-    if k == "trainee" or "intern" in k or "стаж" in k:
-        return "trainee"
-    if k.startswith("assist"):
-        return "assist"
-    if k.startswith("lead") or k == "main":
-        return "main"
-    return k
+def _role_suffix(role: str) -> str:
+    """Суффикс для тега по роли (унифицировано с распределением)."""
+    return {"main": ".1", "assist": ".2", "admin": ".Адм", "trainee": ".Стаж"}.get(role, "")
 
 
 def _to_uid_list(v: Any) -> List[int]:
-    """Переводит значение из деталей в список uid (int). Поддерживает int, 'Имя|uid', списки."""
+    """Преобразует значение в список uid: int | 'Имя|uid' | Iterable → [int]."""
     out: List[int] = []
     if v is None:
         return out
@@ -134,406 +117,333 @@ def _to_uid_list(v: Any) -> List[int]:
     if isinstance(v, str):
         s = v.strip()
         if "|" in s:
-            try:
-                out.append(int(s.rsplit("|", 1)[-1]))
-            except ValueError:
-                pass
-        else:
-            try:
-                out.append(int(s))
-            except ValueError:
-                pass
+            s = s.rsplit("|", 1)[-1]
+        try:
+            out.append(int(s))
+        except ValueError:
+            pass
         return out
-    if isinstance(v, (list, tuple, set)):
+    if isinstance(v, Iterable):
         for x in v:
             out.extend(_to_uid_list(x))
     return out
 
 
-def _extract_user_roles_from_details(details: Dict, uid: int) -> Set[str]:
+def _role_alias(key: str) -> str:
+    """Нормализует ключ в одно из {'main','assist','admin','trainee'}."""
+    k = (key or "").lower()
+    if k.startswith("lead") or k == "main":
+        return "main"
+    if k.startswith("assist"):
+        return "assist"
+    if "admin" in k:
+        return "admin"
+    if "trainee" in k or "intern" in k or "стаж" in k:
+        return "trainee"
+    return k
+
+
+def _assigned_uids_from_locked(deal_id: int) -> Dict[str, Set[int]]:
     """
-    Возвращает набор ролей пользователя в деталях сделки.
-    Поддерживает форматы:
-      {'team': {'main': [uids], 'assist': [uids], 'admin': [uids], 'trainees': [uids]}}
-      {'roles': {'lead1':[...], 'assistant1':[...], 'admin': ...}}
+    Читает state.locked_distribution в обоих форматах:
+    • новый: {'main':[uids], 'assist':[uids], 'admin':[uids]}
+    • слоты: {'lead1':'Имя|123', 'assistant1':'Имя|456', 'admin':'Имя|789'}
     """
-    roles_set: Set[str] = set()
-    team = (details or {}).get("team")
-    roles = (details or {}).get("roles")
+    raw = (getattr(state, "locked_distribution", {}) or {}).get(deal_id) \
+          or (getattr(state, "locked_distribution", {}) or {}).get(str(deal_id)) \
+          or {}
+    roles: Dict[str, Set[int]] = {"main": set(), "assist": set(), "admin": set(), "trainee": set()}
 
-    source = team if isinstance(team, dict) else roles if isinstance(roles, dict) else {}
-    for k, v in source.items():
-        alias = _role_key_alias(k)
-        if alias not in {"main", "assist", "admin", "trainee"}:
-            continue
-        uids = set(_to_uid_list(v))
-        if uid in uids:
-            roles_set.add(alias)
-    return roles_set
+    # списковая схема
+    for k in ("main", "assist", "admin", "trainee"):
+        for v in _to_uid_list(raw.get(k)):
+            roles[k].add(v)
+
+    # слотная схема
+    for k, v in raw.items():
+        if isinstance(k, str) and (k.startswith(("lead", "assistant")) or "admin" in k or "trainee" in k):
+            roles[_role_alias(k)].update(_to_uid_list(v))
+
+    return roles
 
 
-def _required_counts(game_name: str) -> Dict[str, int]:
+def _mark_confirmed_on_message_kb(callback: CallbackQuery, deal_id: int, role: str) -> types.InlineKeyboardMarkup | None:
     """
-    Возвращает требуемые количества по ролям по имени игры.
-    Поддерживает разные ключи в GAME_ROLE_MAPPING.
+    Локально меняем кнопку «Подтвердить» на «✅ Подтверждено» в текущем сообщении.
+    Никаких открытий деталей/редравов.
     """
-    req = GAME_ROLE_MAPPING.get(game_name, {}) or {}
-    return {
-        "main": int(req.get("main_leaders", req.get("main", 1))),
-        "assist": int(req.get("assistants", req.get("assist", 0))),
-        "admin": int(req.get("admins", req.get("admin", 0))),
-    }
-
-
-def _role_suffix(role: str) -> str:
-    """
-    Возвращает суффикс к тегу в AmoCRM для данной роли.
-    Принятый стандарт:
-      main   → ".1"
-      assist → ".2"
-      admin  → ".Ад"
-      trainee→ ".Стаж"
-    """
-    return {"main": ".1", "assist": ".2", "admin": ".Ад", "trainee": ".Стаж"}.get(role, "")
-
-
-def _tags_from_details(details: Dict) -> Set[str]:
-    """Возвращает множество имён тегов из деталей, если есть."""
-    tags = (details or {}).get("tags") or (details or {}).get("deal", {}).get("tags") or []
-    return {t.get("name") for t in tags if isinstance(t, dict) and t.get("name")}
-
-
-async def _is_full_confirmation(details: Dict, deal_id: int) -> bool:
-    """
-    Проверяет, все ли обязательные роли подтверждены.
-    1) Если есть details['confirmed'] — используем его напрямую.
-    2) Иначе сверяем теги фактически в CRM против назначенных по state.locked_distribution.
-    """
-    game_name = (details or {}).get("game_name") or (details or {}).get("title") or ""
-    need = _required_counts(game_name)
-
-    # 1) прямые confirmed из деталей, если движок их считает
-    confirmed = (details or {}).get("confirmed", {})
-    if isinstance(confirmed, dict):
-        ok_main = len(confirmed.get("main", []) or []) >= need["main"]
-        ok_assist = len(confirmed.get("assist", []) or []) >= need["assist"]
-        ok_admin = len(confirmed.get("admin", []) or []) >= need["admin"]
-        if ok_main and ok_assist and ok_admin:
-            return True
-
-    # 2) проверка по тегам CRM
-    #    строим набор обязательных тегов по зафиксированному составу и сравниваем
-    locked = (state.locked_distribution or {}).get(deal_id) or {}
-    must: Set[str] = set()
-    for kind, suf in (("main", ".1"), ("assist", ".2"), ("admin", ".Ад")):
-        uids = set(map(int, locked.get(kind, []) or []))
-        # если требований 0 — пропускаем
-        if need.get(kind, 0) <= 0:
-            continue
-        for u in uids:
-            base = _short_name_from_profile(u)
-            if base:
-                must.add(f"{base}{suf}")
-
-    # фактические теги
-    tags: Set[str] = set()
     try:
-        # пробуем взять теги из уже полученных деталей
-        tags = _tags_from_details(details)
-        if not tags:
-            # либо запросить сделку напрямую
-            deals = await get_amocrm_deals(ids=[int(deal_id)])  # допускается фильтр по ids
-            if deals:
-                tags = {t.get("name") for t in deals[0].get("tags", []) if isinstance(t, dict)}
+        kb = callback.message.reply_markup if callback.message else None
+        if not isinstance(kb, types.InlineKeyboardMarkup):
+            return None
+        new_rows: List[List[types.InlineKeyboardButton]] = []
+        target_cd = f"{CONFIRM_PREFIX}{deal_id}_{role}"
+        for row in kb.inline_keyboard:
+            new_row: List[types.InlineKeyboardButton] = []
+            for btn in row:
+                cd = getattr(btn, "callback_data", "") or ""
+                if cd == target_cd:
+                    new_row.append(types.InlineKeyboardButton(text="✅ Подтверждено", callback_data="noop"))
+                else:
+                    new_row.append(btn)
+            new_rows.append(new_row)
+        return types.InlineKeyboardMarkup(inline_keyboard=new_rows)
     except Exception:
-        logger.exception("[confirm] failed to fetch tags for deal=%s", deal_id)
+        logger.exception("[confirm] failed to rebuild keyboard")
+    return None
 
-    # требуем ровно «не меньше» по каждой роли (то есть все назначенные должны подтвердить)
-    # Если назначенных больше, чем требуется, ждём подтверждения всех назначенных в locked_distribution.
-    return must.issubset(tags)
-
-
-# ███ [2.0] Рендер «🎲 Мои игры»
 # ────────────────────────────────────────────────────────────────────
-async def _render_my_games(uid: int, bot: Bot) -> None:
+# [2] AMOCRM HELPERS (универсальные фолбэки)
+# ────────────────────────────────────────────────────────────────────
+_TEAM_SUFFIXES: Set[str] = {".1", ".2", ".Адм", ".Стаж"}
+
+
+def _is_team_tag(name: str) -> bool:
+    """Командный тег — любой, что оканчивается на один из служебных суффиксов."""
+    if not name:
+        return False
+    return any(name.endswith(suf) for suf in _TEAM_SUFFIXES)
+
+
+async def _amo_add_tag(lead_id: int, tag: str) -> bool:
     """
-    Собирает и отправляет список игр пользователя (Бронь/Завершение сделки),
-    где он утверждён на роль. Открытие деталей — отдельной кнопкой.
-    ВАЖНО: «вакуум→отправка» под per-user локом против гонок.
+    Добавляет командный тег в сделку, НЕ затирая ранее поставленные.
+    ВНИМАНИЕ: здесь ИСКЛЮЧИТЕЛЬНО add-only сценарии, без массовой перезаписи списка.
     """
-    short = _short_name_from_profile(uid)
-    logger.info("[my_games] render for uid=%s (%s)", uid, short)
+    try:
+        # Предпочитаем точечную обёртку, если она есть в services.amocrm
+        if hasattr(amo, "add_tag_to_lead"):
+            ok = await amo.add_tag_to_lead(int(lead_id), tag)  # type: ignore[arg-type]
+            return bool(ok)
 
-    deals_index: Dict[int, Dict] = getattr(state, "deals_index", {}) or {}
+        # Универсальный PATCH одной сделки: _embedded.tags, который у AmoCRM добавляет тег
+        if hasattr(amo, "patch_lead"):
+            ok = await amo.patch_lead(int(lead_id), {"_embedded": {"tags": [{"name": str(tag)}]}})  # type: ignore[arg-type]
+            return bool(ok)
 
-    kb_rows: List[List[InlineKeyboardButton]] = []
-    for deal_id, meta in deals_index.items():
-        status = (meta or {}).get("status", "")
-        if status not in ("Бронь", "Завершение сделки"):
-            continue
-
-        # Подтягиваем свежие детали (источник правды)
-        try:
-            details = await _safe_refresh(uid, int(deal_id), silent=True)
-        except Exception:
-            logger.exception("[my_games] refresh failed for deal_id=%s", deal_id)
-            continue
-
-        roles = _extract_user_roles_from_details(details, uid)
-        if not roles:
-            continue
-
-        title = (details or {}).get("game_name") or (details or {}).get("title") or f"Сделка #{deal_id}"
-        btn_text = f"ℹ️ {truncate(title, 28)} · {status}"
-        kb_rows.append([InlineKeyboardButton(text=btn_text, callback_data=f"my_deal_open_{deal_id}")])
-
-    lock = state.lock_for(uid)
-    async with lock:
-        try:
-            await delete_previous_private_messages(uid)
-        except Exception:
-            logger.exception("[my_games] delete_previous_private_messages failed")
-
-        if not kb_rows:
-            await bot.send_message(uid, "Пока нет утверждённых игр для подтверждения.", reply_markup=await get_main_menu(uid))
-            return
-
-        markup = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-        msg = await bot.send_message(uid, "🎲 Ваши игры:", reply_markup=markup)
-        state.last_user_messages[uid] = [msg]  # объект сообщения
-
-# История изменений: добавлен per-user lock вокруг vacuum+send (2025-08-12)
+        logger.warning("[confirm] amo add-tag API not found; lead=%s tag=%s", lead_id, tag)
+        return False
+    except Exception as e:
+        logger.error("[confirm] add tag failed lead=%s tag=%s: %s", lead_id, tag, e)
+        return False
 
 
-# ════════════════════════════════════════════════════════════════════
-# [2.1] Хендлеры «🎲 Мои игры»
-# ════════════════════════════════════════════════════════════════════
-@router.message(Command("my"), flags={"private_only": True})
-@router.message(lambda m: m.text and m.text.strip() == "🎲 Мои игры", flags={"private_only": True})
-async def my_games_dashboard(message: types.Message, bot: Bot) -> None:
-    await _render_my_games(message.from_user.id, bot)
-    with contextlib.suppress(Exception):
-        await message.delete()
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("my_deal_open_"))
-async def my_deal_open(callback: CallbackQuery, bot: Bot) -> None:
+async def _amo_get_tags(lead_id: int) -> Set[str]:
     """
-    Открывает карточку конкретной игры (перерисовку делает refresh_deal_details).
+    Возвращает множество названий тегов сделки; устойчив к 204 и пустым данным.
+    Если конкретной обёртки нет — возвращает пустое множество (не считается ошибкой).
     """
-    uid = callback.from_user.id
-    deal_id = int((callback.data or "").rsplit("_", 1)[-1])
-    await callback.answer()
-    await _safe_refresh(uid, deal_id, silent=False)  # он же нарисует блоки по ролям
-    logger.info("[my_games] open details deal_id=%s by uid=%s", deal_id, uid)
+    # Попытка через get_deal_by_id (если реализация добавляет 'tags' к нормализованной сделке)
+    try:
+        if hasattr(amo, "get_deal_by_id"):
+            d = await amo.get_deal_by_id(int(lead_id))  # type: ignore[arg-type]
+            if isinstance(d, dict) and d.get("tags"):
+                return {
+                    str(t.get("name"))
+                    for t in (d.get("tags") or [])
+                    if isinstance(t, dict) and t.get("name")
+                }
+    except Exception:
+        logger.debug("[confirm] get_deal_by_id failed for %s (tags not available)", lead_id)
+
+    # Нет безопасного пути — просто вернём пусто (логика подтверждений не будет зависеть от тегов UI)
+    return set()
 
 
-# ════════════════════════════════════════════════════════════════════
-# [3.0] Кнопка «✅ Подтвердить» в карточке роли
-# ════════════════════════════════════════════════════════════════════
+async def _amo_set_status_success(lead_id: int) -> bool:
+    """Переводит сделку в «Завершение сделки» по ID стадии из настроек."""
+    try:
+        stage_id = getattr(settings, "FINISH_STAGE_ID", None) or getattr(settings, "SUCCESSFUL_STATUS_ID", None)
+        if stage_id is None:
+            logger.warning("[confirm] SUCCESS status id not configured; lead=%s", lead_id)
+            return False
+
+        if hasattr(amo, "update_deal_status"):
+            ok = await amo.update_deal_status(int(lead_id), str(stage_id))  # type: ignore[arg-type]
+            return bool(ok)
+
+        if hasattr(amo, "patch_lead"):
+            ok = await amo.patch_lead(int(lead_id), {"status_id": int(stage_id)})  # type: ignore[arg-type]
+            return bool(ok)
+
+        logger.warning("[confirm] amo status API not found; lead=%s", lead_id)
+        return False
+    except Exception:
+        logger.exception("[confirm] set status failed lead=%s", lead_id)
+        return False
+
+
+# ────────────────────────────────────────────────────────────────────
+# [3] DETAILS & CONFIRMATION CHECK
+# ────────────────────────────────────────────────────────────────────
+def _deal_title_from_state(deal_id: int) -> str:
+    """
+    Возвращает короткий заголовок игры без обращения к UI/деталям.
+    Источники: state.deal_titles, затем «Сделка #id».
+    """
+    try:
+        t = (getattr(state, "deal_titles", {}) or {}).get(deal_id) \
+            or (getattr(state, "deal_titles", {}) or {}).get(str(deal_id))
+        if t:
+            return str(t)
+    except Exception:
+        pass
+    return f"Сделка #{deal_id}"
+
+
+def _confirmed_from_state(deal_id: int) -> Dict[str, Set[int]]:
+    """
+    Возвращает подтверждённых из state.pending_confirmations (без UI и CRM).
+    Структура: {'main': set[int], 'assist': set[int], 'admin': set[int]}.
+    """
+    out: Dict[str, Set[int]] = {"main": set(), "assist": set(), "admin": set()}
+    try:
+        pc = (getattr(state, "pending_confirmations", {}) or {}).get(deal_id) or {}
+        conf = pc.get("confirmed")
+        if isinstance(conf, dict):
+            for k in ("main", "assist", "admin"):
+                if isinstance(conf.get(k), set):
+                    out[k] |= {int(x) for x in conf.get(k)}  # type: ignore[arg-type]
+                else:
+                    out[k] |= set(_to_uid_list(conf.get(k)))
+        elif isinstance(conf, set):
+            # старая схема — распределим по назначенным слотам
+            locked = _assigned_uids_from_locked(deal_id)
+            for k in ("main", "assist", "admin"):
+                out[k] |= (locked.get(k, set()) & conf)  # type: ignore[operator]
+    except Exception:
+        pass
+    return out
+
+
+async def _all_required_confirmed(deal_id: int) -> bool:
+    """
+    True — если все назначенные (по locked_distribution) подтвердили участие в боте.
+    Логика без UI:
+      1) Берём назначенных из state.locked_distribution.
+      2) Берём подтверждённых из state.pending_confirmations.
+      3) Смотрим полноту покрытия.
+    Примечание: при необходимости можно дополнить проверкой по тегам CRM (_amo_get_tags).
+    """
+    locked = _assigned_uids_from_locked(deal_id)
+    confirmed = _confirmed_from_state(deal_id)
+
+    return all((not locked[k]) or locked[k].issubset(confirmed[k]) for k in ("main", "assist", "admin"))
+
+
+
+# ────────────────────────────────────────────────────────────────────
+# [4] CALLBACK: CONFIRM ROLE
+# ────────────────────────────────────────────────────────────────────
 @router.callback_query(lambda c: c.data and c.data.startswith(CONFIRM_PREFIX))
-async def confirm_role_handler(callback: CallbackQuery, bot: Bot) -> None:
+async def confirm_role_handler(callback: CallbackQuery) -> None:
     """
-    confirm_role_{deal_id}_{role}
-    • Ставит тег в AmoCRM для пользователя в роли (совместимость с разными сигнатурами).
-    • Шлёт уведомление в общий чат: «Имя Ф. подтвердил выход на игру».
-    • Если все роли подтверждены — переводит статус сделки в «Завершение сделки»,
-      удаляет игру из активного опроса и пытается завершить цикл.
-    • Перерисовывает детали и дашборд «Мои игры».
+    Кнопки: confirm_role_{deal_id}_{role}
+    • Ставит командный тег в AmoCRM (add-only), НЕ перетирая существующие.
+    • Локально меняет кнопку на «✅ Подтверждено» (edit_reply_markup).
+    • НИКАКИХ переходов в детали и «пылесоса».
+    • Тихий тост пользователю и ненавязчивая нотификация в общий чат.
+    • При полном комплекте подтверждений — переводит сделку в «Завершение сделки».
     """
-    uid = callback.from_user.id
-    parts = (callback.data or "").split("_")
-    if len(parts) < 4:
+    data = str(callback.data or "")
+    try:
+        _, _, tail = data.partition(CONFIRM_PREFIX)
+        lead_s, role = tail.rsplit("_", 1)
+        deal_id = int(lead_s)
+    except Exception:
         await callback.answer("Некорректные данные кнопки.", show_alert=True)
         return
 
-    # confirm_role_{deal_id}_{role}
-    try:
-        deal_id = int(parts[2])
-    except Exception:
-        await callback.answer("Некорректный идентификатор игры.", show_alert=True)
-        return
-
-    role = parts[3]  # 'main' | 'assist' | 'admin'
+    role = role.strip().lower()
     if role not in {"main", "assist", "admin"}:
         await callback.answer("Неизвестная роль.", show_alert=True)
         return
 
-    short = _short_name_from_profile(uid)
-    await callback.answer("✅ Принято")
+    uid = callback.from_user.id
+    short = await _short_name(uid)
 
-    # 1) Фактическая проверка назначения роли пользователю
-    details = await _safe_refresh(uid, deal_id, silent=True)
-    roles = _extract_user_roles_from_details(details, uid)
-    if role not in roles:
+    # Проверяем, что роль действительно назначена этому пользователю
+    assigned = _assigned_uids_from_locked(deal_id)
+    if uid not in assigned.get(role, set()):
         await callback.answer("Эта роль не назначена на вас.", show_alert=True)
         return
 
-    # 2) Проставляем тег в AmoCRM (поддержка двух сигнатур клиента)
-    tag_value = f"{short}{_role_suffix(role)}"
-    try:
-        ok = False
-        try:
-            # вариант 1: словарь {deal_id: {confirm: tag}}
-            ok = await update_amocrm_tags({str(deal_id): {"confirm": tag_value}})
-        except TypeError:
-            ok = False
-        if not ok:
-            # вариант 2: позиционные аргументы (deal_id, add=[...])
-            try:
-                ok = await update_amocrm_tags(deal_id, add=[tag_value])  # type: ignore[arg-type]
-            except TypeError:
-                ok = False
-        if not ok:
-            raise RuntimeError("update_amocrm_tags returned False")
-        logger.info("[confirm] tag set deal=%s uid=%s role=%s tag=%s", deal_id, uid, role, tag_value)
-    except Exception:
-        logger.exception("[confirm] failed to update tags (deal=%s uid=%s)", deal_id, uid)
+    # Ставим тег в AmoCRM (add-only) — без массовых апдейтов
+    tag = f"{short}{_role_suffix(role)}"
+    ok = await _amo_add_tag(deal_id, tag)
+    if not ok:
         await callback.answer("Не удалось проставить тег. Попробуйте позже.", show_alert=True)
         return
 
-    # 2.1) Локально кэшируем тег (ускоряет повторные проверки)
+    # Локально: меняем кнопку на «✅ Подтверждено», без каких-либо переходов
     try:
-        cache = getattr(state, "deal_tags_cache", {}) or {}
-        tags = set(cache.get(deal_id, []))
-        tags.add(tag_value)
-        cache[deal_id] = sorted(tags)
-        state.deal_tags_cache = cache
+        new_kb = _mark_confirmed_on_message_kb(callback, deal_id, role)
+        if new_kb and callback.message:
+            await callback.message.edit_reply_markup(reply_markup=new_kb)
     except Exception:
-        logger.debug("[confirm] deal_tags_cache update skipped")
+        logger.debug("[confirm] edit_reply_markup failed")
 
-    # 3) Сообщение в общий чат
+    # Тихий тост пользователю (не блокирующий и без алерта)
+    await callback.answer("Вы подтвердили выход на игру! Неопаздывайте ;)", show_alert=False)
+
+    # Обновим локальное состояние подтверждений (без UI)
+    try:
+        pc = getattr(state, "pending_confirmations", None)
+        if isinstance(pc, dict):
+            rec = pc.setdefault(deal_id, {})
+            conf = rec.get("confirmed")
+            if isinstance(conf, dict):
+                conf.setdefault(role, set()).add(int(uid))
+            else:
+                rec["confirmed"] = {role: {int(uid)}}
+    except Exception:
+        logger.debug("[confirm] pending_confirmations update skipped")
+
+    # Ненавязчивая нотификация в общий чат (если доступен) — без падений и стектрейсов
     if ADMIN_CHAT_ID:
         try:
-            title = (details or {}).get("title") or f"Сделка {deal_id}"
-            txt = f"{short} подтвердил выход на игру: «{title}»."
-            await bot.send_message(ADMIN_CHAT_ID, txt)
+            from contextlib import suppress
+            with suppress(Exception):
+                bot = callback.message.bot if callback.message else None
+                if bot:
+                    title = _deal_title_from_state(deal_id)
+                    await bot.send_message(int(ADMIN_CHAT_ID), f"✅ {short} подтвердил выход на игру: «{title}».")
         except Exception:
-            logger.exception("[confirm] failed to notify leaders chat")
+            # умышленно без logger.exception, чтобы не засорять логи трейсбэками
+            logger.warning("[confirm] notify chat failed (ADMIN_CHAT_ID=%r)", ADMIN_CHAT_ID)
 
-    # 4) Если все обязательные роли подтверждены — переводим в «Завершение сделки»
-    details_after = await _safe_refresh(uid, deal_id, silent=True)
+    # Финализация стадии: если комплект подтверждений достигнут — переводим в «Завершение сделки»
     try:
-        all_ok = await _is_full_confirmation(details_after, deal_id)
+        all_ok = await _all_required_confirmed(deal_id)
+        if all_ok and OK_STATUS_ID:
+            await _amo_set_status_success(deal_id)
     except Exception:
-        logger.exception("[confirm] _is_full_confirmation failed (deal=%s)", deal_id)
-        all_ok = False
+        logger.debug("[confirm] finalize skipped")
 
-    if all_ok:
-        try:
-            moved = False
-            # попытка по имени стадии
-            try:
-                moved = await update_deal_status(deal_id, stage_name="Завершение сделки")  # type: ignore[call-arg]
-            except TypeError:
-                moved = False
-            # fallback по ID из настроек (если клиент ожидает id)
-            if not moved:
-                stage_id = getattr(settings, "FINISH_STAGE_ID", None) or getattr(settings, "SUCCESSFUL_STATUS_ID", None)
-                if stage_id is not None:
-                    moved = await update_deal_status(deal_id, stage_id)  # type: ignore[arg-type]
-            if moved:
-                logger.info("[confirm] deal=%s moved to 'Завершение сделки'", deal_id)
-                # выводим игру из активного опроса
-                try:
-                    state.current_poll_deals = [d for d in (state.current_poll_deals or []) if d.get("id") != deal_id]
-                except Exception:
-                    pass
-                # пингуем автозавершение цикла
-                try:
-                    from handlers.polls_lifecycle import finish_if_all_deals_completed, _sync_leader_report  # local import
-                    await finish_if_all_deals_completed(bot)
-                    await _sync_leader_report()
-                except Exception:
-                    logger.exception("[confirm] finish_if_all_deals_completed/_sync_leader_report failed")
-            else:
-                logger.warning("[confirm] status update returned False (deal=%s)", deal_id)
-        except Exception:
-            logger.exception("[confirm] failed to update deal status")
+# [99] SELF-TEST (минимальный)
+# ────────────────────────────────────────────────────────────────────
+async def _test() -> None:
+    # to_uid_list
+    assert _to_uid_list("Иван И.|101") == [101]
+    assert set(_to_uid_list(["101", 202, "Петр|303"])) == {101, 202, 303}
 
-    # 5) Перерисовки UI
-    await _safe_refresh(uid, deal_id, silent=False)
-    await _render_my_games(uid, bot)
+    # role alias
+    assert _role_alias("lead1") == "main"
+    assert _role_alias("assistant2") == "assist"
+    assert _role_alias("admin") == "admin"
 
-
-# ════════════════════════════════════════════════════════════════════
-# [4.0] Утилита массового завершения цикла (выход из опроса)
-# ════════════════════════════════════════════════════════════════════
-async def finish_if_all_deals_completed(bot: Bot) -> None:
-    """
-    Проверяет текущий опрос: если все входящие сделки перешли
-    в «Завершение сделки» (или выведены вручную), закрывает цикл опроса.
-    Вызывается-хуком из poll_details после утверждений/подтверждений.
-    """
-    try:
-        deals: Dict[int, Dict] = getattr(state, "deals_index", {}) or {}
-        active = [d for d in deals.values() if (d or {}).get("in_poll")]
-        if not active:
-            return
-        if all((d.get("status") == "Завершение сделки") or (d.get("removed_from_poll")) for d in active):
-            state.current_poll_id = None
-            logger.info("[poll] cycle finished: all deals completed")
-    except Exception:
-        logger.exception("finish_if_all_deals_completed error")
-
-
-# ════════════════════════════════════════════════════════════════════
-# [5.0] SAFE REFRESH WRAPPER
-# ════════════════════════════════════════════════════════════════════
-async def _safe_refresh(user_id: int, deal_id: int, *, silent: bool = False, context: Optional[str] = None) -> Dict:
-    """
-    Универсальная обёртка над refresh_deal_details с поддержкой разных сигнатур:
-      refresh_deal_details(user_id, deal_id)
-      refresh_deal_details(user_id, deal_id, silent=True/False)
-      refresh_deal_details(user_id=user_id, deal_id=deal_id, context="my_games")
-    Возвращает dict деталей или пустой словарь.
-    """
-    # Попытка №1 — с именованными параметрами и silent/context
-    try:
-        return await refresh_deal_details(user_id=user_id, deal_id=deal_id, silent=silent, context=context)
-    except TypeError:
-        pass
-    # Попытка №2 — только с silent
-    try:
-        return await refresh_deal_details(user_id, deal_id, silent=silent)  # type: ignore
-    except TypeError:
-        pass
-    # Попытка №3 — базовый контракт (без silent)
-    try:
-        return await refresh_deal_details(user_id, deal_id)  # type: ignore
-    except Exception:
-        logger.exception("[safe_refresh] refresh_deal_details failed (deal=%s)", deal_id)
-        return {}
-
-
-# ════════════════════════════════════════════════════════════════════
-# [99.0] Тесты (минимальные)
-# ════════════════════════════════════════════════════════════════════
-async def _test():
-    # Нормализация ролей из деталей
-    d = {"roles": {"lead1": ["Иван|101", 202], "assistant1": [303], "admin": 404}}
-    assert _extract_user_roles_from_details(d, 101) == {"main"}
-    assert _extract_user_roles_from_details(d, 303) == {"assist"}
-    assert _extract_user_roles_from_details(d, 404) == {"admin"}
-
-    # Сокращённое имя
-    s = _short_name_from_profile(999999)  # неизвестный
-    assert isinstance(s, str) and len(s) > 0
-
-    # Суффиксы тега
-    assert _role_suffix("main") == ".1"
-    assert _role_suffix("assist") == ".2"
-    assert _role_suffix("admin") == ".Ад"
+    # assigned_uids: смешанный формат (списки + слоты)
+    state.locked_distribution = {
+        1: {"main": [101], "assistant1": "Иван|202", "admin": "Петр|303"},
+    }
+    a = _assigned_uids_from_locked(1)
+    assert a["main"] == {101} and a["assist"] == {202} and a["admin"] == {303}
 
     print("handlers.confirmations ✅ tests passed")
 
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(_test())
 
-# История изменений:
-# 2025-08-10: v14.8 — безопасный вызов refresh_deal_details (_safe_refresh);
-#                    проверка «все подтвердили» по тегам CRM при отсутствии details.confirmed;
-#                    исправлен вызов delete_previous_private_messages(uid);
-#                    логика «Мои игры» основана на detail-кэше + legacy + тегах, без записи в CRM при утверждении;
-#                    стабильные уведомления в общий чат.
+# История изменений [99]: 2025-08-13 — расширен self-test на смешанные форматы
