@@ -365,10 +365,140 @@ async def _process_deal(raw: Dict[str, Any], stages: Dict[str, str]) -> Optional
 # ════════════════════════════════════════════════════════════════════
 # [5] PUBLIC API
 # ════════════════════════════════════════════════════════════════════
+async def _build_cf_patch(updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Собирает payload для PATCH кастом-полей AmoCRM:
+    updates: {"photographer": "нет", ...} → {"custom_fields_values":[{field_id, values:[{value}]}]}
+    Возвращает None, если нечего патчить или отсутствуют ID полей.
+    """
+    AMOF = getattr(settings, "AMOCRM_FIELDS", {}) or {}
+    cf_items: List[Dict[str, Any]] = []
+
+    for key, val in updates.items():
+        if val is None or str(val).strip() == "":
+            continue
+        field_id = AMOF.get(key)
+        if not field_id:
+            logger.debug("[Amo] skip CF '%s': not configured in AMOCRM_FIELDS", key)
+            continue
+        try:
+            fid = int(str(field_id).strip())
+        except Exception:
+            logger.warning("[Amo] CF '%s' has non-numeric id=%r, skip", key, field_id)
+            continue
+        cf_items.append({"field_id": fid, "values": [{"value": val}]})
+
+    if not cf_items:
+        return None
+    return {"custom_fields_values": cf_items}
+
+
+def _is_empty_like(value: Any) -> bool:
+    """True, если значение пустое/не указано/дефис и т.п."""
+    s = str(value or "").strip().lower()
+    return s in {"", "-", "—", "не указано", "нет данных", "none", "null"}
+
+
+async def preflight_before_status_change(deal_id: int) -> bool:
+    """
+    Pre-flight перед сменой статуса:
+    • проверяем «блокирующие» поля (минимум photographer);
+    • если пусто — ставим 'нет';
+    • только после этого можно менять статус.
+    Возвращает True даже в offline, чтобы не ломать цикл.
+    """
+    cfg = getattr(state, "config", {}) or {}
+    if not cfg.get("domain"):
+        # offline/stub режим — считаем, что всё ок
+        logger.debug("[Amo] preflight offline ok for deal=%s", deal_id)
+        return True
+
+    try:
+        deal = await get_deal_by_id(deal_id)
+    except Exception as e:
+        logger.warning("[Amo] preflight get_deal_by_id failed for %s: %s", deal_id, e)
+        deal = None
+
+    # Список обязательных полей (минимальный набор по ТЗ)
+    need_updates: Dict[str, Any] = {}
+    try:
+        photographer_val = (deal or {}).get("photographer", "")
+        if _is_empty_like(photographer_val):
+            need_updates["photographer"] = "нет"
+    except Exception:
+        need_updates["photographer"] = "нет"
+
+    if not need_updates:
+        return True
+
+    # FIX: обязательно await, иначе будет "coroutine is not JSON serializable"
+    payload = await _build_cf_patch(need_updates)
+    if not payload:
+        logger.debug("[Amo] preflight: nothing to patch for deal=%s", deal_id)
+        return True
+
+    ok = await _patch_deal(deal_id, payload)
+    if not ok:
+        logger.warning("[Amo] preflight patch failed for deal=%s payload=%s", deal_id, need_updates)
+        # Не блокируем дальнейшую смену статуса — CRM сама вернёт ошибку, если поля критичны
+        return False
+
+    logger.info("[Amo] preflight patched deal=%s with %s", deal_id, need_updates)
+    return True
+
+
+# alias для совместимости с внешними вызовами
+async def ensure_required_fields(deal_id: int) -> bool:
+    return await preflight_before_status_change(deal_id)
+
+
+# ── helpers для тегов (safe merge) ──────────────────────────────────
+def _normalize_tag_name(name: str) -> str:
+    return " ".join((name or "").split())
+
+
+def _dedup_tags(items: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for t in items:
+        n = _normalize_tag_name(t)
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+    return out
+
+
+async def _get_current_tags_for_deal(deal_id: int) -> List[str]:
+    """
+    Возвращает список имён тегов сделки. Если 204/ошибка — пустой список.
+    """
+    cfg = getattr(state, "config", {}) or {}
+    if not cfg.get("domain"):
+        return []
+    js = await _request_json(
+        "GET",
+        f"https://{cfg['domain']}/api/v4/leads/{int(deal_id)}",
+        params={"with": "tags"},
+        ok_statuses=(200, 204),
+    )
+    if not js or not isinstance(js, dict):
+        return []
+    embedded = js.get("_embedded") or {}
+    tags = embedded.get("tags") or []
+    names = [str(t.get("name", "")).strip() for t in tags if isinstance(t, dict)]
+    return _dedup_tags(names)
+
+
 async def update_amocrm_tags(deals_tags: Dict[str, Dict[str, str]]) -> bool:
     """
-    Массовая запись тегов в сделки.
+    Массовая запись тегов в сделки (SAFE MERGE, без затирания).
     deals_tags: {"12345": {"lead1": "Имя Ф.1", "assist1": "Имя Ф.2", ...}, ...}
+
+    Алгоритм для каждой сделки:
+    1) GET /leads/{id}?with=tags → текущие теги (может вернуть пусто/204).
+    2) merged = dedup(current + new_values).
+    3) PATCH /leads/{id} {"_embedded":{"tags":[{"name": "..."}]}}
     """
     if not deals_tags:
         return True
@@ -376,15 +506,32 @@ async def update_amocrm_tags(deals_tags: Dict[str, Dict[str, str]]) -> bool:
     cfg = getattr(state, "config", {}) or {}
     if not cfg.get("domain"):
         # offline stub
-        logger.debug("[Amo] offline update_amocrm_tags: %s", deals_tags)
+        logger.debug("[Amo] offline update_amocrm_tags (merge): %s", deals_tags)
         return True
 
-    tasks = []
-    for deal_id, tag_map in deals_tags.items():
-        tags = [{"name": t} for t in tag_map.values() if t]
-        payload = {"_embedded": {"tags": tags}}
-        tasks.append(_patch_deal(int(deal_id), payload))
+    sem = asyncio.Semaphore(5)
 
+    async def _process_one(did: int, tag_map: Dict[str, str]) -> bool:
+        async with sem:
+            try:
+                incoming = _dedup_tags([v for v in (tag_map or {}).values() if v])
+                if not incoming:
+                    return True
+                current = await _get_current_tags_for_deal(did)
+                merged = _dedup_tags(current + incoming)
+                payload = {"_embedded": {"tags": [{"name": t} for t in merged]}}
+                ok = await _patch_deal(did, payload)
+                if ok:
+                    logger.info(
+                        "[Amo] tags merged for deal=%s: current=%s, add=%s, result=%s",
+                        did, current, incoming, merged
+                    )
+                return ok
+            except Exception as e:
+                logger.exception("[Amo] update_amocrm_tags failed for deal=%s: %s", did, e)
+                return False
+
+    tasks = [_process_one(int(deal_id), tag_map) for deal_id, tag_map in deals_tags.items()]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     return all(isinstance(r, bool) and r for r in results)
 
@@ -393,12 +540,19 @@ async def update_deal_status(deal_id: int, status_id: str) -> bool:
     """
     Переводит сделку в новый статус (например «Завершение сделки»).
     Используется handlers.confirmations после подтверждения всех ведущих.
+    Перед сменой статуса выполняется pre-flight заполнения обязательных полей.
     """
     cfg = getattr(state, "config", {}) or {}
     if not cfg.get("domain"):
         # offline-stub: считаем успешно
         logger.debug("[Amo] offline update_deal_status: id=%s -> %s", deal_id, status_id)
         return True
+
+    try:
+        await preflight_before_status_change(deal_id)
+    except Exception as e:
+        logger.warning("[Amo] preflight raised for deal=%s: %s (continue to status patch)", deal_id, e)
+
     payload = {"status_id": int(status_id)}
     return await _patch_deal(deal_id, payload)
 
@@ -509,6 +663,39 @@ async def get_deal_by_id(deal_id: int | str) -> Optional[Dict[str, Any]]:
         if int(d.get("id", -1)) == did:
             return d
     return None
+# История изменений (блок [5]):
+# 2025-08-12 — добавлен preflight_before_status_change() и alias ensure_required_fields();
+#              update_deal_status() теперь вызывает pre-flight перед PATCH статуса;
+#              остальной публичный API сохранён без изменений.
+# 2025-08-13 — FIX: await _build_cf_patch() в preflight; SAFE MERGE в update_amocrm_tags().
+
+# ════════════════════════════════════════════════════════════════════
+# [5a] SINGLE-TAG HELPERS (используется handlers.confirmations)
+# ════════════════════════════════════════════════════════════════════
+async def patch_lead(lead_id: int, payload: Dict[str, Any]) -> bool:
+    """
+    Универсальный PATCH одной сделки. В offline-режиме — no-op с True.
+    Не затирает поля, если передавать _embedded/partial payload.
+    """
+    cfg = getattr(state, "config", {}) or {}
+    if not cfg.get("domain"):
+        logger.debug("[Amo] offline patch_lead: id=%s payload=%s", lead_id, payload)
+        return True
+    return await _patch_deal(int(lead_id), payload)
+
+
+async def add_tag_to_lead(lead_id: int, tag: str) -> bool:
+    """
+    Безопасно добавляет ОДИН тег (merge, без перетирания других).
+    """
+    tag = _normalize_tag_name(tag)
+    if not tag:
+        return True
+    # читаем текущие теги → merge → patch
+    current = await _get_current_tags_for_deal(int(lead_id))
+    merged = _dedup_tags(current + [tag])
+    payload = {"_embedded": {"tags": [{"name": t} for t in merged]}}
+    return await patch_lead(int(lead_id), payload)
 
 # ════════════════════════════════════════════════════════════════════
 # [6] SELF-TEST
