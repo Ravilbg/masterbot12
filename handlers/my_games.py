@@ -1,32 +1,32 @@
 # handlers/my_games.py — дашборд «Мои игры»
 # ─────────────────────────────────────────────────────────────────────────────
 """
-Версия 5.2 · 2025-08-13
+Версия 5.3 · 2025-08-13
 
-Что изменено по сравнению с 5.1
-────────────────────────────────
-• Гарантированно включаем игры для всех назначенных по слотам locked_distribution,
-  даже если CRM вернула пусто/204 или запаздывает — см. _augment_with_locked()
-  и _visible_deals_for_user().
-• Починили падение при вызове show_my_game_details из _send_details() через
-  «фейковый» CallbackQuery — безопасные await callback.answer() и фолбэк-детали.
-• Восстановлена/добавлена функция _visible_deals_for_user() (исправляет ошибку
-  Pylance «_visible_deals_for_user is not defined»).
-• Сохранена совместимость вакуума (новая/старая сигнатура) и все публичные API.
+Что исправлено/усилено по сравнению с 5.2
+──────────────────────────────────────────
+• ФИКС «пылесоса»: сообщения деталей теперь жёстко учитываются и удаляются.
+  show_my_game_details накапливает отправленные сообщения в state.last_user_messages[uid],
+  _vacuum_safe дополнительно чистит state.detail_blocks для uid.
+• Роль для кнопки «✅ Подтвердить участие» определяется из зафиксированного состава
+  _assigned_role_from_state(...) (поддерживает и новый формат слотов, и legacy-списки),
+  чтобы не терять кнопку при legacy-раскладках.
+• Мягкие хардены: дефолтные значения, безопасные обращения к state.*, единый lock.
+
+Логика, формат и публичные API полностью сохранены.
 """
 
 from __future__ import annotations
+
 # ███ [1] IMPORTS
 # --------------------------------------------------------------------
-from __future__ import annotations
-
 import re
 import contextlib
 import logging
 import unicodedata
+import inspect
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Any, Tuple
-import inspect
 
 from aiogram import Bot, Router, types
 from aiogram.filters import Command
@@ -108,6 +108,7 @@ def _is_my_games_btn(text: str | None) -> bool:
     logger.info("[my_games:match] %s => %s", norm, ok)
     return ok
 
+
 # ███ [2.1] SHOW MY-GAME DETAILS — CRM + утверждённый состав + «✅ Подтвердить»
 # --------------------------------------------------------------------
 def _tag_uid(tag: Optional[str]) -> Optional[int]:
@@ -119,6 +120,7 @@ def _tag_uid(tag: Optional[str]) -> Optional[int]:
     except Exception:
         return None
 
+
 def _tag_label(tag: Optional[str]) -> str:
     """Человекочитаемая часть тега до «|uid»."""
     if not tag:
@@ -126,25 +128,17 @@ def _tag_label(tag: Optional[str]) -> str:
     s = str(tag)
     return s.split("|", 1)[0].strip()
 
+
 def _sorted_slots(dist: Dict[str, str], prefix: str) -> List[str]:
     """Возвращает список ключей слотов (lead*/assistant*) в порядке по индексу."""
-    slots = [k for k in dist.keys() if k.startswith(prefix)]
+    slots = [k for k in dist.keys() if isinstance(k, str) and k.startswith(prefix)]
+
     def keyf(k: str) -> int:
         m = re.search(r"(\d+)$", k)
         return int(m.group(1)) if m else 0
+
     return sorted(slots, key=keyf)
 
-def _role_from_slots(uid: int, dist: Dict[str, str]) -> Optional[str]:
-    """Определяем роль пользователя в новых слотах."""
-    for k in _sorted_slots(dist, "lead"):
-        if _tag_uid(dist.get(k)) == uid:
-            return "main"
-    for k in _sorted_slots(dist, "assistant"):
-        if _tag_uid(dist.get(k)) == uid:
-            return "assist"
-    if _tag_uid(dist.get("admin")) == uid:
-        return "admin"
-    return None
 
 def _is_locally_confirmed(deal_id: int, uid: int) -> bool:
     """
@@ -161,7 +155,8 @@ def _is_locally_confirmed(deal_id: int, uid: int) -> bool:
         return int(uid) in set(map(int, conf))
     return False
 
-@router.callback_query(lambda c: c.data.startswith("mygame_"))
+
+@router.callback_query(lambda c: c.data and c.data.startswith("mygame_"))
 async def show_my_game_details(callback: types.CallbackQuery) -> None:
     """
     Детали игры в «🎲 Мои игры»:
@@ -169,11 +164,23 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
       • утверждённый состав из state.locked_distribution (слоты lead*/assistant*/admin/trainee);
       • кнопка «✅ Подтвердить участие» — только для назначенного и только при статусе «Бронь».
       • повторно кнопку не показываем, если подтверждение уже учтено локально.
+    ФИКС «пылесоса»: все отправленные сообщения аккумулируются и сохраняются
+    в state.last_user_messages[uid] — следующий vacuum их удалит гарантированно.
+
+    ВАЖНО: обработчик открывает детали ТОЛЬКО по колбэку «mygame_details_{deal_id}».
+    Любые другие «mygame_*» (например, кнопка подтверждения в списке) лишь ACK’аются без действий,
+    чтобы интерфейс не «прыгал».
     """
+    # — фильтр против автоперехода из дашборда —
+    if not str(callback.data).startswith("mygame_details_"):
+        with contextlib.suppress(Exception):
+            await callback.answer()  # просто ACK, ничего не открываем
+        return
+
     bot = Bot.get_current()
     uid = callback.from_user.id
     try:
-        deal_id = int(callback.data.rsplit("_", 1)[-1])
+        deal_id = int(str(callback.data).rsplit("_", 1)[-1])
     except Exception:
         with contextlib.suppress(Exception):
             await callback.answer("Некорректные данные.", show_alert=True)
@@ -184,7 +191,7 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
 
     # 2) Фолбэк: игры, которые уже отрисованы этому пользователю в «Мои игры»
     if not deal:
-        user_list = (state.games_by_user or {}).get(uid) or []
+        user_list = (getattr(state, "games_by_user", {}) or {}).get(uid) or []
         deal = next((d for d in user_list if int(d.get("id", 0)) == deal_id), None)
 
     # 3) Жёсткий фолбэк из локального кэша/слотов (когда CRM вернула 204/пусто)
@@ -212,10 +219,11 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
     pkg_raw = str(deal.get("package") or "—")
     players = truncate(str(deal.get("players") or "—"), 60)
     status_id = str(deal.get("status_id") or "")
-    status = str(deal.get("status_name") or ("Бронь" if status_id == BRON_STATUS_ID else "—"))
+    bron_id = str(BRON_STATUS_ID)
+    status = str(deal.get("status_name") or ("Бронь" if status_id == bron_id else "—"))
 
     # Состав из locked_distribution (источник правды — новые "слоты")
-    locked_all = (state.locked_distribution or {})
+    locked_all = (getattr(state, "locked_distribution", {}) or {})
     dist: Dict[str, str] = {}
     if isinstance(locked_all.get(deal_id), dict):
         dist = locked_all[deal_id]
@@ -230,32 +238,33 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
     admin_text = _tag_label(dist.get("admin")) or "—"
     trainee_text = _tag_label(dist.get("trainee"))  # может быть пустым
 
-    lines = [
-        f"🎮 *{name}*",
-        f"📅 {date_s} · 🕒 {time_s}",
-        f"📍 {place}",
-        f"📦 Пакет: {pkg_raw}",
-        f"👥 Игроки: {players}",
-        f"📌 Статус CRM: {status}",
-        "— — —",
-        f"🧭 Ведущие: {mains_text}",
-        f"🛟 Помощники: {assists_text}",
-        f"🛡️ Админ: {admin_text}",
-    ]
-    if trainee_text:
-        lines.append(f"🎓 Стажёр: {trainee_text}")
+    msgs: List[types.Message] = []
+    msgs.append(await bot.send_message(
+        uid,
+        "\n".join([
+            f"🎮 *{name}*",
+            f"📅 {date_s} · 🕒 {time_s}",
+            f"📍 {place}",
+            f"📦 Пакет: {pkg_raw}",
+            f"👥 Игроки: {players}",
+            f"📌 Статус CRM: {status}",
+            "— — —",
+            f"🧭 Ведущие: {mains_text}",
+            f"🛟 Помощники: {assists_text}",
+            f"🛡️ Админ: {admin_text}",
+        ] + ([f"🎓 Стажёр: {trainee_text}"] if trainee_text else [])),
+        parse_mode="Markdown"
+    ))
 
-    await bot.send_message(uid, "\n".join(lines), parse_mode="Markdown")
-
-    # Кнопка «✅ Подтвердить участие»
-    role = _role_from_slots(uid, dist)  # main/assist/admin/None
+    # Роль для кнопки «✅ Подтвердить участие» — из зафиксированного состава (новый и legacy)
+    role = _assigned_role_from_state(uid, deal_id)  # main/assist/admin/None
 
     # confirmed по факту: теги ИЛИ локальный state.pending_confirmations
     confirmed_by_tags = _has_confirmation_tag(deal, uid)
     confirmed_local = _is_locally_confirmed(deal_id, uid)
     confirmed = confirmed_by_tags or confirmed_local
 
-    can_confirm = (role in {"main", "assist", "admin"}) and (status_id == BRON_STATUS_ID) and (not confirmed)
+    can_confirm = (role in {"main", "assist", "admin"}) and (status_id == bron_id) and (not confirmed)
 
     if can_confirm:
         kb = InlineKeyboardMarkup(
@@ -264,11 +273,48 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
             ]
         )
         # отдельным сообщением, чтобы confirmations.py мог безопасно edit_reply_markup
-        await bot.send_message(uid, "\u2060", reply_markup=kb)
+        msgs.append(await bot.send_message(uid, "\u2060", reply_markup=kb))
+
+    # Сохраняем всю пачку для будущего vacuum
+    try:
+        (getattr(state, "last_user_messages", {}) or {}).setdefault(uid, [])
+        state.last_user_messages[uid] = msgs
+    except Exception:
+        logger.debug("[my_games] failed to record last_user_messages for uid=%s", uid)
 
     # безопасный ответ на колбэк (если это реальный апдейт; для фейкового — проглотим)
     with contextlib.suppress(Exception):
         await callback.answer()
+
+
+# ── ХЕЛПЕР для дашборда списка «Мои игры»: инлайн-кнопка подтверждения ──────
+def make_my_games_confirm_btn_for_row(deal: Dict[str, Any], uid: int) -> Optional[InlineKeyboardButton]:
+    """
+    Возвращает кнопку «✅ Подтвердить» для строки списка «Мои игры» ИЛИ «✅ Подтверждено»,
+    либо None — если подтверждать нельзя (не назначен/не тот статус/уже подтверждено).
+    Логику берём ту же, что и в деталях.
+    """
+    try:
+        deal_id = int(deal.get("id") or 0)
+    except Exception:
+        return None
+
+    role = _assigned_role_from_state(uid, deal_id)
+    status_id = str(deal.get("status_id") or "")
+    bron_id = str(BRON_STATUS_ID)
+
+    confirmed_by_tags = _has_confirmation_tag(deal, uid)
+    confirmed_local = _is_locally_confirmed(deal_id, uid)
+    confirmed = confirmed_by_tags or confirmed_local
+
+    if not (role in {"main", "assist", "admin"} and status_id == bron_id):
+        return None
+
+    if confirmed:
+        return InlineKeyboardButton(text="✅ Подтверждено", callback_data="noop")
+
+    # ВАЖНО: используем отдельный префикс для списка, чтобы show_my_game_details не срабатывал
+    return InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"mygames_confirm_{deal_id}")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -370,7 +416,8 @@ def _assigned_role_from_state(uid: int, deal_id: int) -> Optional[str]:
             or {}
 
     # Новый формат (слоты)
-    if any(k.startswith("lead") for k in roles.keys()) or ("admin" in roles and isinstance(roles.get("admin"), str)):
+    if any(isinstance(k, str) and k.startswith("lead") for k in roles.keys()) or \
+       (isinstance(roles.get("admin"), str)):
         for k in _sorted_slots(roles, "lead"):
             if _tag_uid(roles.get(k)) == uid:
                 return "main"
@@ -465,6 +512,7 @@ def _details_kb(uid: int, deal: Dict, confirmed: bool) -> InlineKeyboardMarkup:
     kb.button(text="← Назад", callback_data="mygames_back")
     kb.adjust(1)
     return kb.as_markup()
+
 
 # ════════════════════════════════════════════════════════════════════
 # [4] ВЫБОРКА ИГР
@@ -597,6 +645,7 @@ def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
 
     return out
 
+
 # ════════════════════════════════════════════════════════════════════
 # [4.1] Backward compatibility (for handlers.profile import)
 # ════════════════════════════════════════════════════════════════════
@@ -618,6 +667,7 @@ async def _vacuum_safe(uid: int, keep: Optional[List[Any]] = None) -> None:
     """
     Совместимость с разными версиями core.utils.delete_previous_private_messages:
     сначала пробуем новую сигнатуру (bot, uid, keep), затем старую (uid).
+    Плюс: чистим state.detail_blocks[(uid, *)], чтобы точно убрать прежние блоки.
     """
     bot = Bot.get_current()
     try:
@@ -627,6 +677,15 @@ async def _vacuum_safe(uid: int, keep: Optional[List[Any]] = None) -> None:
             await delete_previous_private_messages(uid)  # type: ignore
         except Exception:
             pass
+
+    # Доп. подметание detail_blocks для пользователя
+    try:
+        db = getattr(state, "detail_blocks", {}) or {}
+        to_del = [key for key in db.keys() if isinstance(key, tuple) and key and key[0] == uid]
+        for k in to_del:
+            db.pop(k, None)
+    except Exception:
+        logger.debug("[my_games] detail_blocks cleanup skipped for uid=%s", uid)
 
 
 async def _send_dashboard(uid: int, deals: List[Dict]) -> None:
@@ -661,7 +720,9 @@ async def _send_dashboard(uid: int, deals: List[Dict]) -> None:
         msg = await bot.send_message(
             uid, "🎲 *Мои игры:*", parse_mode="Markdown", reply_markup=kb.as_markup()
         )
+        (getattr(state, "games_by_user", {}) or {}).setdefault(uid, [])
         state.games_by_user[uid] = deals_sorted
+        (getattr(state, "last_user_messages", {}) or {}).setdefault(uid, [])
         state.last_user_messages[uid] = [msg]
 
 
@@ -708,11 +769,13 @@ async def _send_details(uid: int, deal: Dict) -> None:
         kb = InlineKeyboardBuilder()
         kb.button(text="⬅️ Назад к списку", callback_data="mygames_back")
         msg = await bot.send_message(uid, text, reply_markup=kb.as_markup())
+        (getattr(state, "last_user_messages", {}) or {}).setdefault(uid, [])
         state.last_user_messages[uid] = [msg]
 
 # История изменений:
 # • 2025-08-12 — _send_details вызывает [2.1] напрямую; фолбэк без зависимостей от отчёта.
 # • 2025-08-13 — безопасные callback.answer() и фолбэк источников данных для деталей.
+# • 2025-08-13 — v5.3: show_my_game_details сохраняет отправленные сообщения → vacuum удаляет гарантированно.
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -740,7 +803,6 @@ async def redraw_my_games(uid: int) -> None:
         await Bot.get_current().send_message(uid, "😔 Назначенных игр пока нет.")
 
 
-
 # ════════════════════════════════════════════════════════════════════
 # [7] HANDLERS
 # ════════════════════════════════════════════════════════════════════
@@ -751,8 +813,18 @@ async def my_games_handler(message: types.Message) -> None:
     Точка входа в «🎲 Мои игры».
     Фикс: перед любой отрисовкой жёстко вызываем «пылесос», чтобы в ЛС всегда оставался
     один актуальный блок (даже если CRM вернула пусто).
+    Плюс: устанавливаем UI-контекст 'my_games', чтобы внешние апдейты не «вклинивались».
     """
     uid = message.from_user.id
+
+    # 🔒 зафиксировать контекст «мы сейчас в Мои игры»
+    try:
+        ctx = getattr(state, "ui_context", None)
+        if ctx is None:
+            state.ui_context = {}
+        state.ui_context[uid] = "my_games"
+    except Exception:
+        pass
 
     # всегда чистим ЛС перед новой отрисовкой
     await _vacuum_safe(uid)
@@ -779,7 +851,22 @@ async def my_games_handler(message: types.Message) -> None:
 
 @router.callback_query(lambda c: c.data and c.data.startswith(DETAILS_PREFIX))
 async def cb_details(callback: types.CallbackQuery) -> None:
+    """
+    Открыть карточку деталей «Мои игры».
+    Фикс: при любом заходе в детали переустанавливаем UI-контекст 'my_games',
+    чтобы фоновые апдейты чужого UI (отчёт опроса) игнорировали этого пользователя.
+    """
     uid = callback.from_user.id
+
+    # 🔒 закрепить контекст
+    try:
+        ctx = getattr(state, "ui_context", None)
+        if ctx is None:
+            state.ui_context = {}
+        state.ui_context[uid] = "my_games"
+    except Exception:
+        pass
+
     try:
         deal_id = int((callback.data or "").split("_")[-1])
     except Exception:
@@ -787,7 +874,7 @@ async def cb_details(callback: types.CallbackQuery) -> None:
         return
 
     deal: Optional[Dict] = next(
-        (d for d in state.games_by_user.get(uid, []) if int(d.get("id") or 0) == deal_id),
+        (d for d in (getattr(state, "games_by_user", {}) or {}).get(uid, []) if int(d.get("id") or 0) == deal_id),
         None,
     )
     if not deal:
@@ -811,8 +898,22 @@ async def cb_details(callback: types.CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data == "mygames_back")
 async def cb_back(callback: types.CallbackQuery) -> None:
+    """
+    Вернуться к списку «Мои игры».
+    Фикс: при возврате также закрепляем контекст 'my_games'.
+    """
     uid = callback.from_user.id
-    if state.games_by_user.get(uid):
+
+    # 🔒 закрепить контекст
+    try:
+        ctx = getattr(state, "ui_context", None)
+        if ctx is None:
+            state.ui_context = {}
+        state.ui_context[uid] = "my_games"
+    except Exception:
+        pass
+
+    if (getattr(state, "games_by_user", {}) or {}).get(uid):
         await _send_dashboard(uid, state.games_by_user[uid])  # внутри есть vacuum
     else:
         await redraw_my_games(uid)  # внутри есть vacuum
@@ -821,15 +922,46 @@ async def cb_back(callback: types.CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data and c.data.startswith(REPORT_PREFIX))
 async def cb_report_placeholder(callback: types.CallbackQuery) -> None:
+    # Контекст остаётся 'my_games' (не меняем), просто ответ.
     await callback.answer("📝 Отчёт — в разработке.", show_alert=True)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith(SWAP_PREFIX))
 async def cb_swap_placeholder(callback: types.CallbackQuery) -> None:
+    # Контекст остаётся 'my_games' (не меняем), просто ответ.
     await callback.answer("🔄 Замена — в разработке.", show_alert=True)
-# История изменений: 2025-08-12 — усилен vacuum в my_games_handler (фикс множества сообщений при пустом списке);
-#                     остальная логика неизменна, подтверждение — только через confirm_role_{deal_id}_{role}.
-#                     2025-08-13 — включение игр из слотов locked_distribution + фиксы деталей/колбэков.
+
+
+@router.callback_query(
+    lambda c: c.data
+    and c.data.startswith("mygame_")
+    and not c.data.startswith(DETAILS_PREFIX)
+    and c.data not in {"mygames_back"}
+    and not c.data.startswith(REPORT_PREFIX)
+    and not c.data.startswith(SWAP_PREFIX)
+)
+async def cb_ack_misc(callback: types.CallbackQuery) -> None:
+    """
+    Любые прочие mygame_* коллбэки (служебные/устаревшие) — просто ACK.
+    Ничего не открываем, чтобы не было «прыжков» UI.
+    """
+    uid = callback.from_user.id
+    # 🔒 на всякий случай поддержим контекст
+    try:
+        ctx = getattr(state, "ui_context", None)
+        if ctx is None:
+            state.ui_context = {}
+        state.ui_context[uid] = "my_games"
+    except Exception:
+        pass
+
+    await callback.answer()
+
+# История изменений:
+# • 2025-08-14 — ФИКС автопереходов: при входе/деталях/назад выставляется state.ui_context[uid]='my_games';
+#   добавлен ACK-хэндлер для прочих mygame_* чтобы не триггерить чужие переходы.
+
+
 
 # ════════════════════════════════════════════════════════════════════
 # [8] SELF-TEST
@@ -857,10 +989,11 @@ async def _test() -> None:
 
     # эмулируем слоты, как пишет polls_distribution
     state.locked_distribution = {
-        1: {"lead1": "Иван И..1|123", "assistant1": "Пётр П..2|456", "admin": "Анна А. Адм|789"},
+        1: {"lead1": "Иван И..1|123", "assistant1": "Пётр П..2|456", "admin": "Анна А..Адм|789"},
         2: {"lead1": "Иван И..1|123"},
     }
     state.assigned_index = {123: {1, 2}, 456: {1}, 789: {1}}
+    state.games_by_user = {}
 
     # назначение/видимость
     assert _is_user_assigned_current(123, dummy_bron) is True
@@ -884,9 +1017,3 @@ if __name__ == "__main__":
     import asyncio, logging as _log
     _log.basicConfig(level=_log.DEBUG)
     asyncio.run(_test())
-
-# История изменений:
-# • 2025-08-12 — v5.1-fix: детали «Мои игры» читают состав из *слотов* locked_distribution,
-#   подтверждение делает правильный callback с ролью, усилены фолбэки CRM и видимость игр.
-# • 2025-08-13 — v5.2: гарантированная видимость игр назначенным (скан слотов),
-#   безопасные callback.answer() при фейковых запросах, возвращён _visible_deals_for_user().
