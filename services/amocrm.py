@@ -46,11 +46,13 @@ import json
 import logging
 import os
 import re
+import contextlib  # ← добавлено
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable  # ← добавлено Iterable
 
 import aiohttp
 from pytz import timezone
+
 
 # ── fallback-импорт core.* (для self-test/offline окружений) ────────
 try:
@@ -105,6 +107,15 @@ __all__ = [
     "get_pipeline_stages",
     "get_custom_fields",
 ]
+# ════════════════════════════════════════════════════════════════════
+# [0.10] STATUS IDS
+# ════════════════════════════════════════════════════════════════════
+# «Бронь» — fallback через BOOKED_STATUS_ID при отсутствии BRON_STATUS_ID
+BRON_STATUS_ID: str = str(
+    getattr(settings, "BRON_STATUS_ID", None)
+    or getattr(settings, "BOOKED_STATUS_ID", "")
+    or ""
+)
 
 # ════════════════════════════════════════════════════════════════════
 # [1] TOKEN HELPERS
@@ -365,16 +376,27 @@ async def _process_deal(raw: Dict[str, Any], stages: Dict[str, str]) -> Optional
 # ════════════════════════════════════════════════════════════════════
 # [5] PUBLIC API
 # ════════════════════════════════════════════════════════════════════
+from typing import Any, Dict, List, Optional  # ← локальные типы для Pylance
+import asyncio                                # ← используется в update_amocrm_tags/fetch
+from datetime import datetime, timedelta      # ← используется в _fetch_amocrm_deals_raw
+import logging
+
+from core.config import settings              # ← конфиг (AMOCRM_FIELDS и т.п.)
+from core.state import state                  # ← доступ к state/config для offline-веток
+
+logger = logging.getLogger(__name__)
+
+
 async def _build_cf_patch(updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Собирает payload для PATCH кастом-полей AmoCRM:
     updates: {"photographer": "нет", ...} → {"custom_fields_values":[{field_id, values:[{value}]}]}
     Возвращает None, если нечего патчить или отсутствуют ID полей.
     """
-    AMOF = getattr(settings, "AMOCRM_FIELDS", {}) or {}
+    AMOF: Dict[str, Any] = getattr(settings, "AMOCRM_FIELDS", {}) or {}
     cf_items: List[Dict[str, Any]] = []
 
-    for key, val in updates.items():
+    for key, val in (updates or {}).items():
         if val is None or str(val).strip() == "":
             continue
         field_id = AMOF.get(key)
@@ -407,14 +429,14 @@ async def preflight_before_status_change(deal_id: int) -> bool:
     • только после этого можно менять статус.
     Возвращает True даже в offline, чтобы не ломать цикл.
     """
-    cfg = getattr(state, "config", {}) or {}
+    cfg: Dict[str, Any] = getattr(state, "config", {}) or {}
     if not cfg.get("domain"):
         # offline/stub режим — считаем, что всё ок
         logger.debug("[Amo] preflight offline ok for deal=%s", deal_id)
         return True
 
     try:
-        deal = await get_deal_by_id(deal_id)
+        deal = await get_deal_by_id(deal_id)  # type: ignore[name-defined]
     except Exception as e:
         logger.warning("[Amo] preflight get_deal_by_id failed for %s: %s", deal_id, e)
         deal = None
@@ -437,7 +459,7 @@ async def preflight_before_status_change(deal_id: int) -> bool:
         logger.debug("[Amo] preflight: nothing to patch for deal=%s", deal_id)
         return True
 
-    ok = await _patch_deal(deal_id, payload)
+    ok = await _patch_deal(deal_id, payload)  # type: ignore[name-defined]
     if not ok:
         logger.warning("[Amo] preflight patch failed for deal=%s payload=%s", deal_id, need_updates)
         # Не блокируем дальнейшую смену статуса — CRM сама вернёт ошибку, если поля критичны
@@ -473,10 +495,10 @@ async def _get_current_tags_for_deal(deal_id: int) -> List[str]:
     """
     Возвращает список имён тегов сделки. Если 204/ошибка — пустой список.
     """
-    cfg = getattr(state, "config", {}) or {}
+    cfg: Dict[str, Any] = getattr(state, "config", {}) or {}
     if not cfg.get("domain"):
         return []
-    js = await _request_json(
+    js = await _request_json(  # type: ignore[name-defined]
         "GET",
         f"https://{cfg['domain']}/api/v4/leads/{int(deal_id)}",
         params={"with": "tags"},
@@ -503,7 +525,7 @@ async def update_amocrm_tags(deals_tags: Dict[str, Dict[str, str]]) -> bool:
     if not deals_tags:
         return True
 
-    cfg = getattr(state, "config", {}) or {}
+    cfg: Dict[str, Any] = getattr(state, "config", {}) or {}
     if not cfg.get("domain"):
         # offline stub
         logger.debug("[Amo] offline update_amocrm_tags (merge): %s", deals_tags)
@@ -520,7 +542,7 @@ async def update_amocrm_tags(deals_tags: Dict[str, Dict[str, str]]) -> bool:
                 current = await _get_current_tags_for_deal(did)
                 merged = _dedup_tags(current + incoming)
                 payload = {"_embedded": {"tags": [{"name": t} for t in merged]}}
-                ok = await _patch_deal(did, payload)
+                ok = await _patch_deal(did, payload)  # type: ignore[name-defined]
                 if ok:
                     logger.info(
                         "[Amo] tags merged for deal=%s: current=%s, add=%s, result=%s",
@@ -542,7 +564,7 @@ async def update_deal_status(deal_id: int, status_id: str) -> bool:
     Используется handlers.confirmations после подтверждения всех ведущих.
     Перед сменой статуса выполняется pre-flight заполнения обязательных полей.
     """
-    cfg = getattr(state, "config", {}) or {}
+    cfg: Dict[str, Any] = getattr(state, "config", {}) or {}
     if not cfg.get("domain"):
         # offline-stub: считаем успешно
         logger.debug("[Amo] offline update_deal_status: id=%s -> %s", deal_id, status_id)
@@ -554,18 +576,19 @@ async def update_deal_status(deal_id: int, status_id: str) -> bool:
         logger.warning("[Amo] preflight raised for deal=%s: %s (continue to status patch)", deal_id, e)
 
     payload = {"status_id": int(status_id)}
-    return await _patch_deal(deal_id, payload)
+    return await _patch_deal(deal_id, payload)  # type: ignore[name-defined]
 
 
 async def _fetch_amocrm_deals_raw() -> List[Dict[str, Any]]:
     """Забирает «сырые» лиды из AmoCRM страницами (без нормализации)."""
-    cfg = getattr(state, "config", {}) or {}
+    cfg: Dict[str, Any] = getattr(state, "config", {}) or {}
     if not cfg.get("domain"):
         return []
 
-    # Пейджинг: фильтруем по updated_at за последние DATE_FILTER_DAYS
+    # Пейджинг: фильтруем по updated_at за последние N дней
     page, limit = 1, 250
-    updated_from = int((datetime.now() - timedelta(days=DATE_FILTER_DAYS)).timestamp())
+    date_filter_days = int(getattr(settings, "DATE_FILTER_DAYS", 14))
+    updated_from = int((datetime.now() - timedelta(days=date_filter_days)).timestamp())
     out: List[Dict[str, Any]] = []
 
     while True:
@@ -575,10 +598,14 @@ async def _fetch_amocrm_deals_raw() -> List[Dict[str, Any]]:
             "page": page,
             "filter[updated_at][from]": updated_from,
         }
-        js = await _request_json("GET", f"https://{cfg['domain']}/api/v4/leads", params=params)
+        js = await _request_json(  # type: ignore[name-defined]
+            "GET",
+            f"https://{cfg['domain']}/api/v4/leads",
+            params=params
+        )
         if not js:
             break
-        leads = js.get("_embedded", {}).get("leads", [])
+        leads = (js.get("_embedded", {}) or {}).get("leads", []) if isinstance(js, dict) else []
         if not leads:
             break
         out.extend(leads)
@@ -592,8 +619,8 @@ async def fetch_amocrm_deals() -> List[Dict[str, Any]]:
     Загружает сделки и приводит их к нормализованной форме.
     В offline-окружении возвращает один stub-дил.
     """
-    cfg = getattr(state, "config", {}) or {}
-    stages = await get_pipeline_stages() if cfg.get("domain") else {"100": "Бронь"}
+    cfg: Dict[str, Any] = getattr(state, "config", {}) or {}
+    stages = await get_pipeline_stages() if cfg.get("domain") else {"100": "Бронь"}  # type: ignore[name-defined]
 
     # offline-fallback
     if not cfg.get("domain"):
@@ -608,13 +635,13 @@ async def fetch_amocrm_deals() -> List[Dict[str, Any]]:
                 {"field_id": settings.AMOCRM_FIELDS["players"],     "values": [{"value": "до 8"}]},
             ],
         }
-        d = await _process_deal(stub, stages)
+        d = await _process_deal(stub, stages)  # type: ignore[name-defined]
         return [d] if d else []
 
     raws = await _fetch_amocrm_deals_raw()
     deals: List[Dict[str, Any]] = []
     for raw in raws:
-        d = await _process_deal(raw, stages)
+        d = await _process_deal(raw, stages)  # type: ignore[name-defined]
         if d:
             deals.append(d)
     deals.sort(key=lambda d: d["event_datetime"])
@@ -643,17 +670,20 @@ async def get_deal_by_id(deal_id: int | str) -> Optional[Dict[str, Any]]:
         logger.warning("[Amo] get_deal_by_id bad id=%r", deal_id)
         return None
 
-    cfg = getattr(state, "config", {}) or {}
-    stages = await get_pipeline_stages() if cfg.get("domain") else {"100": "Бронь"}
+    cfg: Dict[str, Any] = getattr(state, "config", {}) or {}
+    stages = await get_pipeline_stages() if cfg.get("domain") else {"100": "Бронь"}  # type: ignore[name-defined]
 
     # Прямой запрос
     if cfg.get("domain"):
-        js = await _request_json("GET", f"https://{cfg['domain']}/api/v4/leads/{did}")
+        js = await _request_json(  # type: ignore[name-defined]
+            "GET",
+            f"https://{cfg['domain']}/api/v4/leads/{did}"
+        )
         if js and isinstance(js, dict):
             # ответ одного лида — это сам лид (не в _embedded)
             raw = js if js.get("id") else None
             if raw:
-                d = await _process_deal(raw, stages)
+                d = await _process_deal(raw, stages)  # type: ignore[name-defined]
                 if d:
                     return d
 
@@ -663,11 +693,14 @@ async def get_deal_by_id(deal_id: int | str) -> Optional[Dict[str, Any]]:
         if int(d.get("id", -1)) == did:
             return d
     return None
+
 # История изменений (блок [5]):
 # 2025-08-12 — добавлен preflight_before_status_change() и alias ensure_required_fields();
 #              update_deal_status() теперь вызывает pre-flight перед PATCH статуса;
 #              остальной публичный API сохранён без изменений.
 # 2025-08-13 — FIX: await _build_cf_patch() в preflight; SAFE MERGE в update_amocrm_tags().
+# 2025-08-15 — Добавлены локальные импорты типов/модулей для Pylance; убран доступ к глобальной
+#              константе DATE_FILTER_DAYS из внешнего блока — используется безопасный fallback.
 
 # ════════════════════════════════════════════════════════════════════
 # [5a] SINGLE-TAG HELPERS (используется handlers.confirmations)
@@ -696,6 +729,170 @@ async def add_tag_to_lead(lead_id: int, tag: str) -> bool:
     merged = _dedup_tags(current + [tag])
     payload = {"_embedded": {"tags": [{"name": t} for t in merged]}}
     return await patch_lead(int(lead_id), payload)
+
+
+# ════════════════════════════════════════════════════════════════════
+# [5b] USER CONFIRMATION TAGS & SWAP HELPERS
+# ════════════════════════════════════════════════════════════════════
+from typing import Iterable
+
+def _build_expected_user_tags(base: str) -> set[str]:
+    """
+    Конструирует набор подтверждающих тегов для «Имя Ф.» с историческими вариациями.
+    Примеры: «Иван И..1», «Иван И..2», «Иван И..Адм», «Иван И. .Адм», «Иван И.. Адм»
+    """
+    b = (base or "").strip()
+    if not b:
+        return set()
+    variants = {
+        f"{b}.1", f"{b}.2", f"{b}.Адм",
+        f"{b} .Адм", f"{b}. Адм", f"{b}.Ад", f"{b}. Ад",
+        f"{b}..1", f"{b}..2", f"{b}..Адм",
+    }
+    return { _normalize_tag_name(v) for v in variants }
+
+async def _get_short_base_from_uid(uid: int) -> str:
+    """
+    Достаёт «Имя Ф.» из core.db.get_user_info (совместимость с sync/async).
+    Если не получилось — возвращает пустую строку.
+    """
+    try:
+        from core.db import get_user_info  # type: ignore
+    except Exception:
+        get_user_info = None  # type: ignore
+
+    if callable(get_user_info):
+        try:
+            res = get_user_info(uid)  # может быть и корутина, и sync
+            ui = await res if asyncio.iscoroutine(res) else res  # type: ignore
+        except Exception:
+            ui = None
+        if isinstance(ui, dict):
+            fn = (ui.get("first_name") or "").strip()
+            li = (ui.get("last_name_initial") or "").strip()
+            base = f"{fn} {li}".strip()
+            return base
+    return ""
+
+async def set_tags_exact_for_deal(deal_id: int, tag_names: Iterable[str]) -> bool:
+    """
+    Устанавливает РОВНО переданный список тегов (без merge).
+    Безопасно работает в offline: возвращает True.
+    """
+    cfg = getattr(state, "config", {}) or {}
+    names = _dedup_tags([_normalize_tag_name(t) for t in (tag_names or [])])
+    if not cfg.get("domain"):
+        logger.debug("[Amo] offline set_tags_exact_for_deal id=%s tags=%s", deal_id, names)
+        return True
+    payload = {"_embedded": {"tags": [{"name": t} for t in names]}}
+    return await _patch_deal(int(deal_id), payload)
+
+async def remove_user_confirmation_tags_from_deal(
+    deal_id: int,
+    *,
+    uid: int | None = None,
+    short_base: str | None = None,
+) -> list[str]:
+    """
+    Удаляет подтверждающие теги конкретного пользователя из сделки и возвращает остаток (список имён).
+    Поиск тегов идёт по базовой форме «Имя Ф.» с поддержкой исторических вариантов.
+
+    Args:
+        deal_id: ID сделки в AmoCRM
+        uid:     user_id (если известен) — для получения «Имя Ф.»
+        short_base: «Имя Ф.» (если уже есть; приоритетнее uid)
+
+    Returns:
+        Список оставшихся тегов (после удаления); в offline — пустой или исходный.
+
+    Не меняет статус сделки. Для возврата в «Бронь» см. revert_to_bron_after_swap().
+    """
+    # 1) базовая форма «Имя Ф.»
+    base = (short_base or "").strip()
+    if not base and uid:
+        base = await _get_short_base_from_uid(int(uid))
+    if not base:
+        logger.warning("[Amo] remove_user_confirmation_tags: base name unresolved (uid=%s)", uid)
+
+    # 2) актуальные теги сделки
+    current = await _get_current_tags_for_deal(int(deal_id))
+    if not current:
+        return []
+
+    # 3) фильтрация
+    kill = _build_expected_user_tags(base) if base else set()
+    remaining = [t for t in current if _normalize_tag_name(t) not in kill]
+
+    # 4) PATCH (ровно оставшийся список)
+    ok = await set_tags_exact_for_deal(int(deal_id), remaining)
+    if not ok:
+        logger.warning("[Amo] remove_user_confirmation_tags: patch failed for deal=%s", deal_id)
+    else:
+        logger.info("[Amo] tags updated for deal=%s; removed=%s; left=%s", deal_id, sorted(list(kill)), remaining)
+    return remaining
+
+async def revert_to_bron_after_swap(
+    deal_id: int,
+    *,
+    uid: int | None = None,
+    short_base: str | None = None,
+) -> bool:
+    """
+    Комплексная обёртка для сценария «Замена»:
+      1) pre-flight обязательных полей (photographer и пр.);
+      2) удаление подтверждающих тегов пользователя (если удалось определить);
+      3) перевод сделки в «Бронь».
+
+    Возвращает True при успешном PATCH статуса (в offline — True).
+    """
+    # 1) pre-flight
+    try:
+        await preflight_before_status_change(int(deal_id))
+    except Exception as e:
+        logger.warning("[Amo] revert_to_bron preflight raised for deal=%s: %s", deal_id, e)
+
+    # 2) удалить теги подтверждения (мягко; ошибки не блокируют шаг 3)
+    with contextlib.suppress(Exception):
+        await remove_user_confirmation_tags_from_deal(int(deal_id), uid=uid, short_base=short_base)
+
+    # 3) перевод в «Бронь»
+    if not BRON_STATUS_ID:
+        logger.error("[Amo] BRON_STATUS_ID is not configured; cannot revert deal=%s", deal_id)
+        return False
+    return await update_deal_status(int(deal_id), BRON_STATUS_ID)
+
+async def get_deal_brief_strings(deal_id: int) -> tuple[str, str, str, str]:
+    """
+    Возвращает краткие строки по нормализованной сделке:
+      (date_dd.mm.yyyy, time_HH:MM, package, players_or_count)
+    """
+    d = await get_deal_by_id(int(deal_id)) or {}
+    # дата
+    dt = d.get("event_datetime")
+    date_s = dt.strftime("%d.%m.%Y") if isinstance(dt, datetime) else str(d.get("event_date") or "—")
+    # время — приоритетно custom поле event_time
+    time_s = str(d.get("event_time") or "—")
+    # пакет
+    pkg = str(d.get("package") or "—")
+    # игроки (если нет строки — используем count)
+    players = str(d.get("players") or "").strip()
+    if not players:
+        cnt = d.get("players_count")
+        players = f"{cnt}" if isinstance(cnt, int) and cnt > 0 else "—"
+    return (date_s, time_s, pkg, players)
+__all__ = [
+    "get_amocrm_deals",
+    "get_deal_by_id",
+    "update_amocrm_tags",
+    "update_deal_status",
+    "get_pipeline_stages",
+    "get_custom_fields",
+    # NEW:
+    "set_tags_exact_for_deal",
+    "remove_user_confirmation_tags_from_deal",
+    "revert_to_bron_after_swap",
+    "get_deal_brief_strings",
+]
 
 # ════════════════════════════════════════════════════════════════════
 # [6] SELF-TEST
