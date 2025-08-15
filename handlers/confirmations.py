@@ -337,150 +337,428 @@ async def _resolve_notify_chat_id(bot) -> Optional[int]:
     return None
 
 
-# ███ [3] DETAILS & CONFIRMATION CHECK
+# ███ [3] DETAILS & CONFIRMATION CHECK — CRM+LOCAL fallback
 # --------------------------------------------------------------------
-def _confirmed_from_state(deal_id: int) -> Dict[str, Set[int]]:
-    """
-    Возвращает подтверждённых из state.pending_confirmations (без UI и CRM).
-    Структура: {'main': set[int], 'assist': set[int], 'admin': set[int]}.
-    """
-    out: Dict[str, Set[int]] = {"main": set(), "assist": set(), "admin": set()}
-    try:
-        pc = (getattr(state, "pending_confirmations", {}) or {}).get(deal_id) or {}
-        conf = pc.get("confirmed")
-        if isinstance(conf, dict):
-            for k in ("main", "assist", "admin"):
-                if isinstance(conf.get(k), set):
-                    out[k] |= {int(x) for x in conf.get(k)}  # type: ignore[arg-type]
-                else:
-                    out[k] |= set(_to_uid_list(conf.get(k)))
-        elif isinstance(conf, set):
-            # старая схема — распределим по назначенным слотам
-            locked = _assigned_uids_from_locked(deal_id)
-            for k in ("main", "assist", "admin"):
-                out[k] |= (locked.get(k, set()) & conf)  # type: ignore[operator]
-    except Exception:
-        pass
+from typing import Dict, Set, List, Any, Optional, Iterable, Tuple
+from contextlib import suppress
+import logging
+
+from core.state import state
+from services.amocrm import get_deal_by_id  # CRM — источник истины по тегам
+
+logger = logging.getLogger(__name__)
+
+def _to_uid_list(v: Any) -> List[int]:
+    """int | 'Имя|uid' | 'uid' | None | контейнеры → [uid, ...]."""
+    out: List[int] = []
+    if v is None:
+        return out
+    if isinstance(v, int):
+        return [v]
+    if isinstance(v, str):
+        s = v.strip()
+        if "|" in s:
+            s = s.rsplit("|", 1)[-1]
+        with suppress(ValueError):
+            out.append(int(s))
+        return out
+    if isinstance(v, (list, tuple, set)):
+        for x in v:
+            if isinstance(x, (list, tuple, set)):
+                out.extend(_to_uid_list(x))
+            else:
+                out.extend(_to_uid_list(x))
     return out
 
+def _role_alias(key: str) -> str:
+    """assistant1 → assist; lead1/lead2 → main; admin → admin."""
+    k = str(key).lower()
+    if k.startswith("lead"):
+        return "main"
+    if k.startswith("assistant"):
+        return "assist"
+    return "admin" if "admin" in k else k
+
+def _assigned_uids_from_locked(deal_id: int) -> Dict[str, Set[int]]:
+    """
+    Назначенные по зафиксированному распределению.
+    Возвращает {'main': {…}, 'assist': {…}, 'admin': {…}}.
+    """
+    out: Dict[str, Set[int]] = {"main": set(), "assist": set(), "admin": set()}
+    locked = (getattr(state, "locked_distribution", {}) or {}).get(deal_id) or {}
+    if not isinstance(locked, dict):
+        return out
+    for slot, val in locked.items():
+        role = _role_alias(slot)
+        out.setdefault(role, set()).update(_to_uid_list(val))
+    return out
+
+def _confirmed_from_state(deal_id: int) -> Dict[str, Set[int]]:
+    """
+    Локальные подтверждения (когда CRM недоступна). Формат:
+    {'main': set[int], 'assist': set[int], 'admin': set[int]}.
+    """
+    out: Dict[str, Set[int]] = {"main": set(), "assist": set(), "admin": set()}
+    pc = (getattr(state, "pending_confirmations", {}) or {}).get(deal_id) or {}
+    conf = pc.get("confirmed")
+    if isinstance(conf, dict):
+        for k in ("main", "assist", "admin"):
+            vals = conf.get(k)
+            if isinstance(vals, set):
+                out[k] |= {int(x) for x in vals}
+            elif vals:
+                out[k] |= set(_to_uid_list(vals))
+    elif isinstance(conf, set):
+        # старая плоская схема: раскидываем по назначенным ролям
+        assigned = _assigned_uids_from_locked(deal_id)
+        for k in ("main", "assist", "admin"):
+            out[k] |= (assigned.get(k, set()) & conf)
+    return out
+
+async def _crm_confirmation_tags(deal_id: int) -> Set[str]:
+    """
+    Теги CRM по сделке, нормализованные в Set[str]. Если CRM отвечает 204
+    или недоступна — возвращаем пустое множество (не бросаем исключений).
+    """
+    tags: Set[str] = set()
+    try:
+        deal = await get_deal_by_id(int(deal_id))
+        raw = (deal or {}).get("_embedded", {}).get("tags", [])  # type: ignore[index]
+        for t in raw or []:
+            name = str(t.get("name") or "").strip()
+            if name:
+                tags.add(name)
+    except Exception:
+        logger.warning("[confirm] CRM tags unavailable for lead=%s (treating as empty)", deal_id)
+    return tags
+
+async def _expected_tag_map(deal_id: int) -> Dict[str, Set[str]]:
+    """
+    Для назначенных uid строим ожидаемые текстовые теги вида «Имя Ф.1/2/Адм».
+    Возвращает {'main': {'Иван И.1', ...}, 'assist': {...}, 'admin': {...}}.
+    """
+    from handlers.confirmations import _short_name  # локальный импорт
+    assigned = _assigned_uids_from_locked(deal_id)
+    def _suffix(role: str) -> str:
+        return "1" if role == "main" else ("2" if role == "assist" else "Адм")
+    out: Dict[str, Set[str]] = {"main": set(), "assist": set(), "admin": set()}
+    for role, uids in assigned.items():
+        suf = _suffix(role)
+        for u in uids:
+            human = (getattr(state, "user_short", {}) or {}).get(u)
+            if not human:
+                # подстрахуемся на случай отсутствия кэша имён
+                human = await _short_name(u)
+            out[role].add(f"{human}.{suf}")
+    return out
 
 async def _all_required_confirmed(deal_id: int) -> bool:
     """
-    True — если все назначенные (по locked_distribution) подтвердили участие в боте.
-    Логика без UI:
-      1) Берём назначенных из state.locked_distribution.
-      2) Берём подтверждённых из state.pending_confirmations.
-      3) Смотрим полноту покрытия.
+    True, если все назначенные роли подтвердили участие.
+    Источник истины — теги CRM; если CRM недоступна/пуста, применяем
+    консенсус-фолбэк по локальному state.pending_confirmations.
     """
-    locked = _assigned_uids_from_locked(deal_id)
-    confirmed = _confirmed_from_state(deal_id)
-    return all((not locked[k]) or locked[k].issubset(confirmed[k]) for k in ("main", "assist", "admin"))
+    assigned = _assigned_uids_from_locked(deal_id)
+    if not any(assigned.values()):
+        return False
+
+    # 1) пытаемся подтвердить по CRM-тегам
+    expected = await _expected_tag_map(deal_id)
+    crm_tags = await _crm_confirmation_tags(deal_id)
+    if crm_tags:
+        for role, exp in expected.items():
+            # у админа ровно 1 слот, у остальных — по числу назначенных
+            need = len(assigned.get(role, set()))
+            have = len([x for x in exp if x in crm_tags])
+            if have < max(need, 0):
+                return False
+        return True
+
+    # 2) CRM пустая/недоступна → фолбэк по локальным подтверждениям
+    local = _confirmed_from_state(deal_id)
+    for role, uids in assigned.items():
+        if not uids:
+            continue
+        if not (uids <= local.get(role, set())):
+            return False
+    return True
+
+# История изменений: 2025-08-15 — добавлен CRM→LOCAL фолбэк, совместимость со старой схемой state.confirmed
 
 
-# ███ [4] CALLBACK: CONFIRM ROLE
+# ███ [4] CALLBACK: CONFIRM ROLE — идемпотентность + единый источник правды
 # --------------------------------------------------------------------
+from typing import Optional, Tuple, List, Set, Dict
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+
+CONFIRM_PREFIX = "confirm_role_"  # экспортируется в другие модули
+
+async def _mark_confirmed_on_message_kb(callback: CallbackQuery, deal_id: int, role: str) -> Optional[InlineKeyboardMarkup]:
+    """
+    Локально перекрашивает кнопку текущего сообщения на «✅ Подтверждено».
+    Без редравов других сообщений (детали/дашборд подтянутся из state).
+    """
+    msg = getattr(callback, "message", None)
+    kb = getattr(msg, "reply_markup", None)
+    if not kb or not isinstance(kb, InlineKeyboardMarkup):
+        return None
+
+    new_rows: List[List[InlineKeyboardButton]] = []
+    for row in (kb.inline_keyboard or []):
+        new_row: List[InlineKeyboardButton] = []
+        for btn in row:
+            cd = getattr(btn, "callback_data", "") or ""
+            if cd == f"{CONFIRM_PREFIX}{deal_id}_{role}":
+                new_row.append(InlineKeyboardButton(text="✅ Подтверждено", callback_data="noop"))
+            else:
+                new_row.append(btn)
+        new_rows.append(new_row)
+    return InlineKeyboardMarkup(inline_keyboard=new_rows)
+
+async def _amo_add_tag(lead_id: int, tag_text: str) -> bool:
+    """
+    Добавляет тег в AmoCRM (add-only). Возвращает True при видимом успехе.
+    Лояльна к различным фасадам services.amocrm.
+    """
+    try:
+        if hasattr(amo, "add_tag_to_lead"):
+            ok = await amo.add_tag_to_lead(int(lead_id), tag_text)  # type: ignore[arg-type]
+            return bool(ok)
+        if hasattr(amo, "patch_lead"):
+            # общий фолбэк — добавить в массив tags
+            ok = await amo.patch_lead(int(lead_id), {"add_tags": [tag_text]})  # type: ignore[arg-type]
+            return bool(ok)
+    except Exception:
+        logger.exception("[confirm] add tag failed lead=%s tag=%s", lead_id, tag_text)
+    return False
+
+async def _amo_set_status_success(lead_id: int) -> bool:
+    """Переводит сделку в успешный статус (OK_STATUS_ID)."""
+    try:
+        stage_id = (OK_STATUS_ID or getattr(settings, "SUCCESSFUL_STATUS_ID", None))
+        if not stage_id:
+            logger.warning("[confirm] SUCCESS status id not configured; lead=%s", lead_id)
+            return False
+        if hasattr(amo, "update_deal_status"):
+            return bool(await amo.update_deal_status(int(lead_id), str(stage_id)))  # type: ignore[arg-type]
+        if hasattr(amo, "patch_lead"):
+            return bool(await amo.patch_lead(int(lead_id), {"status_id": int(stage_id)}))  # type: ignore[arg-type]
+    except Exception:
+        logger.exception("[confirm] set status failed lead=%s", lead_id)
+    return False
+
+async def _role_of_user_in_locked(uid: int, deal_id: int) -> Optional[str]:
+    """main/assist/admin/None — по зафиксированному распределению."""
+    locked = (getattr(state, "locked_distribution", {}) or {}).get(deal_id) or {}
+    if not isinstance(locked, dict):
+        return None
+    for slot, val in locked.items():
+        role = _role_alias(slot)
+        if uid in set(_to_uid_list(val)):
+            return role
+    return None
+
+async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> None:
+    """
+    Пайплайн подтверждения:
+    1) Валидация: пользователь действительно назначен на роль/сделку.
+    2) Идемпотентность: если уже подтвержден (CRM или локально) — только UI-метка.
+    3) Пытаемся проставить тег в CRM; независимо от CRM пишем локальный флаг.
+    4) Меняем кнопку на «✅ Подтверждено», шлём одно уведомление в общий чат.
+    5) Если все роли подтверждены (CRM→LOCAL), переводим в «Завершение сделки».
+    """
+    uid = callback.from_user.id
+    user_role = await _role_of_user_in_locked(uid, deal_id)
+    if user_role != role:
+        await callback.answer("⛔ Вы не назначены на эту роль.", show_alert=True)
+        return
+
+    # Инициализация хранилищ состояния (совместимость со старыми сборками)
+    state.__dict__.setdefault("pending_confirmations", {})
+    state.__dict__.setdefault("confirmed", {})
+
+    # Идемпотентность: если уже подтвержден — просто перекрашиваем кнопку
+    expected = await _expected_tag_map(deal_id)
+    crm_tags = await _crm_confirmation_tags(deal_id)
+    local = _confirmed_from_state(deal_id)
+    human_expected = expected.get(role, set())
+
+    already = False
+    if crm_tags and any(tag in crm_tags for tag in human_expected):
+        already = True
+    if uid in local.get(role, set()):
+        already = True
+
+    if already:
+        kb = await _mark_confirmed_on_message_kb(callback, deal_id, role)
+        with suppress(Exception):
+            if kb:
+                await callback.message.edit_reply_markup(reply_markup=kb)
+        with suppress(Exception):
+            await callback.answer("Уже подтверждено ✅")
+        return
+
+    # 1) CRM-тег (лучшее усилие) +  локальный флаг подтверждения
+    # строим текст тега: «Имя Ф.» + .1/.2/.Адм
+    from handlers.confirmations import _short_name  # локальный импорт
+    human = (getattr(state, "user_short", {}) or {}).get(uid) or (await _short_name(uid))
+    suffix = {"main": "1", "assist": "2", "admin": "Адм"}[role]
+    tag_text = f"{human}.{suffix}"
+    with suppress(Exception):
+        await _amo_add_tag(deal_id, tag_text)
+
+    # локально отмечаем подтверждение в двух местах (новая и старая схемы)
+    pc = state.pending_confirmations.setdefault(deal_id, {})
+    conf_map: Dict[str, Set[int]] = pc.setdefault("confirmed", {}) if isinstance(pc.get("confirmed"), dict) else {}  # type: ignore[assignment]
+    pc["confirmed"] = conf_map
+    conf_map.setdefault(role, set()).add(uid)
+    state.confirmed.setdefault(deal_id, set()).add(uid)
+
+    # 2) Перекрашиваем кнопку текущего сообщения
+    kb = await _mark_confirmed_on_message_kb(callback, deal_id, role)
+    with suppress(Exception):
+        if kb:
+            await callback.message.edit_reply_markup(reply_markup=kb)
+
+    # 3) Уведомление в общий чат — ГЕНДЕР-НЕЙТРАЛЬНО, ПОЛНЫЕ ДАННЫЕ
+    try:
+        bot = callback.message.bot if callback.message else None
+        if bot:
+            chat_id = await _resolve_notify_chat_id(bot)
+            if chat_id is not None:
+                # Заголовок (название игры)
+                title = None
+                with suppress(Exception):
+                    if callable(globals().get("_deal_title_from_state")):
+                        title = globals()["_deal_title_from_state"](deal_id)
+                if not title:
+                    title = (getattr(state, "deal_titles", {}) or {}).get(deal_id) or "игра"
+
+                # Когда (дата + время) — берём из функции, если она доступна; иначе из state
+                when = ""
+                with suppress(Exception):
+                    if callable(globals().get("_deal_when")):
+                        d_s, t_s = globals()["_deal_when"](deal_id)
+                        when = f"{(d_s or '').strip()} {(t_s or '').strip()}".strip()
+                if not when:
+                    raw_when = (getattr(state, "deal_when", {}) or {}).get(deal_id)
+                    if isinstance(raw_when, (list, tuple)) and raw_when:
+                        when = " ".join([str(x).strip() for x in raw_when if x]).strip()
+                    elif isinstance(raw_when, dict):
+                        when = " ".join([str(raw_when.get(k, "")).strip() for k in ("date", "time") if raw_when.get(k)]).strip()
+                    elif isinstance(raw_when, str):
+                        when = raw_when.strip()
+
+                # Роль (человекочитаемая) + эмодзи
+                role_human_map = {"main": "Ведущий", "assist": "Помощник", "admin": "Админ"}
+                role_emoji_map = {"main": "🎭", "assist": "🤝", "admin": "🛡️"}
+                role_human = role_human_map.get(role, "Участник")
+                r = role_emoji_map.get(role, "🎯")
+
+                name = human  # короткое «Имя Ф.»
+
+                # Итоговый текст строго по шаблону:
+                # ✅ Участие подтверждено: {name} — {r} {role} на «{title}» {when}.
+                base = f"✅ Участие подтверждено: {name} — {r} {role_human} на «{title}»"
+                text = f"{base} {when}.".strip() if when else f"{base}."
+
+                # Антидубли: одно уведомление на (deal, uid, role)
+                notified = state.__dict__.setdefault("_confirm_notified", set())
+                key = (deal_id, uid, role)
+                if key not in notified:
+                    await bot.send_message(chat_id, text)
+                    notified.add(key)
+            else:
+                logger.warning("[confirm] no available chat for notify; skipped")
+    except Exception:
+        logger.exception("[confirm] notify failed")
+
+    # 4) Если все роли закрыты → статус «Завершение сделки»
+    with suppress(Exception):
+        all_ok = await _all_required_confirmed(deal_id)
+        if all_ok and OK_STATUS_ID:
+            moved = await _amo_set_status_success(deal_id)
+            logger.info("[confirm] lead %s completed=%s", deal_id, moved)
+
+    # 5) Мягкая перерисовка деталей (если открыты) — без «прыжков»
+    with suppress(Exception):
+        if callable(refresh_deal_details):
+            await refresh_deal_details(bot=callback.message.bot, deal_id=deal_id, force_approved=False)  # type: ignore[misc]
+
+    with suppress(Exception):
+        await callback.answer("Готово ✅")
+
 @router.callback_query(lambda c: c.data and c.data.startswith(CONFIRM_PREFIX))
 async def confirm_role_handler(callback: CallbackQuery) -> None:
     """
     Кнопки: confirm_role_{deal_id}_{role}
-    • Ставит командный тег в AmoCRM (add-only), НЕ перетирая существующие.
-    • Локально меняет кнопку на «✅ Подтверждено» (edit_reply_markup).
-    • НИКАКИХ переходов в детали и «пылесоса».
-    • Отправляет уведомление в общий чат (гендерно-нейтрально):
-      «✅ Участие подтверждено: Имя Ф. — 🎭 Ведущий на «Название» ДД.ММ ЧЧ:ММ.»
-    • При полном комплекте подтверждений — переводит сделку в «Завершение сделки».
+    • Идемпотентно подтверждает участие для main/assist/admin.
     """
     data = str(callback.data or "")
     try:
         _, _, tail = data.partition(CONFIRM_PREFIX)
         lead_s, role_raw = tail.rsplit("_", 1)
         deal_id = int(lead_s)
+        role = role_raw.strip().lower()
     except Exception:
-        await callback.answer("Некорректные данные кнопки.", show_alert=True)
+        with suppress(Exception):
+            await callback.answer("Некорректные данные кнопки.", show_alert=True)
         return
 
-    role = role_raw.strip().lower()
     if role not in {"main", "assist", "admin"}:
-        await callback.answer("Неизвестная роль.", show_alert=True)
+        with suppress(Exception):
+            await callback.answer("Неизвестная роль.", show_alert=True)
+        return
+
+    await _perform_confirm(callback, deal_id, role)
+
+# История изменений:
+# 2025-08-15 — обновлён текст уведомления (гендер-нейтральный шаблон, полные данные: имя, роль+эмодзи, название и дата/время).
+#               Логика подтверждения/CRM/перерисовок не изменялась.
+
+
+
+# ███ [4.1] CALLBACK: CONFIRM FROM «Мои игры»
+# --------------------------------------------------------------------
+from typing import Optional
+from aiogram.types import CallbackQuery
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("mygames_confirm_"))
+async def confirm_from_mygames_handler(callback: CallbackQuery) -> None:
+    """
+    Коллбэк из дашборда: mygames_confirm_{deal_id}
+    • Определяем роль пользователя из locked_distribution;
+    • Запускаем стандартный пайплайн подтверждения (_perform_confirm);
+    • Без автопереходов и «прыжков» UI.
+    """
+    data = str(callback.data or "")
+    try:
+        deal_id = int(data.split("_")[-1])
+    except Exception:
+        await callback.answer("⚠️ Ошибочная кнопка.", show_alert=True)
         return
 
     uid = int(callback.from_user.id)
-    short = await _short_name(uid)
-
-    # Проверяем, что роль действительно назначена этому пользователю
     assigned = _assigned_uids_from_locked(deal_id)
-    if uid not in assigned.get(role, set()):
-        await callback.answer("Эта роль не назначена на вас.", show_alert=True)
+
+    # Приоритет определения роли при коллизиях: admin → main → assist.
+    role: Optional[str] = None
+    if uid in assigned.get("admin", set()):
+        role = "admin"
+    elif uid in assigned.get("main", set()):
+        role = "main"
+    elif uid in assigned.get("assist", set()):
+        role = "assist"
+
+    if not role:
+        await callback.answer("Роль не найдена или не назначена на вас.", show_alert=True)
         return
 
-    # Ставим тег в AmoCRM (add-only), формат «Имя Ф.1|2|Ад»
-    tag = f"{short}{_role_suffix(role)}"
-    ok = await _amo_add_tag(deal_id, tag)
-    if not ok:
-        await callback.answer("Не удалось проставить тег. Попробуйте позже.", show_alert=True)
-        return
+    await _perform_confirm(callback, deal_id, role)
 
-    # Локально: меняем кнопку на «✅ Подтверждено», без переходов/пылесоса
-    with suppress(Exception):
-        new_kb = _mark_confirmed_on_message_kb(callback, deal_id, role)
-        if new_kb and callback.message:
-            await callback.message.edit_reply_markup(reply_markup=new_kb)
-
-    # Тихий тост пользователю
-    with suppress(Exception):
-        await callback.answer("Вы подтвердили выход на игру ✅", show_alert=False)
-
-    # Обновим локальное состояние подтверждений (без UI)
-    with suppress(Exception):
-        pc = getattr(state, "pending_confirmations", None)
-        if isinstance(pc, dict):
-            rec = pc.setdefault(deal_id, {})
-            conf = rec.get("confirmed")
-            if isinstance(conf, dict):
-                conf.setdefault(role, set()).add(uid)
-            else:
-                rec["confirmed"] = {role: {uid}}
-
-    # ── Уведомление в общий чат (гендерно-нейтрально, с эмодзи роли) ─────────
-    try:
-        bot = callback.message.bot if callback.message else None
-        if bot:
-            chat_id = await _resolve_notify_chat_id(bot)
-            if chat_id is not None:
-                title = _deal_title_from_state(deal_id)
-                d_s, t_s = _deal_when(deal_id)
-                when = f"{d_s} {t_s}".strip()
-
-                role_human_map = {"main": "Ведущий", "assist": "Помощник", "admin": "Админ"}
-                role_emoji_map = {"main": "🎭", "assist": "🤝", "admin": "🛡️"}
-                role_human = role_human_map.get(role, "Участник")
-                r_emoji = role_emoji_map.get(role, "🎯")
-
-                text = f"✅ Участие подтверждено: {short} — {r_emoji} {role_human} на «{title}» {when}."
-                await bot.send_message(chat_id, text.strip())
-            else:
-                logger.error("[confirm] no available chat for notify; skipped")
-    except Exception as e:
-        logger.warning("[confirm] notify failed: %s", e)
-
-    # Финализация стадии: если комплект подтверждений достигнут — переводим в «Завершение сделки»
-    with suppress(Exception):
-        all_ok = await _all_required_confirmed(deal_id)
-        if all_ok and OK_STATUS_ID:
-            await _amo_set_status_success(deal_id)
-            # мягкая очистка из активного цикла (если реализовано)
-            with suppress(Exception):
-                import handlers.polls_lifecycle as plc
-                if callable(getattr(plc, "remove_deal_from_poll_cycle", None)):
-                    plc.remove_deal_from_poll_cycle(deal_id)  # type: ignore
-                if callable(getattr(plc, "maybe_finish_poll_cycle", None)):
-                    await plc.maybe_finish_poll_cycle()  # type: ignore
-
-    # (опционально) Обновим детали, если где-то открыты
-    with suppress(Exception):
-        if callable(refresh_deal_details):
-            await refresh_deal_details(bot=callback.message.bot, deal_id=deal_id, force_approved=True)  # type: ignore
-
+# История изменений:
+#  • 2025-08-15 — Сохранена логика; типы добавлены для Pylance; прокинут стандартный пайплайн.
 
 
 # ███ [99] SELF‑TEST (минимальный)

@@ -16,7 +16,6 @@
   – новый стиль: refresh_deal_details(bot=Bot, deal_id=int, force_approved:bool=False, uid:Optional[int]=None)
   – старый стиль: refresh_deal_details(uid:int, deal_id:int)
 """
-
 # ███ [0] IMPORTS & SETUP
 # --------------------------------------------------------------------
 from __future__ import annotations
@@ -24,6 +23,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import contextlib  # ← добавлено для suppress(...) в [2]
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -50,7 +50,9 @@ _ADMIN_PKGS = {"стандарт", "стандарт+", "премиум", "vip",
 _local_status_cache: Dict[str, Tuple[str, float]] = {}
 STATUS_CACHE_TTL = 60 * 60 * 4  # 4 часа
 
-# История изменений: пересобран импорт, единая точка пылесоса, локальный статус-кэш (2025-08-13)
+# История изменений:
+# • 2025-08-13 — пересобран импорт, единая точка пылесоса, локальный статус-кэш.
+# • 2025-08-15 — добавлен import contextlib для suppress() в блоке [2].
 
 
 # ███ [1] HELPERS (normalize, role cfg, svetofor cache, tags/ids, invariants)
@@ -229,18 +231,115 @@ async def _normalize_tag_texts(dist: Dict[str, str], need_main: int, need_assist
 
 # История изменений: добавлены _need_admin_by_package, жёсткая инварианта и нормализация текстов тегов (2025-08-13)
 
+# ███ [1.5] UTILS: enforce_single_role (совместимо с polls_distribution)
+# --------------------------------------------------------------------
+from typing import Any, Dict, List, Optional, Set
+
+def _enforce_single_role(data: Dict[str, Any], *, need_main: Optional[int] = None, need_assist: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Универсальная защита «1 uid → 1 роль» с приоритетом: main > assist > admin > trainee.
+
+    Принимает два типа структур:
+    1) РОЛЕВАЯ:
+       {"main":[int], "assist":[int], "admin":[int]} → вернёт НОВЫЙ dict без дублей.
+    2) СЛОТОВАЯ (distribution_cache/poll_details):
+       {"lead1":"Имя.1|uid", "assistant1":"Имя.2|uid", "admin":"Имя.Адм|uid", ...}
+       → чистит ДУБЛИ НА МЕСТЕ и подрезает лишние слоты за пределами need_main/need_assist.
+         Возвращает исходный dict (для удобства чейнинга).
+
+    Параметры need_main/need_assist нужны только для слотовой схемы.
+    Если не заданы — определяются по максимальному индексу lead*/assistant* в data.
+    """
+    # Ветка 1: ролевая структура
+    if any(k in data for k in ("main", "assist", "admin")) and not any(
+        k for k in data.keys() if isinstance(k, str) and (k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"})
+    ):
+        roles_in = {
+            "main":  [int(u) for u in (data.get("main")   or []) if isinstance(u, int)],
+            "assist":[int(u) for u in (data.get("assist") or []) if isinstance(u, int)],
+            "admin": [int(u) for u in (data.get("admin")  or []) if isinstance(u, int)],
+        }
+        seen: Set[int] = set()
+        out: Dict[str, List[int]] = {"main": [], "assist": [], "admin": []}
+        for u in roles_in["main"]:
+            if u not in seen:
+                out["main"].append(u); seen.add(u)
+        for u in roles_in["assist"]:
+            if u not in seen:
+                out["assist"].append(u); seen.add(u)
+        for u in roles_in["admin"]:
+            if u not in seen:
+                out["admin"].append(u); seen.add(u)
+        return out  # новый объект
+
+    # Ветка 2: слотовая структура
+    dist: Dict[str, Any] = data
+
+    # Определяем потребности, если не заданы
+    if need_main is None:
+        max_lead = 0
+        for k in dist.keys():
+            if isinstance(k, str) and k.startswith("lead"):
+                with contextlib.suppress(Exception):
+                    max_lead = max(max_lead, int("".join(ch for ch in k if ch.isdigit()) or "0"))
+        need_main = max(1, max_lead)
+    if need_assist is None:
+        max_asst = 0
+        for k in dist.keys():
+            if isinstance(k, str) and k.startswith("assistant"):
+                with contextlib.suppress(Exception):
+                    max_asst = max(max_asst, int("".join(ch for ch in k if ch.isdigit()) or "0"))
+        need_assist = max(0, max_asst)
+
+    leads = [f"lead{i}" for i in range(1, max(1, int(need_main)) + 1)]
+    assis = [f"assistant{i}" for i in range(1, max(0, int(need_assist)) + 1)]
+    priority_keys: List[str] = [*leads, *assis, "admin", "trainee"]
+
+    seen_uids: Set[int] = set()
+    # проход по приоритету: первое вхождение uid остаётся, последующие вычищаем
+    for key in priority_keys:
+        val = dist.get(key)
+        uid = _tag_uid(val) if isinstance(val, str) else None
+        if uid is None:
+            continue
+        if uid in seen_uids:
+            dist.pop(key, None)
+        else:
+            seen_uids.add(uid)
+
+    # подрезаем мусорные ключи вне диапазонов
+    for key in list(dist.keys()):
+        if isinstance(key, str) and key.startswith("lead"):
+            with contextlib.suppress(Exception):
+                idx = int("".join(ch for ch in key if ch.isdigit()) or "0")
+                if idx < 1 or idx > int(need_main):
+                    dist.pop(key, None)
+        elif isinstance(key, str) and key.startswith("assistant"):
+            with contextlib.suppress(Exception):
+                idx = int("".join(ch for ch in key if ch.isdigit()) or "0")
+                if idx < 1 or idx > int(need_assist):
+                    dist.pop(key, None)
+
+    return dist  # тот же объект (in-place), для удобства использования
+
 # ███ [2] CORE RENDER — общий рендер карточки (используется show/refresh)
 # --------------------------------------------------------------------
-async def _render_detail(uid: int, deal_id: int, bot: Bot) -> None:
+async def _render_detail(uid: int, deal_id: int, bot: Bot, *, force_approved: bool = False) -> None:
     """
     Рисует карточку игры user→deal_id:
       • автоподбор в пустые слоты с учётом «Светофора»;
       • инварианта «1 uid → 1 роль»;
       • стажёр (красный);
       • кнопки «Утвердить/Стоп/Назад».
+    Аргумент force_approved зарезервирован для совместимости разметки.
     """
     # Пылесос: в деталях оставляем только текущий блок
-    await delete_previous_private_messages(uid)
+    try:
+        await delete_previous_private_messages(bot, uid, keep=[])
+    except TypeError:
+        # совместимость со старой сигнатурой
+        with contextlib.suppress(Exception):
+            await delete_previous_private_messages(uid)  # type: ignore
 
     # Поиск сделки в текущем опросе
     deal = next((d for d in (state.current_poll_deals or []) if int(d.get("id") or 0) == deal_id), None)
@@ -249,9 +348,11 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot) -> None:
         return
 
     g_name = str(deal.get("game_name") or deal.get("name") or "Игра")
+    # дата/время
     date_s = deal.get("event_datetime")
     date_s = date_s.strftime("%d.%m.%Y") if hasattr(date_s, "strftime") else str(deal.get("event_date") or "—")
     time_s = str(deal.get("event_time") or "—")
+    # пакет/игроки
     pkg_raw = str(deal.get("package") or "—").strip()
     pkg_icon = {"компакт": "🎒", "стандарт": "📦", "стандарт+": "📦➕", "премиум": "💎", "vip": "👑", "вип": "👑"}.get(_clean(pkg_raw), "🎁")
     players = truncate(str(deal.get("players") or deal.get("players_count") or "—"), 40)
@@ -280,16 +381,15 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot) -> None:
         for adm in (pdata.get("admin_available", []) or []):
             respondents[int(adm["user_id"])] = {**respondents.get(int(adm["user_id"]), {}), **adm}
 
-    # Текущее распределение
+    # Текущее распределение из кэша
     dist: Dict[str, str] = getattr(state, "distribution_cache", {}).setdefault(str(deal_id), {})
     await _ensure_single_role(dist, need_main, need_assist)
-    await _normalize_tag_texts(dist, need_main, need_assist)  # ← нормализация текста тегов
+    await _normalize_tag_texts(dist, need_main, need_assist)  # нормализация текста тегов
 
     chosen_global: Set[int] = set()  # занятые в любой роли (включая стажёра)
 
     async def _fits(user_id: int, role: str) -> bool:
         if role == "admin":
-            # допускаем любого, пометив фильтр на стороне откликов (is_admin_eligible)
             return bool(respondents.get(user_id, {}).get("is_admin_eligible"))
         st = await _status_cached(user_id, g_name)
         if role == "main":
@@ -320,12 +420,12 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot) -> None:
             out: List[Tuple[int, str]] = []
             if role == "admin":
                 uid0 = _tag_uid(dist.get("admin"))
-                if uid0 and uid0 in respondents:
+                if uid0 and (not respondents or uid0 in respondents):
                     out.append((uid0, "🛡️"))
             else:
                 for i in range(1, need + 1):
                     uid0 = _tag_uid(dist.get(f"{prefix}{i}"))
-                    if uid0 and uid0 in respondents:
+                    if uid0 and (not respondents or uid0 in respondents):
                         out.append((uid0, ""))
             return out
 
@@ -389,15 +489,20 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot) -> None:
 
         # Вывод блока роли
         ready = len(chosen) >= need
-        def _nm(u: int) -> str:
-            return state.user_short.get(u) if hasattr(state, "user_short") and state.user_short.get(u) else None  # type: ignore
+
+        def _nm(u: int) -> Optional[str]:
+            try:
+                return getattr(state, "user_short", {}).get(u)
+            except Exception:
+                return None
+
         lines = [
-            f"───── {icon} *{title.upper()}* ─────",
+            f"─────{icon} *{title.upper()}* ────",
             f"{'✅' if ready else '❌'} {min(len(chosen), need)}/{need}",
         ]
         for u, mark in chosen[:max(need, 0)]:
-            human = _nm(u)
-            lines.append(f"– {(human or (await _short_name(u)))} {mark}")
+            human = _nm(u) or (await _short_name(u))
+            lines.append(f"– {human} {mark}")
 
         msgs.append(await bot.send_message(uid, "\n".join(lines), parse_mode="Markdown"))
 
@@ -412,9 +517,9 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot) -> None:
                 else:
                     st = await _status_cached(u, g_name)
                     mark = "🟢" if (role == "main") else ("🟢" if st == "green" else "🟡")
-                human = state.user_short.get(u) if hasattr(state, "user_short") and state.user_short.get(u) else None  # type: ignore
+                human = (getattr(state, "user_short", {}) or {}).get(u) or (await _short_name(u))
                 kb.button(
-                    text=f"{(human or (await _short_name(u)))} {mark}",
+                    text=f"{human} {mark}",
                     callback_data=f"swap_{deal_id}_{role}_{u}",
                 )
             kb.adjust(1)
@@ -452,7 +557,7 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot) -> None:
         if trainee_uid not in red_pool:
             trainee_uid = red_pool[0]
             dist["trainee"] = await _fmt(trainee_uid, "trainee")
-        human = state.user_short.get(trainee_uid) if hasattr(state, "user_short") and state.user_short.get(trainee_uid) else (await _short_name(trainee_uid))  # type: ignore
+        human = (getattr(state, "user_short", {}) or {}).get(trainee_uid) or (await _short_name(trainee_uid))  # type: ignore
         block = [
             "───── 👷 *СТАЖЁР* ─────",
             f"– {human} 🔴",
@@ -467,7 +572,7 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot) -> None:
     is_force_closed = deal_id in (getattr(state, "deal_force_closed", set()) or set())
     if (getattr(state, "current_poll_leader", None) == uid) and not is_force_closed:
         kb_mgr = InlineKeyboardBuilder()
-        if is_locked:
+        if is_locked or force_approved:
             kb_mgr.button(text="✅ Утверждено", callback_data="noop")
         else:
             kb_mgr.button(text="✅ Утвердить игру", callback_data=f"poll_approve_{deal_id}")
@@ -482,22 +587,31 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot) -> None:
     msgs.append(await bot.send_message(uid, "\u2060", reply_markup=kb_back))
 
     # Активный блок деталей — для пылесоса
-    state.detail_blocks[(uid, deal_id)] = msgs
+    getattr(state, "detail_blocks", {}).setdefault((uid, deal_id), msgs)
+# История изменений:
+# • 2025-08-15 — добавлен параметр force_approved; выровнены пылесос/фолбэки; нормализация тегов до/после автодобора;
+#                аккуратная работа с отсутствующими респондентами; совместимость уведомлений и кнопок.
 
 
-# ███ [3] HANDLERS — show / refresh / approve-delegate / stop / swap / back
+
+# ███ [3] HANDLERS — show / refresh / swap / back
 # ─────────────────────────────────────────────────────────────────────
 from contextlib import suppress
 from typing import Optional, Any, Dict, List, Tuple
+import handlers.polls_lifecycle as plc  # для _check_ready_state/_sync_leader_report/_refresh_detail_views
 
 @router.callback_query(lambda c: c.data and c.data.startswith("show_deal_"))
 async def show_deal_callback_handler(callback: types.CallbackQuery) -> None:
-    # (без изменений)
-    did = int(str(callback.data).rsplit("_", 1)[-1])
-    await _render_detail(uid=callback.from_user.id, deal_id=did, bot=callback.message.bot)
+    """Открыть detail-view конкретной игры из отчёта."""
+    try:
+        did = int(str(callback.data).rsplit("_", 1)[-1])
+    except Exception:
+        with suppress(Exception):
+            await callback.answer("⚠️ Неверный формат кнопки.", show_alert=True)
+        return
+    await _render_detail(uid=callback.from_user.id, deal_id=did, bot=callback.message.bot, force_approved=False)
     with suppress(Exception):
         await callback.answer()
-
 
 async def refresh_deal_details(
     bot: Optional[Bot] = None,
@@ -511,28 +625,21 @@ async def refresh_deal_details(
     """
     Перерисовка detail-view для конкретной сделки.
 
-    👇 Критич. изменение (фикс «автоперехода»):
-    • Больше НЕ «автооткрывает» карточку, если она не была открыта.
+    Правила:
+    • Не «автооткрывает» карточку, если она не была открыта.
     • Если uid не передан, ищем владельца по state.detail_blocks[(uid, deal_id)].
-      Если владельца нет — ТИХО ВЫХОДИМ (ничего не отправляем).
-    • Если uid явно передан (например, при ручном show_deal_) — перерисуем для него.
-
-    Совместимость:
-    • Поддерживаем старую позиционную сигнатуру refresh_deal_details(uid, deal_id).
-    • Параметр force_approved оставлен для внешних вызовов (разметка/лейблы внутри _render_detail).
+      Если владельца нет — ТИХО ВЫХОДИМ.
+    • Поддерживает старую позиционную сигнатуру refresh_deal_details(uid, deal_id).
     """
     # legacy позиционная сигнатура: (uid, deal_id)
     if uid is None and deal_id is None:
-        # попробуем разобрать kwargs['args'] / или прямой вызов с позиционными
         args = kwargs.pop("args", ()) or ()
         if args:
-            try:
+            with suppress(Exception):
                 if len(args) >= 1 and isinstance(args[0], int):
                     uid = args[0]
                 if len(args) >= 2 and isinstance(args[1], int):
                     deal_id = args[1]
-            except Exception:
-                pass
 
     # бот
     bot = bot or Bot.get_current()
@@ -547,7 +654,6 @@ async def refresh_deal_details(
         except Exception:
             uid = None
 
-    # ❗НОВЫЙ ФЛОУ: не подставляем current_poll_leader; если нет владельца — выходим
     if not bot or uid is None or deal_id is None:
         logger.debug(
             "[poll_details.refresh] skip (no open view): bot=%s uid=%s deal_id=%s",
@@ -555,14 +661,111 @@ async def refresh_deal_details(
         )
         return
 
-    # Перерисовка действующего detail-view (со всеми правилами и учётом force_approved)
     await _render_detail(uid=uid, deal_id=deal_id, bot=bot, force_approved=force_approved)
 
-# История изменений:
-# • 2025-08-14 — фикс «автоперехода»: убран фолбэк на current_poll_leader в refresh_deal_details.
-#   Теперь функция не создаёт новый detail-view, если он не был открыт, и работает только
-#   для явного uid или уже открытых карточек в state.detail_blocks.
+@router.callback_query(lambda c: c.data and c.data.startswith("swap_"))
+async def poll_swap_handler(callback: types.CallbackQuery) -> None:
+    """
+    SWAP-кнопка из блока «Альтернативы»:
+    • переносит выбранного кандидата в целевую роль;
+    • удаляет его из всех прочих ролей;
+    • пересчитывает «готовность», синхронизирует отчёт и перерисовывает detail-view.
+    Формат data: swap_{deal_id}_{targetRole}_{uid}
+        targetRole ∈ {main, assist, admin}
+    """
+    data_s = str(callback.data or "")
+    try:
+        _, deal_id_s, role, uid_s = data_s.split("_", 3)
+        deal_id = int(deal_id_s)
+        uid_new = int(uid_s)
+    except Exception:
+        with suppress(Exception):
+            await callback.answer("⚠️ Ошибка формата кнопки.", show_alert=True)
+        return
 
+    # Текущее распределение
+    dist_map = getattr(state, "distribution_cache", {}) or {}
+    dist: Dict[str, str] = dist_map.setdefault(str(deal_id), {})
+    # Мета по игре
+    details = (getattr(state, "poll_details", {}) or {}).get(deal_id) or {}
+    game_name = details.get("game_name") or details.get("title") or ""
+    cfg = _role_cfg(str(game_name))
+    need_main   = int(cfg.get("main_leaders", 1) or 1)
+    need_assist = int(cfg.get("assistants", 1) or 1)
+
+    # 1) убрать uid_new из ВСЕХ слотов (инварианта 1 uid = 1 роль)
+    for k, v in list(dist.items()):
+        if isinstance(k, str) and (k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"}):
+            if _tag_uid(v) == uid_new:
+                dist[k] = ""
+
+    # 2) записать в нужную роль
+    if role == "admin":
+        dist["admin"] = await _fmt(uid_new, "admin")
+    else:
+        prefix = "lead" if role == "main" else "assistant"
+        # найдём первый пустой целевой слот, иначе — первый по порядку
+        target_key = None
+        for idx in range(1, (need_main if prefix == "lead" else need_assist) + 1):
+            k = f"{prefix}{idx}"
+            if not _tag_uid(dist.get(k)):
+                target_key = k
+                break
+        if target_key is None:
+            target_key = f"{prefix}1"
+        dist[target_key] = await _fmt(uid_new, "main" if role == "main" else "assist")
+
+    # 3) нормализация + гарантия инварианты
+    await _ensure_single_role(dist, need_main, need_assist)
+    await _normalize_tag_texts(dist, need_main, need_assist)
+
+    # 4) синхронизация UI: сводный отчёт и реактивные detail-view
+    try:
+        await plc._check_ready_state({deal_id})
+    except Exception as e:
+        logger.warning("[swap] ready-state failed: %s", e)
+    try:
+        await plc._sync_leader_report()
+    except Exception as e:
+        logger.warning("[swap] report-sync failed: %s", e)
+    try:
+        await plc._refresh_detail_views({deal_id}, refresh_all=False)
+    except Exception as e:
+        logger.warning("[swap] details-refresh failed: %s", e)
+
+    # 5) локальная перерисовка для инициатора
+    try:
+        await refresh_deal_details(bot=callback.message.bot, deal_id=deal_id, uid=callback.from_user.id)
+    except TypeError:
+        with suppress(Exception):
+            await refresh_deal_details(callback.from_user.id, deal_id)  # type: ignore
+
+    with suppress(Exception):
+        await callback.answer("✅ Состав обновлён")
+    logger.info("[swap] deal %d → %s uid=%d", deal_id, role, uid_new)
+
+@router.callback_query(lambda c: c.data == POLL_BACK)
+async def poll_back_handler(callback: types.CallbackQuery) -> None:
+    """
+    «Назад к списку»:
+    • чистим private-ленточку пользователя;
+    • обновляем сводный отчёт лидеру (если он открыт).
+    """
+    bot = callback.message.bot if callback.message else None
+    uid = callback.from_user.id
+    if bot:
+        try:
+            await delete_previous_private_messages(bot, uid, keep=[])
+        except TypeError:
+            with suppress(Exception):
+                await delete_previous_private_messages(uid)  # type: ignore
+    with suppress(Exception):
+        await plc._sync_leader_report()
+    with suppress(Exception):
+        await callback.answer("↩️ Возврат к списку")
+# История изменений:
+# • 2025-08-15 — добавлен SWAP-обработчик с инвариантой «1 uid = 1 роль» + синхронизацией отчёта и detail-view;
+#                refresh_deal_details выровнен с новой сигнатурой _render_detail; надёжный «Назад к списку».
 
 
 

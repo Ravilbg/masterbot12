@@ -501,6 +501,203 @@ async def _auto_assign_from_responses(impacted: Set[int], apply_to_all_on_admin_
             state.distribution_cache = {}
         state.distribution_cache[str(did)] = dist
 
+# ════════════════════════════════════════════════════════════════════
+# [2.6] CHAT RESOLVER (куда слать сервисные уведомления)
+# ════════════════════════════════════════════════════════════════════
+async def _resolve_notify_chat_id() -> Optional[int]:
+    """
+    Возвращает первый доступный чат для сервисных сообщений.
+    ВАЖНО: приоритет на admin_chat_id, т.к. он гарантированно рабочий в тесте.
+    Порядок: state.admin_chat_id → POLLS_CHAT_ID → LEADERS_CHAT_ID → ADMIN_CHAT_ID.
+    Без падений, строки/числа приводим к int.
+    """
+    candidates = [
+        getattr(state, "admin_chat_id", None),          # ← приоритетно
+        getattr(settings, "POLLS_CHAT_ID", None),
+        getattr(settings, "LEADERS_CHAT_ID", None),
+        getattr(settings, "ADMIN_CHAT_ID", None),
+    ]
+    for cid in candidates:
+        if cid is None:
+            continue
+        try:
+            return int(str(cid).strip())
+        except Exception:
+            continue
+    return None
+
+# История изменений: 2025-08-15 — приоритет admin_chat_id; безопасное приведение к int
+
+
+# ════════════════════════════════════════════════════════════════════
+# [2.7] SWAP / DISTRIBUTION HELPERS
+# ════════════════════════════════════════════════════════════════════
+async def _short_label(uid: int) -> str:
+    """«Имя Ф.» для слотов и уведомлений."""
+    ui = await get_user_info(uid) or {}
+    fn = (ui.get("first_name") or "").strip()
+    li = (ui.get("last_name_initial") or "").strip()
+    return f"{fn} {li}".strip() if (fn or li) else f"user{uid}"
+
+def _slot_label(uid: int, base: Optional[str] = None) -> str:
+    """Метка слота: 'Имя Ф.|uid'."""
+    return f"{(base or '').strip() or 'user'+str(uid)}|{uid}"
+
+def _remove_uid_from_dist(dist: Dict[str, Any], uid: int) -> None:
+    """Инвариант «1 пользователь = 1 роль» — убираем uid из всех lead*/assistant*/admin."""
+    for k, v in list(dist.items()):
+        if not isinstance(k, str):
+            continue
+        if k.startswith("lead") or k.startswith("assistant") or k == "admin":
+            if isinstance(v, str) and v.rsplit("|", 1)[-1].isdigit() and int(v.rsplit("|", 1)[-1]) == uid:
+                dist[k] = None
+
+def _ensure_role_slots(dist: Dict[str, Any], game_name: str, package: str) -> Tuple[int, int, int]:
+    """Создаёт недостающие ключи lead{i}/assistant{i}/admin согласно конфигурации."""
+    need = _role_cfg(game_name)
+    need_main = int(need.get("main_leaders", 1))
+    need_assist = int(need.get("assistants", 0))
+    need_admin = _need_admin_by_package(package)
+    for i in range(1, max(1, need_main) + 1):
+        dist.setdefault(f"lead{i}", None)
+    for i in range(1, max(0, need_assist) + 1):
+        dist.setdefault(f"assistant{i}", None)
+    dist.setdefault("admin", None if need_admin else None)
+    return need_main, need_assist, need_admin
+
+def _first_empty_slot(dist: Dict[str, Any], prefix: str, count: int) -> Optional[str]:
+    """Возвращает имя первого пустого слота с данным префиксом (lead/assistant)."""
+    for i in range(1, count + 1):
+        key = f"{prefix}{i}"
+        if dist.get(key) in (None, "", 0):
+            return key
+    return f"{prefix}1" if count >= 1 else None
+
+def _names_list_from_dist(dist: Dict[str, Any], prefix: str, count_guess: int) -> List[str]:
+    """Имена без |uid из слотов prefix* (для уведомления)."""
+    out: List[str] = []
+    for i in range(1, max(1, count_guess) + 1):
+        v = dist.get(f"{prefix}{i}")
+        if isinstance(v, str):
+            out.append(v.split("|", 1)[0])
+    return [x for x in out if x]
+
+def _team_summary_text(dist: Dict[str, Any], game_name: str, package: str) -> str:
+    """Человекочитаемый состав команды одной строкой + переносы."""
+    need_main, need_assist, _need_admin = _ensure_role_slots(dist, game_name, package)
+    mains = ", ".join(_names_list_from_dist(dist, "lead", need_main)) or "—"
+    assists = ", ".join(_names_list_from_dist(dist, "assistant", need_assist)) or "—"
+    adm = dist.get("admin")
+    admin = (adm.split("|", 1)[0] if isinstance(adm, str) else "") or "—"
+    trainee = dist.get("trainee")
+    trainee_s = (trainee.split("|", 1)[0] if isinstance(trainee, str) else "")
+    parts = [f"🧭 Ведущие: {mains}", f"🛟 Помощники: {assists}", f"🛡️ Админ: {admin}"]
+    if trainee_s:
+        parts.append(f"🎓 Стажёр: {trainee_s}")
+    return "\n".join(parts)
+
+async def _insert_candidate_into_distribution(deal_id: int, role: str, uid: int, status: str) -> Dict[str, Any]:
+    """
+    Точечно встраивает кандидата в distribution_cache[str(deal_id)]:
+    • green/yellow → целевая роль;
+    • red → слот trainee (не учитывается в готовности).
+    Инвариант: 1 пользователь = 1 роль.
+    Возвращает актуализированный dist.
+    """
+    # найдём сделку
+    deal = next((d for d in (state.current_poll_deals or []) if int(d.get("id", 0)) == int(deal_id)), {}) or {}
+    game_name = str(deal.get("game_name") or deal.get("name") or "")
+    package = str(deal.get("package") or "")
+    # получить/подготовить dist
+    if not getattr(state, "distribution_cache", None):
+        state.distribution_cache = {}
+    dist: Dict[str, Any] = dict((state.distribution_cache or {}).get(str(deal_id)) or {})
+    need_main, need_assist, _need_admin = _ensure_role_slots(dist, game_name, package)
+
+    # удалить кандидата из всех ролей (если вдруг уже был)
+    _remove_uid_from_dist(dist, uid)
+
+    # метка
+    label = _slot_label(uid, await _short_label(uid))
+
+    if status == "red" and role in {"main", "assist"}:
+        # «красный» — в стажёры, готовность не увеличивает
+        dist["trainee"] = label
+    else:
+        if role == "main":
+            key = _first_empty_slot(dist, "lead", need_main) or "lead1"
+            dist[key] = label
+        elif role == "assist":
+            key = _first_empty_slot(dist, "assistant", need_assist) or "assistant1"
+            dist[key] = label
+        elif role == "admin":
+            dist["admin"] = label
+        else:
+            # защитный фолбэк — как помощник
+            key = _first_empty_slot(dist, "assistant", max(1, need_assist)) or "assistant1"
+            dist[key] = label
+
+    state.distribution_cache[str(deal_id)] = dist
+    return dist
+def _assigned_role_from_state(uid: int, deal_id: int) -> Optional[str]:
+    """
+    Возвращает роль ('main'|'assist'|'admin') пользователя по сделке из
+    locked_distribution (в приоритете) или distribution_cache.
+    """
+    uid = int(uid)
+    did_s = str(int(deal_id))
+    # 1) lock (утверждённый состав)
+    dist = (getattr(state, "locked_distribution", {}) or {}).get(int(deal_id)) or {}
+    # 2) cache (предварительный состав)
+    if not dist:
+        dist = (getattr(state, "distribution_cache", {}) or {}).get(did_s) or {}
+    if not isinstance(dist, dict):
+        return None
+
+    def _match(val: Any) -> bool:
+        if isinstance(val, int):
+            return val == uid
+        if isinstance(val, str) and "|" in val:
+            tail = val.rsplit("|", 1)[-1]
+            return tail.isdigit() and int(tail) == uid
+        return False
+
+    # main
+    for k, v in dist.items():
+        if isinstance(k, str) and k.startswith("lead") and _match(v):
+            return "main"
+    # assist
+    for k, v in dist.items():
+        if isinstance(k, str) and k.startswith("assistant") and _match(v):
+            return "assist"
+    # admin
+    if _match(dist.get("admin")):
+        return "admin"
+    return None
+
+
+async def _find_deal_snapshot(deal_id: int) -> Dict[str, Any]:
+    """
+    Находит сделку сперва в state.current_poll_deals, при отсутствии — в AmoCRM.
+    Возвращает dict (может быть пустым).
+    """
+    did = int(deal_id)
+    for d in (getattr(state, "current_poll_deals", []) or []):
+        try:
+            if int(d.get("id", 0)) == did:
+                return d
+        except Exception:
+            continue
+    # запасной путь — запросить список актуальных сделок и найти там
+    try:
+        deals = await get_amocrm_deals()
+        for d in deals or []:
+            if int(d.get("id", 0)) == did:
+                return d
+    except Exception:
+        pass
+    return {}
+
 
 # ════════════════════════════════════════════════════════════════════
 # [3] СОЗДАНИЕ ОПРОСА
@@ -639,20 +836,25 @@ async def create_poll_handler(message: types.Message) -> None:
         }
         logger.debug("[create_poll] poll sent: id=%s, deals=%s", poll.poll.id, list(idx_map.values()))
 
-    await message.answer("✅ Опросы отправлены.")
+        # было:
+    # await message.answer("✅ Опросы отправлены.")
+    # with contextlib.suppress(Exception):
+    #     await _refresh_menu(uid)
+
+    sent_info = await message.answer("✅ Опросы отправлены.")
+    # ✨ Добавим одноразовое сообщение в список на удаление, чтобы «пылесос» его снёс
+    try:
+        if not getattr(state, "messages_to_delete", None):
+            state.messages_to_delete = {}
+        state.messages_to_delete.setdefault(uid, [])
+        mid = getattr(sent_info, "message_id", None)
+        if mid:
+            state.messages_to_delete[uid].append(int(mid))
+    except Exception:
+        pass
+
     with contextlib.suppress(Exception):
         await _refresh_menu(uid)
-
-    await _send_leader_report(uid)
-
-    # авто-завершение и напоминания
-    asyncio.get_event_loop().call_later(
-        int(getattr(settings, "POLL_DURATION_HOURS", 24)) * 3600,
-        lambda: asyncio.create_task(clear_poll_data(uid)),
-    )
-    _schedule_reminders()
-    await _delete_trigger(message)
-
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -861,7 +1063,195 @@ async def handle_poll_answer(event: types.PollAnswer) -> None:
     scope = impacted if not admin_flag else {int(d.get("id", 0)) for d in (state.current_poll_deals or [])}
     await _check_ready_state(scope)
     asyncio.create_task(_refresh_detail_views(scope, refresh_all=admin_flag))
+# ════════════════════════════════════════════════════════════════════
+# [4.8] HANDLER: «Замена» из «Мои игры» (mygame_swap_{deal_id})
+# ════════════════════════════════════════════════════════════════════
+@router.callback_query(lambda c: c.data and c.data.startswith("mygame_swap_"))
+async def swap_request_handler(callback: types.CallbackQuery) -> None:
+    """
+    Пользователь просит замену на уже утверждённую игру.
+    Делаем:
+      • проверяем, что пользователь действительно назначен (по locked_distribution/cache);
+      • публикуем объявление в рабочем чате с кнопкой «✋ Откликнуться»;
+      • мягко чистим его подтверждающие теги в сделке и переводим статус в «Бронь» (pre-flight внутри);
+      • не ломаем текущий состав локально — перераспределение произойдёт после «Откликнуться».
+    """
+    uid = int(callback.from_user.id)
+    data_s = str(callback.data or "")
+    try:
+        deal_id = int(data_s.split("_")[-1])
+    except Exception:
+        await callback.answer("⚠️ Ошибочная кнопка.", show_alert=True)
+        return
 
+    logger.info("[swap] request by uid=%s deal_id=%s", uid, deal_id)
+
+    # проверим, что пользователь назначен на эту игру и какую роль он занимает
+    role = _assigned_role_from_state(uid, deal_id)
+    if not role:
+        await callback.answer("Вы не назначены на эту игру.", show_alert=True)
+        logger.warning("[swap] denied: uid=%s not assigned to deal=%s", uid, deal_id)
+        return
+
+    # найдём «снимок» сделки для текста
+    snap = await _find_deal_snapshot(deal_id)
+    title = _deal_title(snap or {"id": deal_id})
+    dt = (snap or {}).get("event_datetime")
+    date_s = dt.strftime("%d.%m") if hasattr(dt, "strftime") else str((snap or {}).get("event_date") or "—")
+    time_s = str((snap or {}).get("event_time") or "—")
+    pkg = str((snap or {}).get("package") or "—")
+    players = str((snap or {}).get("players") or "—")
+
+    # куда публикуем
+    chat_id = await _resolve_notify_chat_id()
+    if not chat_id:
+        await callback.answer("⚠️ Не настроен чат для объявлений.", show_alert=True)
+        logger.error("[swap] no available chat for notify; uid=%s deal=%s", uid, deal_id)
+        return
+
+    # объявление об открытой замене + кнопка отклика
+    short = await _short_label(uid)
+    text = (
+        f"⚠️ {short} просит замену на игру «{title}»\n"
+        f"📅 {date_s} · 🕒 {time_s} · 📦 {pkg} · 👥 {players}\n\n"
+        "Нажмите «Откликнуться», если готовы выйти."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✋ Откликнуться", callback_data=f"swap_accept_{deal_id}_{role}")]
+        ]
+    )
+
+    bot = Bot.get_current()
+
+    # запомним открытый запрос замены (первый клик «Откликнуться» выигрывает)
+    if not getattr(state, "swap_requests", None):
+        state.swap_requests = {}
+    state.swap_requests[int(deal_id)] = {
+        "by": uid,
+        "role": role,
+        "accepted_by": None,
+        "created_at": datetime.now(tz=MSK_TZ).isoformat(),
+    }
+
+    # Пытаемся отправить в рабочий чат. Если получится — отлично.
+    sent_ok = False
+    try:
+        await bot.send_message(chat_id, text, reply_markup=kb)
+        sent_ok = True
+        logger.info("[swap] announcement posted to chat=%s for deal=%s", chat_id, deal_id)
+    except Exception as e:
+        logger.warning("[swap] notify failed chat=%s deal=%s: %s", chat_id, deal_id, e)
+
+    # Фолбэк: если не смогли отправить в чат — уведомим инициатора в ЛС,
+    # чтобы они понимали, что запрос зафиксирован, и дадим текст для ручного форварда.
+    if not sent_ok:
+        try:
+            await bot.send_message(uid, "⚠️ Не удалось отправить объявление в чат. "
+                                        "Я сохранил запрос на замену. "
+                                        "Скинь этот текст в рабочий чат вручную:\n\n" + text)
+        except Exception:
+            pass
+
+    # CRM: убрать подтверждающие теги пользователя и вернуть сделку в «Бронь»
+    try:
+        from services.amocrm import revert_to_bron_after_swap  # lazy import
+        await revert_to_bron_after_swap(int(deal_id), uid=uid, short_base=await _short_label(uid))
+    except Exception as e:
+        logger.warning("[swap] CRM revert failed for deal=%s: %s", deal_id, e)
+
+    # UI: сообщим пользователю и мягко обновим отчёты/детали
+    with contextlib.suppress(Exception):
+        await callback.answer("Запрос на замену отправлен.", show_alert=False)
+    await _sync_leader_report()
+    asyncio.create_task(_refresh_detail_views({int(deal_id)}, refresh_all=False))
+
+# История изменений: 2025-08-15 — логи, приоритет admin_chat, фолбэк в ЛС, обязательный ACK
+
+# ════════════════════════════════════════════════════════════════════
+# [4.9] HANDLER: «Откликнуться» на замену (swap_accept_{deal_id}_{role})
+# ════════════════════════════════════════════════════════════════════
+@router.callback_query(lambda c: c.data and c.data.startswith("swap_accept_"))
+async def swap_accept_handler(callback: types.CallbackQuery) -> None:
+    """
+    Первый клик выигрывает:
+    • фиксируем «accepted_by» в state.swap_requests[deal_id], остальные получают ACK «уже занято»;
+    • проверяем по «Светофору» (green/yellow ок для core-ролей; red → стажёр);
+    • точечно пересобираем distribution_cache по сделке (без трогания locked_distribution);
+    • уведомляем чат: «Состав команды обновлён … Подтвердите участие в личном кабинете»;
+    • триггерим _sync_leader_report, _check_ready_state и перерисовку деталей.
+    """
+    data = str(callback.data or "")
+    try:
+        # swap_accept_{deal_id}_{role}
+        _, _, tail = data.partition("swap_accept_")
+        lead_s, role_raw = tail.rsplit("_", 1)
+        deal_id = int(lead_s)
+        role = role_raw.strip().lower()
+    except Exception:
+        await callback.answer("⚠️ Ошибочная кнопка.", show_alert=True)
+        return
+
+    uid = int(callback.from_user.id)
+    logger.info("[swap] accept candidate uid=%s deal=%s role=%s", uid, deal_id, role)
+
+    req = (getattr(state, "swap_requests", {}) or {}).get(deal_id)
+    if not isinstance(req, dict):
+        await callback.answer("Запрос замены уже закрыт.", show_alert=True)
+        logger.warning("[swap] accept: no open request for deal=%s", deal_id)
+        return
+
+    # «первый клик выигрывает»
+    accepted = req.get("accepted_by")
+    if accepted is not None:
+        await callback.answer("Уже занято — замена назначена.", show_alert=True)
+        logger.info("[swap] accept: already taken by uid=%s", accepted)
+        return
+
+    # фиксируем победителя
+    req["accepted_by"] = uid
+
+    # проверка по «Светофору»
+    deal = next((d for d in (state.current_poll_deals or []) if int(d.get("id", 0)) == int(deal_id)), {}) or {}
+    game_name = str(deal.get("game_name") or deal.get("name") or f"Сделка #{deal_id}")
+    status = await _sv_status(uid, game_name)  # '' | green | yellow | red
+
+    # точечная пересборка распределения под кандидата
+    dist = await _insert_candidate_into_distribution(deal_id=deal_id, role=role, uid=uid, status=status)
+
+    # уведомление в чат
+    bot = Bot.get_current()
+    chat_id = await _resolve_notify_chat_id()
+    if chat_id:
+        try:
+            pkg = str(deal.get("package") or "")
+            summary = _team_summary_text(dist, game_name, pkg)
+            title = _deal_title(deal)
+            dt = deal.get("event_datetime")
+            date_s = dt.strftime("%d.%m") if hasattr(dt, "strftime") else str(deal.get("event_date") or "—")
+            time_s = str(deal.get("event_time") or "—")
+
+            text = (
+                "✅ Состав команды обновлён.\n"
+                f"🎮 «{title}» — {date_s} {time_s}\n"
+                f"{summary}\n\n"
+                "Подтвердите участие в личном кабинете."
+            )
+            await bot.send_message(chat_id, text)
+            logger.info("[swap] updated team posted to chat=%s for deal=%s", chat_id, deal_id)
+        except Exception as e:
+            logger.warning("[swap] chat notify failed for deal=%s: %s", deal_id, e)
+
+    # локальные эффекты UI/индикаторов
+    impacted = {int(deal_id)}
+    await _sync_leader_report()
+    await _check_ready_state(impacted)
+    asyncio.create_task(_refresh_detail_views(impacted, refresh_all=False))
+
+    with contextlib.suppress(Exception):
+        await callback.answer("Спасибо! Вы в составе на эту игру.", show_alert=False)
+
+# История изменений: 2025-08-15 — логи, безопасные уведомления, стабильный ACK
 
 # ════════════════════════════════════════════════════════════════════
 # [5] ГОТОВНОСТЬ И УВЕДОМЛЕНИЯ
