@@ -153,70 +153,177 @@ if TYPE_CHECKING:
     def _build_report_keyboard() -> Any: ...
 
 
+# handlers/polls_lifecycle.py
 # ════════════════════════════════════════════════════════════════════
-# [0.95] ПЫЛЕСОС ЛИЧНЫХ СООБЩЕНИЙ (фоновая уборка ЛС)
+# [0.96] REPORT + VACUUM (edit-in-place, no ui_context; no-resend-on-not-modified)
 # ════════════════════════════════════════════════════════════════════
-"""
-Удаляет устаревшие личные сообщения и оставляет только «активные»:
-• последние сообщения в ЛС из state.last_user_messages[uid]
-• активные detail-блоки из state.detail_blocks[(uid, deal_id)]
-• персональный отчёт лидера (если uid == current_poll_leader)
-Совместимо с legacy/new сигнатурами delete_previous_private_messages.
-"""
-_vacuum_log = logger.getChild("vacuum")
+import contextlib
+import logging
+from typing import Optional, Set, Tuple, Dict, Any, List
 
-async def _vacuum_old_messages() -> None:
+from aiogram import Bot, types
+from aiogram.types import InlineKeyboardMarkup
+
+from core.config import settings
+from core.db import get_user_info
+from core.state import state
+from core.utils import delete_previous_private_messages, vacuum_private  # ← добавили vacuum_private
+
+logger = logging.getLogger(__name__)
+
+async def _edit_or_send_report(uid: int, text: str, kb: InlineKeyboardMarkup) -> None:
+    """
+    Пытаемся отредактировать действующий отчёт. Если не получилось —
+    полностью чистим ЛС и отправляем новый. Синхронизируем state.
+    Специальный кейс: 'message is not modified' считаем УСПЕХОМ (ничего не пересылаем).
+    """
     bot = Bot.get_current()
+    mid = getattr(state, "personal_report_message_id", None)
+    can_edit = isinstance(mid, int) and mid > 0
 
-    uids: Set[int] = set()
-    try:
-        uids.update((getattr(state, "last_user_messages", {}) or {}).keys())
-    except Exception:
-        pass
-    try:
-        uids.update((getattr(state, "messages_to_delete", {}) or {}).keys())
-    except Exception:
-        pass
-    try:
-        detail_blocks = getattr(state, "detail_blocks", {}) or {}
-        uids.update({uid for (uid, _did) in detail_blocks.keys()})
-    except Exception:
-        detail_blocks = {}
+    if can_edit:
+        try:
+            await bot.edit_message_text(
+                text=text,
+                chat_id=uid,
+                message_id=mid,
+                parse_mode="Markdown",
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            class _Msg:
+                def __init__(self, message_id: int) -> None:
+                    self.message_id = message_id
+            state.last_user_messages[uid] = [_Msg(mid)]
+            return
+        except Exception as e:
+            msg = str(e).lower()
+            # НИЧЕГО НЕ ДЕЛАЕМ, если контент не изменился — считаем, что отчёт актуален
+            if "message is not modified" in msg:
+                class _Msg:
+                    def __init__(self, message_id: int) -> None:
+                        self.message_id = message_id
+                state.last_user_messages[uid] = [_Msg(mid)]
+                logger.debug("[report] edit skipped: content not modified")
+                return
+            logger.debug("[report] edit failed → resend: %s", e)
 
-    if not uids:
+    # «Жёсткая» очистка и новая отправка
+    with contextlib.suppress(Exception):
+        await delete_previous_private_messages(uid, keep=[])
+
+    sent = await bot.send_message(
+        uid, text, parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True
+    )
+    state.personal_report_message_id = sent.message_id
+    state.last_user_messages[uid] = [sent]
+
+
+async def _send_leader_report(leader_id: int) -> None:
+    text = await generate_poll_report()             # type: ignore[name-defined]
+    kb   = _build_report_keyboard()                 # type: ignore[name-defined]
+    await _edit_or_send_report(leader_id, text, kb)
+
+
+async def _sync_leader_report(leader_id: Optional[int] = None) -> None:
+    lid = leader_id or getattr(state, "current_poll_leader", None)
+    if not lid:
+        with contextlib.suppress(Exception):
+            from core.db import get_all_leader_uids
+            got = await get_all_leader_uids()
+            lid = (got or [None])[0]
+    if not lid:
+        logger.debug("[sync_report] leader_id undefined — skip")
+        return
+    await _send_leader_report(int(lid))
+
+
+async def sync_report() -> None:
+    await _sync_leader_report()
+
+
+@router.message(lambda m: (m.text or "") == "📊 Отчёт по опросу")
+async def poll_report_handler(message: types.Message) -> None:
+    uid = message.from_user.id
+    ui  = await get_user_info(uid) or {}
+    if ui.get("role") not in getattr(settings, "ACCESS", {}).get("poll", ["admin", "leader"]):
+        await message.answer("⛔ Нет доступа.", reply_markup=await get_main_menu(uid))  # type: ignore[name-defined]
+        with contextlib.suppress(Exception):
+            await message.delete()
         return
 
-    leader_uid = getattr(state, "current_poll_leader", None)
-    leader_board_id = getattr(state, "personal_report_message_id", None)
+    if not state.coordination_cycle_active:
+        await message.answer("⚠️ Нет активных опросов.", reply_markup=await get_main_menu(uid))  # type: ignore[name-defined]
+        with contextlib.suppress(Exception):
+            await message.delete()
+        return
 
-    async def _do(uid_: int, keep_: List[Any]) -> None:
-        try:
-            await delete_previous_private_messages(uid_, keep=keep_)  # новая сигнатура
-            return
-        except TypeError:
-            with contextlib.suppress(Exception):
-                await delete_previous_private_messages(bot, uid_, keep=keep_)  # legacy type: ignore
+    text = await generate_poll_report()     # type: ignore[name-defined]
+    kb   = _build_report_keyboard()         # type: ignore[name-defined]
+    await _edit_or_send_report(uid, text, kb)
 
-    tasks: List[asyncio.Task] = []
-    for uid in uids:
-        keep: List[Any] = []
-        try:
-            keep.extend(((getattr(state, "last_user_messages", {}) or {}).get(uid) or []))
-        except Exception:
-            pass
-        try:
-            for (u, _did), msgs in (detail_blocks.items() if isinstance(detail_blocks, dict) else []):
-                if u == uid and msgs:
-                    keep.extend(msgs)
-        except Exception:
-            pass
-        if leader_uid and uid == leader_uid and leader_board_id:
-            keep.append(leader_board_id)
-        tasks.append(asyncio.create_task(_do(uid, keep)))
+    with contextlib.suppress(Exception):
+        await _refresh_menu(uid)            # type: ignore[name-defined]
+    with contextlib.suppress(Exception):
+        await message.delete()
 
-    for r in await asyncio.gather(*tasks, return_exceptions=True):
-        if isinstance(r, Exception):
-            _vacuum_log.debug("[vacuum] suppressed deletion error: %s", r)
+
+async def _vacuum_old_messages() -> None:
+    """
+    Плановая чистка ЛС.
+    • Собираем ПОЛНОЕ множество uid из state: last_user_messages, detail_blocks, menu_message_id,
+      assigned_index, games_by_user.
+    • Бережём главное меню (keep = [menu_message_id]).
+    • Удаляем все прочие «хвосты» через canonical vacuum_private(...).
+    """
+    # 1) Соберём uid'ы из разных источников
+    uids: Set[int] = set()
+    try:
+        lm: Dict[int, Any] = (getattr(state, "last_user_messages", {}) or {})
+        uids.update(int(u) for u in lm.keys() if isinstance(u, int))
+    except Exception:
+        pass
+    try:
+        db: Dict[Tuple[int, int], Any] = (getattr(state, "detail_blocks", {}) or {})
+        uids.update(int(k[0]) for k in db.keys() if isinstance(k, tuple) and len(k) >= 2 and isinstance(k[0], int))
+    except Exception:
+        pass
+    try:
+        mm: Dict[int, int] = (getattr(state, "menu_message_id", {}) or {})
+        uids.update(int(u) for u in mm.keys() if isinstance(u, int))
+    except Exception:
+        pass
+    try:
+        ai: Dict[int, Any] = (getattr(state, "assigned_index", {}) or {})
+        uids.update(int(u) for u in ai.keys() if isinstance(u, int))
+    except Exception:
+        pass
+    try:
+        gib: Dict[int, Any] = (getattr(state, "games_by_user", {}) or {})
+        uids.update(int(u) for u in gib.keys() if isinstance(u, int))
+    except Exception:
+        pass
+
+    # 2) Для каждого пользователя — vacuum с сохранением главного меню
+    try:
+        from core.menu import get_menu_message_id  # берём ID меню, если есть
+    except Exception:
+        get_menu_message_id = lambda _uid: None  # type: ignore
+
+    for uid in sorted(uids):
+        keep_ids: List[int] = []
+        with contextlib.suppress(Exception):
+            mid = get_menu_message_id(uid)
+            if isinstance(mid, int):
+                keep_ids.append(mid)
+        with contextlib.suppress(Exception):
+            await vacuum_private(uid, keep=keep_ids)
+
+# История изменений:
+# 2025-08-18 • v0.96d — vacuum: бережём главное меню + чистим по union(uid) из state (выровнено под SSOT).
+# 2025-08-18 • v0.96c — «message is not modified» трактуем как OK; убран resend; синхронизируем last_user_messages.
+# ════════════════════════════════════════════════════════════════════
+
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -504,40 +611,19 @@ async def _auto_assign_from_responses(impacted: Set[int], apply_to_all_on_admin_
 # ════════════════════════════════════════════════════════════════════
 # [2.6] CHAT RESOLVER (куда слать сервисные уведомления)
 # ════════════════════════════════════════════════════════════════════
-async def _resolve_notify_chat_id() -> Optional[int]:
-    """
-    Возвращает первый доступный чат для сервисных сообщений.
-    ВАЖНО: приоритет на admin_chat_id, т.к. он гарантированно рабочий в тесте.
-    Порядок: state.admin_chat_id → POLLS_CHAT_ID → LEADERS_CHAT_ID → ADMIN_CHAT_ID.
-    Без падений, строки/числа приводим к int.
-    """
-    candidates = [
-        getattr(state, "admin_chat_id", None),          # ← приоритетно
-        getattr(settings, "POLLS_CHAT_ID", None),
-        getattr(settings, "LEADERS_CHAT_ID", None),
-        getattr(settings, "ADMIN_CHAT_ID", None),
-    ]
-    for cid in candidates:
-        if cid is None:
-            continue
-        try:
-            return int(str(cid).strip())
-        except Exception:
-            continue
-    return None
+# Переведено на SSOT: используем общий резолвер из core.utils.
+from core.utils import resolve_notify_chat_id
 
-# История изменений: 2025-08-15 — приоритет admin_chat_id; безопасное приведение к int
+# История изменений:
+# 2025-08-18 — выровнено под SSOT: локальный _resolve_notify_chat_id удалён, используем core.utils.resolve_notify_chat_id.
 
 
 # ════════════════════════════════════════════════════════════════════
 # [2.7] SWAP / DISTRIBUTION HELPERS
 # ════════════════════════════════════════════════════════════════════
-async def _short_label(uid: int) -> str:
-    """«Имя Ф.» для слотов и уведомлений."""
-    ui = await get_user_info(uid) or {}
-    fn = (ui.get("first_name") or "").strip()
-    li = (ui.get("last_name_initial") or "").strip()
-    return f"{fn} {li}".strip() if (fn or li) else f"user{uid}"
+# SSOT: короткие имена, печать состава и чтение ролей — из core.utils.
+from core.utils import short_name, team_bulleted_lines, assigned_role_from_state as _assigned_role_from_state
+from services.amocrm import get_amocrm_deals  # для снапшота сделки (fallback)
 
 def _slot_label(uid: int, base: Optional[str] = None) -> str:
     """Метка слота: 'Имя Ф.|uid'."""
@@ -573,29 +659,6 @@ def _first_empty_slot(dist: Dict[str, Any], prefix: str, count: int) -> Optional
             return key
     return f"{prefix}1" if count >= 1 else None
 
-def _names_list_from_dist(dist: Dict[str, Any], prefix: str, count_guess: int) -> List[str]:
-    """Имена без |uid из слотов prefix* (для уведомления)."""
-    out: List[str] = []
-    for i in range(1, max(1, count_guess) + 1):
-        v = dist.get(f"{prefix}{i}")
-        if isinstance(v, str):
-            out.append(v.split("|", 1)[0])
-    return [x for x in out if x]
-
-def _team_summary_text(dist: Dict[str, Any], game_name: str, package: str) -> str:
-    """Человекочитаемый состав команды одной строкой + переносы."""
-    need_main, need_assist, _need_admin = _ensure_role_slots(dist, game_name, package)
-    mains = ", ".join(_names_list_from_dist(dist, "lead", need_main)) or "—"
-    assists = ", ".join(_names_list_from_dist(dist, "assistant", need_assist)) or "—"
-    adm = dist.get("admin")
-    admin = (adm.split("|", 1)[0] if isinstance(adm, str) else "") or "—"
-    trainee = dist.get("trainee")
-    trainee_s = (trainee.split("|", 1)[0] if isinstance(trainee, str) else "")
-    parts = [f"🧭 Ведущие: {mains}", f"🛟 Помощники: {assists}", f"🛡️ Админ: {admin}"]
-    if trainee_s:
-        parts.append(f"🎓 Стажёр: {trainee_s}")
-    return "\n".join(parts)
-
 async def _insert_candidate_into_distribution(deal_id: int, role: str, uid: int, status: str) -> Dict[str, Any]:
     """
     Точечно встраивает кандидата в distribution_cache[str(deal_id)]:
@@ -617,8 +680,8 @@ async def _insert_candidate_into_distribution(deal_id: int, role: str, uid: int,
     # удалить кандидата из всех ролей (если вдруг уже был)
     _remove_uid_from_dist(dist, uid)
 
-    # метка
-    label = _slot_label(uid, await _short_label(uid))
+    # метка SSOT: «Имя Ф.|uid»
+    label = _slot_label(uid, await short_name(uid))
 
     if status == "red" and role in {"main", "assist"}:
         # «красный» — в стажёры, готовность не увеличивает
@@ -639,42 +702,6 @@ async def _insert_candidate_into_distribution(deal_id: int, role: str, uid: int,
 
     state.distribution_cache[str(deal_id)] = dist
     return dist
-def _assigned_role_from_state(uid: int, deal_id: int) -> Optional[str]:
-    """
-    Возвращает роль ('main'|'assist'|'admin') пользователя по сделке из
-    locked_distribution (в приоритете) или distribution_cache.
-    """
-    uid = int(uid)
-    did_s = str(int(deal_id))
-    # 1) lock (утверждённый состав)
-    dist = (getattr(state, "locked_distribution", {}) or {}).get(int(deal_id)) or {}
-    # 2) cache (предварительный состав)
-    if not dist:
-        dist = (getattr(state, "distribution_cache", {}) or {}).get(did_s) or {}
-    if not isinstance(dist, dict):
-        return None
-
-    def _match(val: Any) -> bool:
-        if isinstance(val, int):
-            return val == uid
-        if isinstance(val, str) and "|" in val:
-            tail = val.rsplit("|", 1)[-1]
-            return tail.isdigit() and int(tail) == uid
-        return False
-
-    # main
-    for k, v in dist.items():
-        if isinstance(k, str) and k.startswith("lead") and _match(v):
-            return "main"
-    # assist
-    for k, v in dist.items():
-        if isinstance(k, str) and k.startswith("assistant") and _match(v):
-            return "assist"
-    # admin
-    if _match(dist.get("admin")):
-        return "admin"
-    return None
-
 
 async def _find_deal_snapshot(deal_id: int) -> Dict[str, Any]:
     """
@@ -698,6 +725,10 @@ async def _find_deal_snapshot(deal_id: int) -> Dict[str, Any]:
         pass
     return {}
 
+# История изменений:
+# 2025-08-18 — выровнено под SSOT: short_name/team_bulleted_lines/assigned_role_from_state из core.utils;
+#               добавлен обратно _find_deal_snapshot (фиксы Pylance).
+
 
 # ════════════════════════════════════════════════════════════════════
 # [3] СОЗДАНИЕ ОПРОСА
@@ -708,24 +739,41 @@ async def create_poll_handler(message: types.Message) -> None:
     uid = message.from_user.id
     logger.info("[create_poll] invoked by %d", uid)
 
+    bot = Bot.get_current()
+
+    # вспомогательный шорткат: показать короткое ЛС-сообщение как «экран»
+    async def _screen(text: str, *, kb: Optional[InlineKeyboardMarkup] = None) -> None:
+        # перед каждым экраном — жёсткий пылесос ЛС (только приват)
+        with contextlib.suppress(TypeError):
+            await delete_previous_private_messages(bot, uid, keep=[])
+        with contextlib.suppress(Exception):
+            await delete_previous_private_messages(uid, keep=[])
+        # отправляем и фиксируем как текущий экран
+        sent = await bot.send_message(uid, text, reply_markup=kb)
+        (getattr(state, "last_user_messages", {}) or {}).setdefault(uid, [])
+        state.last_user_messages[uid] = [sent]
+
     # 1) доступ
     ui = await get_user_info(uid) or {}
     if ui.get("role") not in getattr(settings, "ACCESS", {}).get("poll", ["admin", "leader"]):
-        await message.answer("⛔ Нет доступа.", reply_markup=await get_main_menu(uid))
-        await _delete_trigger(message)
+        await _screen("⛔ Нет доступа.", kb=await get_main_menu(uid))
+        with contextlib.suppress(Exception):
+            await message.delete()
         return
 
-    # активный цикл → просто отчёт
+    # активный цикл → просто «уже есть»
     if state.coordination_cycle_active:
-        await message.answer("⚠️ Уже есть активный опрос.", reply_markup=await get_main_menu(uid))
+        await _screen("⚠️ Уже есть активный опрос.", kb=await get_main_menu(uid))
         with contextlib.suppress(Exception):
             await _refresh_menu(uid)
-        await _delete_trigger(message)
+        with contextlib.suppress(Exception):
+            await message.delete()
         return
 
     if not state.admin_chat_id:
-        await message.answer("⚠️ Чат не настроен.", reply_markup=await get_main_menu(uid))
-        await _delete_trigger(message)
+        await _screen("⚠️ Чат не настроен.", kb=await get_main_menu(uid))
+        with contextlib.suppress(Exception):
+            await message.delete()
         return
 
     # 2) загрузка сделок
@@ -733,8 +781,9 @@ async def create_poll_handler(message: types.Message) -> None:
         deals = await get_amocrm_deals()
     except Exception as e:
         logger.exception("[create_poll] get_amocrm_deals failed: %s", e)
-        await message.answer("⚠️ Не удалось получить игры из AmoCRM.")
-        await _delete_trigger(message)
+        await _screen("⚠️ Не удалось получить игры из AmoCRM.")
+        with contextlib.suppress(Exception):
+            await message.delete()
         return
 
     now, window = datetime.now(tz=MSK_TZ), datetime.now(tz=MSK_TZ) + timedelta(days=14)
@@ -746,53 +795,39 @@ async def create_poll_handler(message: types.Message) -> None:
         and not d.get("team_leads")
     ]
     if not poll_deals:
-        await message.answer("😔 Нет новых игр.", reply_markup=await get_main_menu(uid))
-        await _delete_trigger(message)
+        await _screen("😔 Нет новых игр.", kb=await get_main_menu(uid))
+        with contextlib.suppress(Exception):
+            await message.delete()
         return
 
     # 3) инициализация state
-    state.current_poll_deals        = poll_deals
-    state.current_poll_leader       = uid
+    state.current_poll_deals         = poll_deals
+    state.current_poll_leader        = uid
     state.responses.clear()
     state.distribution_cache.clear()
     state.poll_distribution.clear()
     state.deal_force_closed.clear()
     state.confirmed_users.clear() if hasattr(state, "confirmed_users") else None
     state.current_deal_ready.clear()
-    state.all_ready_notified        = False
+    state.all_ready_notified         = False
     state.personal_report_message_id = None
-    state.coordination_cycle_active = True
-    state.force_closed              = False
+    state.coordination_cycle_active  = True
+    state.force_closed               = False
 
     with contextlib.suppress(Exception):
         await _refresh_menu(uid)
 
-    # 4) публикация опросов (по 8 опций + 2 служебных)
+    # 4) публикация опросов (в рабочем чате)
     def _deal_dt_parts(d: Dict[str, Any]) -> Tuple[str, str]:
-        """Дата всегда из event_datetime/строк, время — ПРЕЖДЕ ВСЕГО из кастомного event_time."""
         dt = d.get("event_datetime")
-        # дата
         date_s = dt.strftime("%d.%m") if isinstance(dt, datetime) else str(d.get("event_date") or "—")
-        # время: приоритет у кастомного поля
         et = str(d.get("event_time") or "").strip()
-        if et:
-            time_s = et
-        elif isinstance(dt, datetime):
-            time_s = dt.strftime("%H:%M")
-        else:
-            time_s = str(d.get("event_time") or "—")
+        time_s = et if et else (dt.strftime("%H:%M") if isinstance(dt, datetime) else str(d.get("event_time") or "—"))
         return date_s, time_s
 
     def _deal_extras(d: Dict[str, Any]) -> Tuple[str, str]:
         pkg = str(d.get("package") or "").strip()
-        # поддерживаем несколько возможных ключей для «бонусов»
-        bonuses = d.get("bonuses")
-        if bonuses is None:
-            bonuses = d.get("bonus")
-        if bonuses is None:
-            bonuses = d.get("extra_bonuses")
-        if bonuses is None:
-            bonuses = d.get("extra_services")
+        bonuses = d.get("bonuses", d.get("bonus", d.get("extra_bonuses", d.get("extra_services"))))
         return pkg, str(bonuses or "").strip()
 
     urgent = any(d["event_datetime"] <= now + timedelta(days=3) for d in poll_deals)
@@ -807,21 +842,18 @@ async def create_poll_handler(message: types.Message) -> None:
             title = _deal_title(d)
             date_s, time_s = _deal_dt_parts(d)
             pkg_s, bonus_s = _deal_extras(d)
-
-            # Формат: "🎉 Игра — дата время пакет бонусы"
             parts: List[str] = [f"🎉 {title} — {date_s} {time_s}"]
             if pkg_s:
                 parts.append(pkg_s)
             if bonus_s:
                 parts.append(bonus_s)
-
             opts.append(truncate(" ".join(parts)))
             idx_map[i] = int(d["id"])
 
         # служебные опции
         opts += ["🚫 Не смогу работать", "🛡️ Могу Администратором"]
 
-        poll = await Bot.get_current().send_poll(
+        poll = await bot.send_poll(
             state.admin_chat_id,
             header,
             opts,
@@ -836,30 +868,22 @@ async def create_poll_handler(message: types.Message) -> None:
         }
         logger.debug("[create_poll] poll sent: id=%s, deals=%s", poll.poll.id, list(idx_map.values()))
 
-        # было:
-    # await message.answer("✅ Опросы отправлены.")
-    # with contextlib.suppress(Exception):
-    #     await _refresh_menu(uid)
-
-    sent_info = await message.answer("✅ Опросы отправлены.")
-    # ✨ Добавим одноразовое сообщение в список на удаление, чтобы «пылесос» его снёс
-    try:
-        if not getattr(state, "messages_to_delete", None):
-            state.messages_to_delete = {}
-        state.messages_to_delete.setdefault(uid, [])
-        mid = getattr(sent_info, "message_id", None)
-        if mid:
-            state.messages_to_delete[uid].append(int(mid))
-    except Exception:
-        pass
-
+    # 5) финальный экран в ЛС лидера: «Опросы отправлены»
+    await _screen("✅ Опросы отправлены.")
     with contextlib.suppress(Exception):
         await _refresh_menu(uid)
-
+    with contextlib.suppress(Exception):
+        await message.delete()
 
 # ════════════════════════════════════════════════════════════════════
-# [4] ОТЧЁТ ЛИДЕРУ / ПРИЁМ ОТВЕТОВ
+# [4] ОТЧЁТ ЛИДЕРУ / ПРИЁМ ОТВЕТОВ — редактирование «на месте»
+# Версия 6.6 · 2025-08-18
+# ────────────────────────────────────────────────────────────────────
+# • Используем _edit_or_send_report() → отчёт не копится в ЛС.
+# • Удаляем только триггер пользователя; «старый отчёт» редактируется.
+# • Остальная логика без изменений: ready-счёт, auto-assign, refresh.
 # ════════════════════════════════════════════════════════════════════
+
 def _merge_keyboards(k1: InlineKeyboardMarkup, k2: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[*(k1.inline_keyboard or []), *(k2.inline_keyboard or [])])
 
@@ -890,7 +914,7 @@ def _counts_ready_for_deal(deal: Dict[str, Any]) -> Tuple[bool, Dict[str, int]]:
     assist_uids = [_slot_uid(dist.get(f"assistant{i}")) for i in range(1, max(0, need_assist) + 1)]
     admin_uid = _slot_uid(dist.get("admin"))
 
-    # инварианта: 1 пользователь = 1 роль → считаем по множествам и вычитаем пересечения
+    # инвариант: 1 пользователь = 1 роль → считаем по множествам и вычитаем пересечения
     ms = [u for u in main_uids if u]
     as_ = [u for u in assist_uids if u]
     as_uniq = [u for u in as_ if u not in ms]
@@ -956,19 +980,13 @@ def _build_report_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows if rows else [[InlineKeyboardButton(text="Обновить", callback_data="poll_back_to_games_list")]])
 
 async def _send_leader_report(leader_id: int) -> None:
-    bot = Bot.get_current()
+    """
+    Обновляет «личный» отчёт лидеру без размножения сообщений:
+    пробуем редактировать, иначе — подчистка и отправка нового.
+    """
     text = await generate_poll_report()
     kb = _build_report_keyboard()
-
-    # подчистка старых сообщений у лидера
-    with contextlib.suppress(TypeError):
-        await delete_previous_private_messages(bot, leader_id, keep=[])
-    with contextlib.suppress(Exception):
-        await delete_previous_private_messages(leader_id, keep=[])  # новая сигнатура
-
-    sent = await bot.send_message(leader_id, text, parse_mode="Markdown", reply_markup=kb)
-    state.personal_report_message_id = sent.message_id
-    state.last_user_messages[leader_id] = [sent]
+    await _edit_or_send_report(leader_id, text, kb)
 
 async def _sync_leader_report(leader_id: Optional[int] = None) -> None:
     """Обратная совместимость: обновить отчёт лидеру (старый коллбэк)."""
@@ -988,6 +1006,12 @@ async def sync_report() -> None:
 
 @router.message(lambda m: (m.text or "") == "📊 Отчёт по опросу")
 async def poll_report_handler(message: types.Message) -> None:
+    """
+    Показывает «Отчёт по опросу» без копий:
+      • права доступа — как раньше,
+      • отчёт редактируется «на месте» (_edit_or_send_report),
+      • триггер пользователя удаляется.
+    """
     uid = message.from_user.id
     ui = await get_user_info(uid) or {}
     if ui.get("role") not in getattr(settings, "ACCESS", {}).get("poll", ["admin", "leader"]):
@@ -999,16 +1023,12 @@ async def poll_report_handler(message: types.Message) -> None:
         await _delete_trigger(message)
         return
 
-    bot = Bot.get_current()
-    with contextlib.suppress(TypeError):
-        await delete_previous_private_messages(bot, uid, keep=[])
-    with contextlib.suppress(Exception):
-        await delete_previous_private_messages(uid, keep=[])
+    # редактируем существующий отчёт или отправляем новый (жёсткая очистка внутри)
+    text = await generate_poll_report()
+    kb = _build_report_keyboard()
+    await _edit_or_send_report(uid, text, kb)
 
-    dash = await bot.send_message(uid, await generate_poll_report(), parse_mode="Markdown", reply_markup=_build_report_keyboard())
-    state.personal_report_message_id = dash.message_id
-    state.last_user_messages[uid] = [dash]
-
+    # обновим меню и удалим триггер
     with contextlib.suppress(Exception):
         await _refresh_menu(uid)
     await _delete_trigger(message)
@@ -1063,6 +1083,10 @@ async def handle_poll_answer(event: types.PollAnswer) -> None:
     scope = impacted if not admin_flag else {int(d.get("id", 0)) for d in (state.current_poll_deals or [])}
     await _check_ready_state(scope)
     asyncio.create_task(_refresh_detail_views(scope, refresh_all=admin_flag))
+
+# История изменений:
+# 2025-08-18 — v6.6: отчёт редактируется «на месте», пылесос устранён; остальное без изменений.
+
 # ════════════════════════════════════════════════════════════════════
 # [4.8] HANDLER: «Замена» из «Мои игры» (mygame_swap_{deal_id})
 # ════════════════════════════════════════════════════════════════════
@@ -1102,15 +1126,16 @@ async def swap_request_handler(callback: types.CallbackQuery) -> None:
     pkg = str((snap or {}).get("package") or "—")
     players = str((snap or {}).get("players") or "—")
 
-    # куда публикуем
-    chat_id = await _resolve_notify_chat_id()
+    # куда публикуем — общий резолвер из SSOT
+    bot = Bot.get_current()
+    chat_id = resolve_notify_chat_id(bot)
     if not chat_id:
         await callback.answer("⚠️ Не настроен чат для объявлений.", show_alert=True)
         logger.error("[swap] no available chat for notify; uid=%s deal=%s", uid, deal_id)
         return
 
     # объявление об открытой замене + кнопка отклика
-    short = await _short_label(uid)
+    short = await short_name(uid)
     text = (
         f"⚠️ {short} просит замену на игру «{title}»\n"
         f"📅 {date_s} · 🕒 {time_s} · 📦 {pkg} · 👥 {players}\n\n"
@@ -1121,8 +1146,6 @@ async def swap_request_handler(callback: types.CallbackQuery) -> None:
             [InlineKeyboardButton(text="✋ Откликнуться", callback_data=f"swap_accept_{deal_id}_{role}")]
         ]
     )
-
-    bot = Bot.get_current()
 
     # запомним открытый запрос замены (первый клик «Откликнуться» выигрывает)
     if not getattr(state, "swap_requests", None):
@@ -1156,7 +1179,7 @@ async def swap_request_handler(callback: types.CallbackQuery) -> None:
     # CRM: убрать подтверждающие теги пользователя и вернуть сделку в «Бронь»
     try:
         from services.amocrm import revert_to_bron_after_swap  # lazy import
-        await revert_to_bron_after_swap(int(deal_id), uid=uid, short_base=await _short_label(uid))
+        await revert_to_bron_after_swap(int(deal_id), uid=uid, short_base=await short_name(uid))
     except Exception as e:
         logger.warning("[swap] CRM revert failed for deal=%s: %s", deal_id, e)
 
@@ -1166,7 +1189,8 @@ async def swap_request_handler(callback: types.CallbackQuery) -> None:
     await _sync_leader_report()
     asyncio.create_task(_refresh_detail_views({int(deal_id)}, refresh_all=False))
 
-# История изменений: 2025-08-15 — логи, приоритет admin_chat, фолбэк в ЛС, обязательный ACK
+# История изменений:
+# 2025-08-18 — выровнено под SSOT: resolve_notify_chat_id (core.utils) + short_name.
 
 # ════════════════════════════════════════════════════════════════════
 # [4.9] HANDLER: «Откликнуться» на замену (swap_accept_{deal_id}_{role})
@@ -1221,15 +1245,17 @@ async def swap_accept_handler(callback: types.CallbackQuery) -> None:
 
     # уведомление в чат
     bot = Bot.get_current()
-    chat_id = await _resolve_notify_chat_id()
+    chat_id = resolve_notify_chat_id(bot)
     if chat_id:
         try:
-            pkg = str(deal.get("package") or "")
-            summary = _team_summary_text(dist, game_name, pkg)
             title = _deal_title(deal)
             dt = deal.get("event_datetime")
             date_s = dt.strftime("%d.%m") if hasattr(dt, "strftime") else str(deal.get("event_date") or "—")
             time_s = str(deal.get("event_time") or "—")
+
+            # Печать состава — строго через SSOT-хелпер
+            summary_lines = await team_bulleted_lines(dist)
+            summary = "\n".join(summary_lines)
 
             text = (
                 "✅ Состав команды обновлён.\n"
@@ -1251,7 +1277,9 @@ async def swap_accept_handler(callback: types.CallbackQuery) -> None:
     with contextlib.suppress(Exception):
         await callback.answer("Спасибо! Вы в составе на эту игру.", show_alert=False)
 
-# История изменений: 2025-08-15 — логи, безопасные уведомления, стабильный ACK
+# История изменений:
+# 2025-08-18 — выровнено под SSOT: resolve_notify_chat_id (core.utils) + team_bulleted_lines для печати состава.
+
 
 # ════════════════════════════════════════════════════════════════════
 # [5] ГОТОВНОСТЬ И УВЕДОМЛЕНИЯ

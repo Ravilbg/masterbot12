@@ -331,7 +331,11 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot, *, force_approved: bo
       • инварианта «1 uid → 1 роль»;
       • стажёр (красный);
       • кнопки «Утвердить/Стоп/Назад».
-    Аргумент force_approved зарезервирован для совместимости разметки.
+
+    ВАЖНО:
+    • Перед показом — жёсткий пылесос delete_previous_private_messages(bot, uid).
+    • Все отправленные сообщения добавляем в state.last_user_messages[uid].
+    • detail-блоки храним в state.detail_blocks[(uid, deal_id)] (utils их затем чистит).
     """
     # Пылесос: в деталях оставляем только текущий блок
     try:
@@ -344,7 +348,10 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot, *, force_approved: bo
     # Поиск сделки в текущем опросе
     deal = next((d for d in (state.current_poll_deals or []) if int(d.get("id") or 0) == deal_id), None)
     if not deal:
-        await bot.send_message(uid, "⚠️ Игра не найдена или уже закрыта.")
+        msg = await bot.send_message(uid, "⚠️ Игра не найдена или уже закрыта.")
+        # даже в случае ошибки положим сообщение в last_user_messages
+        (getattr(state, "last_user_messages", {}) or {}).setdefault(uid, [])
+        state.last_user_messages[uid] = [msg]
         return
 
     g_name = str(deal.get("game_name") or deal.get("name") or "Игра")
@@ -426,7 +433,7 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot, *, force_approved: bo
                 for i in range(1, need + 1):
                     uid0 = _tag_uid(dist.get(f"{prefix}{i}"))
                     if uid0 and (not respondents or uid0 in respondents):
-                        out.append((uid0, ""))
+                        out.append((uid0, ""))  # маркеры добавим ниже
             return out
 
         chosen: List[Tuple[int, str]] = _chosen_from_dist()
@@ -586,12 +593,20 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot, *, force_approved: bo
     )
     msgs.append(await bot.send_message(uid, "\u2060", reply_markup=kb_back))
 
-    # Активный блок деталей — для пылесоса
-    getattr(state, "detail_blocks", {}).setdefault((uid, deal_id), msgs)
-# История изменений:
-# • 2025-08-15 — добавлен параметр force_approved; выровнены пылесос/фолбэки; нормализация тегов до/после автодобора;
-#                аккуратная работа с отсутствующими респондентами; совместимость уведомлений и кнопок.
+    # ── ЯДРО УЧЁТА СООБЩЕНИЙ (для пылесоса) ─────────────────────────
+    # detail_blocks: гарантированно существующий dict
+    db = getattr(state, "detail_blocks", None)
+    if not isinstance(db, dict):
+        db = {}
+    state.detail_blocks = db
+    state.detail_blocks[(uid, deal_id)] = msgs
 
+    # last_user_messages: вся текущая пачка сообщений деталей
+    lum = getattr(state, "last_user_messages", None)
+    if not isinstance(lum, dict):
+        lum = {}
+    state.last_user_messages = lum
+    state.last_user_messages[uid] = list(msgs)
 
 
 # ███ [3] HANDLERS — show / refresh / swap / back

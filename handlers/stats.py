@@ -1,15 +1,12 @@
-"""handlers/stats.py — Статистика по команде / по играм
-─────────────────────────────────────────────────────────────────────────────
-Версия 2.0 · 2025-08-07
+# handlers/stats.py — Статистика по команде / по играм 
+# ─────────────────────────────────────────────────────────────────────────────
+"""
+Версия 2.1 · 2025-08-16
 
-Новая функциональность «📈 Статистика по команде» для роли *poll*:
-1. Кнопка или команда выводит **inline‑список пользователей**.
-2. Выбор пользователя — подробная карточка:
-   • количество игр за 30 дней;
-   • текущий приоритет назначения;
-   • кнопки «🔼 Приоритет» / «🔽 Приоритет».
-3. Везде работают пылесос и «← Назад».
-Старая «📈 Статистика игр» (глобальный список) сохранена командой /stats.
+Что нового
+• Пылесос ЛС перед показом любых экранов статистики (команда/игры).
+• Любой экранный месседж в ЛС сохраняется в state.last_user_messages[uid].
+• Безопасная инициализация state.priorities = {} (не падаем, если нет атрибута).
 """
 
 from __future__ import annotations
@@ -17,6 +14,7 @@ from __future__ import annotations
 # ███ [1] IMPORTS
 # --------------------------------------------------------------------
 import logging
+import contextlib
 from typing import Dict, List
 
 from aiogram import Bot, Router, types
@@ -33,31 +31,61 @@ from services.stats import games_per_leader
 logger = logging.getLogger(__name__)
 router = Router()
 
-# ── callback‑префиксы ───────────────────────────────────────────────
+# ── init safe fields ────────────────────────────────────────────────
+# state.priorities может отсутствовать в ранних сборках → создаём
+try:
+    if not isinstance(getattr(state, "priorities", None), dict):
+        state.priorities = {}
+except Exception:
+    state.priorities = {}
+
+# ── callback-префиксы ───────────────────────────────────────────────
 USER_PREFIX   = "teamstat_user_"
 PRIO_UP       = "teamstat_up_"
 PRIO_DOWN     = "teamstat_down_"
 BACK_TO_LIST  = "teamstat_back"
 
 # ════════════════════════════════════════════════════════════════════
+# [1.5] VACUUM helper (совместим с legacy/new сигнатурами)
+# ════════════════════════════════════════════════════════════════════
+async def _vacuum(uid: int) -> None:
+    """
+    Удаляет старые личные сообщения пользователя. Пробует новую и legacy сигнатуры.
+    """
+    bot = Bot.get_current()
+    # Новая сигнатура: delete_previous_private_messages(uid, keep=[])
+    try:
+        await delete_previous_private_messages(uid, keep=[])
+        return
+    except TypeError:
+        pass
+    except Exception:
+        pass
+    # Legacy сигнатура: delete_previous_private_messages(bot, uid, keep=[])
+    with contextlib.suppress(Exception):
+        await delete_previous_private_messages(bot, uid, keep=[])
+
+# ════════════════════════════════════════════════════════════════════
 # [2] HELPERS
 # ════════════════════════════════════════════════════════════════════
-
 async def _human_name(uid: int) -> str:
     info = await get_user_info(uid) or {}
-    first = info.get("first_name") or "БезИмени"
-    last_i = info.get("last_name_initial", "")
-    return f"{first} {last_i}."
-
+    first = (info.get("first_name") or "БезИмени").strip()
+    last_i = (info.get("last_name_initial") or "").strip()
+    dot = "." if last_i and not last_i.endswith(".") else ""
+    return f"{first} {last_i}{dot}".strip()
 
 def _get_priority(uid: int) -> int:
-    """Возвращает текущий приоритет (0..5). Placeholder → state.priorities."""
-    return state.priorities.get(uid, 0)  # type: ignore[attr-defined]
-
+    """Возвращает текущий приоритет (0..5)."""
+    try:
+        return int((getattr(state, "priorities", {}) or {}).get(uid, 0))
+    except Exception:
+        return 0
 
 def _set_priority(uid: int, delta: int) -> None:
-    state.priorities[uid] = max(0, min(5, _get_priority(uid) + delta))  # type: ignore[attr-defined]
-
+    state.__dict__.setdefault("priorities", {})
+    cur = _get_priority(uid)
+    state.priorities[uid] = max(0, min(5, cur + delta))
 
 async def _team_list_keyboard(uids: List[int]) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -66,7 +94,6 @@ async def _team_list_keyboard(uids: List[int]) -> InlineKeyboardMarkup:
         kb.button(text=name, callback_data=f"{USER_PREFIX}{uid}")
     kb.adjust(1)
     return kb.as_markup()
-
 
 async def _user_detail(uid: int) -> str:
     games_cnt = (await games_per_leader(30)).get(uid, 0)
@@ -77,7 +104,6 @@ async def _user_detail(uid: int) -> str:
         f"🎮 *Игр за 30 дней*: {games_cnt}\n"
         f"⭐️ *Приоритет*: {prio}"
     )
-
 
 def _user_detail_keyboard(uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -90,8 +116,7 @@ def _user_detail_keyboard(uid: int) -> InlineKeyboardMarkup:
 # ════════════════════════════════════════════════════════════════════
 # [3] HANDLERS: СТАТИСТИКА ПО КОМАНДЕ
 # ════════════════════════════════════════════════════════════════════
-
-@router.message(lambda m: m.text and m.text.strip() == "📈 Статистика по команде")
+@router.message(lambda m: (m.text or "").strip() == "📈 Статистика по команде")
 async def team_stats_handler(message: types.Message) -> None:
     uid = message.from_user.id
     ui = await get_user_info(uid) or {}
@@ -104,49 +129,45 @@ async def team_stats_handler(message: types.Message) -> None:
         await message.answer("ℹ️ Нет данных по команде.")
         return
 
-    await delete_previous_private_messages(uid)
+    await _vacuum(uid)
     kb = await _team_list_keyboard(uids)
     sent = await message.answer("📈 *Команда:*", parse_mode="Markdown", reply_markup=kb)
     state.last_user_messages[uid] = [sent]
-    try:
+
+    with contextlib.suppress(Exception):
         await message.delete()
-    except Exception:
-        pass
 
-
-@router.callback_query(lambda c: c.data.startswith(USER_PREFIX))
+@router.callback_query(lambda c: (c.data or "").startswith(USER_PREFIX))
 async def user_detail_handler(callback: types.CallbackQuery) -> None:
     uid = callback.from_user.id
-    target = int(callback.data.split("_")[-1])
+    target = int((callback.data or "").split("_")[-1])
 
-    await delete_previous_private_messages(uid)
+    await _vacuum(uid)
     txt = await _user_detail(target)
     kb = _user_detail_keyboard(target)
     sent = await Bot.get_current().send_message(uid, txt, parse_mode="Markdown", reply_markup=kb)
     state.last_user_messages[uid] = [sent]
     await callback.answer()
 
-
-@router.callback_query(lambda c: c.data in {BACK_TO_LIST})
+@router.callback_query(lambda c: (c.data or "") == BACK_TO_LIST)
 async def back_to_list(callback: types.CallbackQuery) -> None:
     uid = callback.from_user.id
     uids = await get_all_leader_uids()
-    kb = await _team_list_keyboard(uids)
-    await delete_previous_private_messages(uid)
+
+    await _vacuum(uid)
+    kb = await _team_list_keyboard(uids or [])
     sent = await Bot.get_current().send_message(uid, "📈 *Команда:*", parse_mode="Markdown", reply_markup=kb)
     state.last_user_messages[uid] = [sent]
     await callback.answer()
 
-
-@router.callback_query(lambda c: c.data.startswith(PRIO_UP) or c.data.startswith(PRIO_DOWN))
+@router.callback_query(lambda c: (c.data or "").startswith(PRIO_UP) or (c.data or "").startswith(PRIO_DOWN))
 async def priority_change(callback: types.CallbackQuery) -> None:
-    uid = callback.from_user.id
-    data = callback.data
+    data = callback.data or ""
     target = int(data.split("_")[-1])
     delta = 1 if data.startswith(PRIO_UP) else -1
     _set_priority(target, delta)
 
-    # Обновляем карточку
+    # Обновляем карточку на месте (ЛС не «захламляем» дополнительными сообщениями)
     txt = await _user_detail(target)
     kb = _user_detail_keyboard(target)
     await callback.message.edit_text(txt, parse_mode="Markdown", reply_markup=kb)
@@ -155,9 +176,8 @@ async def priority_change(callback: types.CallbackQuery) -> None:
 # ════════════════════════════════════════════════════════════════════
 # [4] СТАРАЯ «СТАТИСТИКА ИГР» (ГЛОБАЛЬНЫЙ СПИСОК)
 # ════════════════════════════════════════════════════════════════════
-
 @router.message(Command("stats"))
-@router.message(lambda m: m.text and m.text.strip() == "📈 Статистика игр")
+@router.message(lambda m: (m.text or "").strip() == "📈 Статистика игр")
 async def show_stats_handler(message: types.Message) -> None:
     uid = message.from_user.id
     ui = await get_user_info(uid) or {}
@@ -173,16 +193,21 @@ async def show_stats_handler(message: types.Message) -> None:
     lines = ["📈 *Статистика за 30 дней:*"]
     for user_id, cnt in sorted(stats.items(), key=lambda kv: (-kv[1], kv[0])):
         lines.append(f"• {(await _human_name(user_id))} — *{cnt}*")
-    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+    # ЛС-экран: пылесос + сохранение сообщения
+    await _vacuum(uid)
+    sent = await message.answer("\n".join(lines), parse_mode="Markdown")
+    state.last_user_messages[uid] = [sent]
+
+    with contextlib.suppress(Exception):
+        await message.delete()
 
 # ════════════════════════════════════════════════════════════════════
-# [5] SELF‑TEST (smoke)
+# [5] SELF-TEST (smoke)
 # ════════════════════════════════════════════════════════════════════
-
 async def _test():
     assert isinstance(await games_per_leader(1), dict)
     print("handlers.stats ✅ tests passed")
-
 
 if __name__ == "__main__":
     import asyncio, logging as _l

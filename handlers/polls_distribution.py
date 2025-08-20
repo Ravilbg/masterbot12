@@ -842,8 +842,8 @@ async def _commit_locked_distribution_to_state(deal_id: int, roles: Dict[str, Li
     all_uids: Set[int] = set()
 
     def _parse_uid_safe(v: Any) -> Optional[int]:
-        u = _slot_uid_from_label(v)
-        return int(u) if isinstance(u, int) else (u if isinstance(u, int) else u)
+        # упрощённо и надёжно
+        return _slot_uid_from_label(v)
 
     for v in slots.values():
         u = _parse_uid_safe(v)
@@ -854,9 +854,14 @@ async def _commit_locked_distribution_to_state(deal_id: int, roles: Dict[str, Li
         idx = state.assigned_index.setdefault(uid, set())
         idx.add(deal_id)
 
+    # ➕ НОВОЕ: коалесцированный редрав «Мои игры» сразу для всех участников
+    with suppress(Exception):
+        q = globals().get("_queue_redraw_my_games")
+        if callable(q):
+            q(all_uids)  # type: ignore[arg-type]
+
     logger.debug("[polls_dist] deal %d locked+committed; slots=%s", deal_id, slots)
     return slots
-
 
 # ════════════════════════════════════════════════════════════════════
 # [1] INLINE-КЛАВИАТУРА (резерв под действия)
