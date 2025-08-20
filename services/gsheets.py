@@ -73,40 +73,7 @@ _AUTH_COOLDOWN_MINUTES = 15
 
 
 # ███ [1] CONFIG / CREDS
-# ███ [1] CONFIG / CREDS
 # --------------------------------------------------------------------
-import json
-import logging
-import os
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
-
-import gspread
-from google.auth.exceptions import GoogleAuthError, RefreshError
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-
-from core.config import settings
-
-logger = logging.getLogger(__name__)
-
-_AUTH_COOLDOWN_MINUTES = 15
-_CACHE_TTL_HOURS = 24
-
-# Единое хранилище состояния «Светофора»
-_svetofor: Dict[str, Any] = {
-    "sheet": None,
-    "service": None,
-    "spreadsheet_id": None,
-    "rows": None,
-    "headers": None,
-    "last_refresh": None,
-    "cooldown_until": None,
-    "scopes": None,
-    "init_error": None,
-}
-
-
 def _normalize_scopes(raw: Any) -> List[str]:
     """Возвращает валидный список скоупов spreadsheets.*, иначе readonly."""
     readonly = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
@@ -195,8 +162,9 @@ def _load_credentials_info() -> Dict[str, Any]:
 
     raise RuntimeError("[gsheets] Не найден ключ сервисного аккаунта: GOOGLE_CREDENTIALS_FILE/JSON")
 
+# История изменений (блок [1]):
+# 2025-08-18 — удалены дубли импортов/констант/стейта; оставлены только функции (выровнено под SSOT).
 
-# ███ [2] INIT / LOAD
 # ███ [2] INIT / LOAD
 # --------------------------------------------------------------------
 def _init_svetofor() -> None:
