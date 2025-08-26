@@ -88,7 +88,7 @@ def truncate(text: Union[str, None], max_len: int = 200) -> str:
     return s[: max(0, max_len - 1)].rstrip() + "…"
 
 
-# ███ [2] ИМЕНА И ФОРМАТЫ — SSOT
+# ███ [2] ИМЕНА/РОЛИ/ФОРМАТИРОВАНИЕ
 # --------------------------------------------------------------------
 def format_short_name(first_name: Optional[str], last_name: Optional[str]) -> str:
     """
@@ -103,7 +103,6 @@ def format_short_name(first_name: Optional[str], last_name: Optional[str]) -> st
         return f
     return f"{f} {l[:1]}."  # «Имя Ф.»
 
-
 async def short_name(subject: Union[int, str, Dict[str, Any], None]) -> str:
     """
     Унифицированное «Имя Ф.» по uid, "Имя|uid" или словарю с полями.
@@ -113,55 +112,202 @@ async def short_name(subject: Union[int, str, Dict[str, Any], None]) -> str:
     if subject is None:
         return "Без имени"
 
-    # Слот "Имя Ф.|12345"
     if isinstance(subject, str):
         if "|" in subject:
             left, right = subject.split("|", 1)
             left = (left or "").strip()
             _ = parse_uid(right)  # валидация правой части
             return left or "Без имени"
-        if subject.isdigit():  # Просто "12345"
+        if subject.isdigit():
             subject = int(subject)
         else:
             return (subject or "").strip() or "Без имени"
 
-    # Словарь с first_name/last_name
     if isinstance(subject, dict):
-        return format_short_name(subject.get("first_name"), subject.get("last_name"))
+        fn = (subject.get("first_name") or "").strip()
+        ln = (subject.get("last_name") or "").strip()
+        li = (subject.get("last_name_initial") or (ln[:1] if ln else "")).strip()
+        if fn and li:
+            return f"{fn} {li}."
+        if fn or ln:
+            return format_short_name(fn, ln)
+        return "Без имени"
 
-    # uid: запросим профиль (поддержка sync/async get_user_info)
     if isinstance(subject, int):
         try:
             ui = get_user_info(subject)
             if asyncio.iscoroutine(ui):
                 ui = await ui  # type: ignore[func-returns-value]
-            if isinstance(ui, dict) and (ui.get("first_name") or ui.get("last_name")):
-                return format_short_name(ui.get("first_name"), ui.get("last_name"))
+            if isinstance(ui, dict):
+                fn = (ui.get("first_name") or "").strip()
+                ln = (ui.get("last_name") or "").strip()
+                li = (ui.get("last_name_initial") or (ln[:1] if ln else "")).strip()
+                if fn and li:
+                    return f"{fn} {li}."
+                if fn or ln:
+                    return format_short_name(fn, ln)
         except Exception as e:  # pragma: no cover
             logger.debug("[short_name] get_user_info failed for %s: %s", subject, e)
         return f"uid:{subject}"
 
     return "Без имени"
 
-
 def role_suffix(role: str, index: Optional[int] = None) -> str:
     """
-    Возвращает суффикс роли для уведомлений:
-    main -> .1/.2 (по index),
-    assist -> .1/.2,
-    admin -> .Адм,
-    trainee -> .Стаж
+    Возвращает СУФФИКС роли БЕЗ дополнительной точки:
+    • main  → "1"
+    • assist→ "2"
+    • admin → "Адм"
+    • trainee → "Стаж"
+    Итог: «Имя Ф.» + SUFFIX = «Имя Ф.1/2/Адм/Стаж» (без «двойной точки»).
     """
     r = (role or "").lower()
-    if r in ("main", "assist"):
-        if index is None:
-            return ""
-        return f".{index}"
+    if r == "main":
+        return "1"
+    if r == "assist":
+        return "2"
     if r == "admin":
-        return ".Адм"
+        return "Адм"
     if r == "trainee":
+        return "Стаж"
+    return ""
+
+# История изменений:
+# • 2025-08-20 — Учтён last_name_initial; суффиксы ролей без лишней точки (исключена «двойная точка»).
+# ███ [2.5] ДАТЫ/ВРЕМЯ — short_dt()
+# --------------------------------------------------------------------
+from datetime import datetime, date as _date
+
+def short_dt(value: Any) -> str:
+    """
+    Короткий формат даты/времени для заголовков деталей:
+    • datetime → 'ДД.ММ HH:MM'
+    • date     → 'ДД.ММ'
+    • ISO-строки ('YYYY-MM-DD', 'YYYY-MM-DD HH:MM', '...T...') → авторазбор
+    • Иные строки возвращаем как есть; None → '—'
+
+    Функция НЕ меняет таймзону и НЕ «обнуляет» время — просто форматирует то,
+    что пришло из кастомного поля сделки.
+    """
+    if value is None:
+        return "—"
+
+    # 1) datetime → 'ДД.ММ HH:MM'
+    if isinstance(value, datetime):
+        return value.strftime("%d.%m %H:%M")
+
+    # 2) date → 'ДД.ММ'
+    if isinstance(value, _date):
+        return value.strftime("%d.%m")
+
+    # 3) строки: пробуем ISO, потом простые шаблоны
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return "—"
+        # Попытка ISO: 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM:SS', 'YYYY-MM-DD HH:MM'
+        try:
+            # fromisoformat понимает и '+03:00', и микросекунды
+            iso = s.replace("T", " ")
+            dt = datetime.fromisoformat(iso)
+            if dt.time() == datetime.min.time():
+                return dt.strftime("%d.%m")
+            return dt.strftime("%d.%m %H:%M")
+        except Exception:
+            pass
+
+        # Простой 'ДД.MM[.ГГГГ]' → вернем 'ДД.ММ'
+        m = re.search(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?", s)
+        if m:
+            dd, mm = int(m.group(1)), int(m.group(2))
+            return f"{dd:02}.{mm:02}"
+
+        return s  # оставляем как есть
+
+    # 4) всё остальное → str()
+    return str(value)
+
+# ███ [2.x] СУФФИКСЫ РОЛЕЙ И СТРОКИ КОМАНДЫ
+# --------------------------------------------------------------------
+from typing import Any, Dict, List, Optional
+
+def role_suffix(role: str, index_in_role: Optional[int] = None) -> str:
+    """
+    Канонические суффиксы ролей для тегов/ярлыков:
+    • main/lead  → '.1'
+    • assist     → '.2'
+    • admin      → '.Адм'
+    • trainee    → '.Стаж'
+    index_in_role игнорируем намеренно: по стандарту у ассистентов всегда '.2',
+    у ведущих — '.1', независимо от порядкового номера слота.
+    """
+    r = (role or "").lower()
+    if r in {"main", "lead", "leader"}:
+        return ".1"
+    if r in {"assist", "assistant", "helper"}:
+        return ".2"
+    if r in {"admin", "administrator", "админ", "adm"}:
+        return ".Адм"
+    if r in {"trainee", "intern", "стаж", "стажер", "стажёр"}:
         return ".Стаж"
     return ""
+
+async def team_bulleted_lines(
+    roles_or_slots: Dict[str, Any],
+    prefer_slot_names: bool = True,
+) -> List[str]:
+    """
+    Строит строки команды для уведомлений.
+
+    Если prefer_slot_names=True — сначала пытаемся взять имя из слота "имя|uid",
+    чтобы не делать лишних запросов к профилю. Если имени нет — обращаемся к БД.
+
+    Поддерживает оба формата входа: роли и слоты.
+    """
+    lines: List[str] = []
+
+    # Если это не нормализованные роли — считаем, что пришли слоты (для имён)
+    slots: Dict[str, Any] = {}
+    if not all(k in roles_or_slots for k in ("main", "assist", "admin")):
+        slots = dict(roles_or_slots)
+
+    # Нормализуем uid-списки
+    norm = normalize_roles(roles_or_slots)
+
+    async def _name_from_uid_or_slot(uid: int, slot_key: Optional[str], index_in_role: Optional[int], role: str) -> str:
+        # 1) если стоит флаг и есть слот — используем имя слева
+        if prefer_slot_names and slot_key and slot_key in slots:
+            val = slots.get(slot_key)
+            if isinstance(val, str):
+                left = val.split("|", 1)[0].strip()
+                n = (left or "...")
+                return f"{n}{role_suffix(role, index_in_role)}"
+        # 2) иначе — short_name(uid)
+        n = await short_name(uid)
+        return f"{n}{role_suffix(role, index_in_role)}"
+
+    # MAIN
+    for i, uid in enumerate(norm["main"], start=1):
+        skey = f"lead{i}"
+        lines.append(f"• {await _name_from_uid_or_slot(uid, skey, i, 'main')}")
+
+    # ASSIST
+    for i, uid in enumerate(norm["assist"], start=1):
+        skey = f"assistant{i}"
+        lines.append(f"• {await _name_from_uid_or_slot(uid, skey, i, 'assist')}")
+
+    # ADMIN
+    for i, uid in enumerate(norm["admin"], start=1):
+        lines.append(f"• {await _name_from_uid_or_slot(uid, 'admin', None, 'admin')}")
+
+    # TRAINEE (не влияет на комплектность, но печатаем, если есть)
+    for i, uid in enumerate(norm.get("trainee", []), start=1):
+        lines.append(f"• {await _name_from_uid_or_slot(uid, 'trainee', None, 'trainee')}")
+
+    return lines
+
+# История изменений:
+# • 2025-08-20 — добавлен role_suffix(...) в блок; исправлен UndefinedVariable в team_bulleted_lines.
 
 
 # ███ [3] UID / ПАРСИНГ / НОРМАЛИЗАЦИЯ
@@ -521,6 +667,115 @@ async def delete_previous_private_messages(*args, **kwargs) -> None:
 # История изменений:
 # 2025-08-18 • v7.5 — вакуум автоматически сохраняет сообщение главного меню (menu_message_id).
 
+# ════════════════════════════════════════════════════════════════════
+# [7.1] TEAM LINES — bullets for notifications (SSOT)
+# ════════════════════════════════════════════════════════════════════
+
+import re
+from typing import Any, Dict, List, Tuple
+
+# Короткие суффиксы ролей — как в SSOT
+_ROLE_SUFFIXES: Dict[str, str] = {
+    "lead": ".1",
+    "assistant": ".2",
+    "admin": ".Адм",
+    "trainee": ".Стаж",
+}
+
+# распознаём уже прилипший суффикс в конце строки имени
+_SUFFIX_RE = re.compile(r"(?:\.(?:1|2|Адм|Стаж))\s*$", re.IGNORECASE)
+
+def _role_of_slot(slot_key: str) -> Tuple[str, str]:
+    """
+    Возвращает пару (role, suffix) для ключа слота.
+    lead1/lead2 → ('lead', '.1'), assistant1 → ('assistant', '.2'), admin → ('admin', '.Адм'), trainee → ('trainee', '.Стаж')
+    """
+    s = (slot_key or "").lower()
+    if s.startswith("lead"):
+        return "lead", _ROLE_SUFFIXES["lead"]
+    if s.startswith("assistant"):
+        return "assistant", _ROLE_SUFFIXES["assistant"]
+    if s == "admin":
+        return "admin", _ROLE_SUFFIXES["admin"]
+    if s == "trainee":
+        return "trainee", _ROLE_SUFFIXES["trainee"]
+    # дефолт: без суффикса
+    return "", ""
+
+def _extract_human(value: Any) -> str:
+    """
+    Из значения слота берём человекочитаемую часть:
+    'Имя Ф.1|12345' → 'Имя Ф.1', 'Имя Ф.|12345' → 'Имя Ф.'
+    """
+    if isinstance(value, str):
+        return value.split("|", 1)[0].strip()
+    return ""
+
+def _strip_existing_suffix(human: str) -> str:
+    """
+    Снимаем ранее добавленный суффикс (.1/.2/.Адм/.Стаж) в конце,
+    чтобы не было дублей. Также схлопываем повторные точки ('..' → '.').
+    """
+    h = _SUFFIX_RE.sub("", human or "").strip()
+    while ".." in h:
+        h = h.replace("..", ".")
+    return h
+
+def _join_name_and_suffix(human: str, suffix: str) -> str:
+    """
+    Склеиваем имя и суффикс без двойной точки.
+    Если human оканчивается на '.', а suffix начинается с '.', берём suffix без ведущей точки.
+    """
+    if not suffix:
+        return human
+    if human.endswith(".") and suffix.startswith("."):
+        return f"{human}{suffix[1:]}"
+    return f"{human}{suffix}"
+
+async def team_bulleted_lines(slots: Dict[str, Any]) -> List[str]:
+    """
+    Формирует строки состава с буллитами.
+    Пример:
+      • Равиль Ш.1
+      • Алиса С.2
+      • Анна М.Адм
+    Правила:
+      — суффиксы ролей: .1 (ведущий), .2 (помощник), .Адм, .Стаж — как в SSOT;
+      — удаляем уже прилипший суффикс, чтобы не было «..1»;
+      — значения слотов читаем только до «|uid».
+    """
+    if not isinstance(slots, dict):
+        return []
+
+    lines: List[str] = []
+
+    # порядок вывода: lead*, assistant*, admin, trainee
+    ordered_keys: List[str] = []
+    ordered_keys += [k for k in sorted(slots.keys()) if str(k).startswith("lead")]
+    ordered_keys += [k for k in sorted(slots.keys()) if str(k).startswith("assistant")]
+    if "admin" in slots:
+        ordered_keys.append("admin")
+    if "trainee" in slots:
+        ordered_keys.append("trainee")
+
+    for key in ordered_keys:
+        raw = slots.get(key)
+        human_raw = _extract_human(raw)
+        if not human_raw:
+            continue
+
+        role, suffix = _role_of_slot(str(key))
+        # 1) убираем прежний суффикс (если он вдруг уже в имени)
+        base = _strip_existing_suffix(human_raw)
+        # 2) аккуратно добавляем правильный суффикс без двойной точки
+        with_suffix = _join_name_and_suffix(base, suffix)
+        lines.append(f"• {with_suffix}")
+
+    return lines
+
+# История изменений:
+# 2025-08-24 — v7.1: добавлена защита от «двойной точки» в имени при склейке суффикса роли;
+#                    снятие ранее прилипшего суффикса; стабильный порядок строк (lead→assist→admin→trainee).
 
 
 
