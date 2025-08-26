@@ -1620,20 +1620,15 @@ async def render_detail_legacy(uid: int, deal_id: int, *_, **__) -> None:
 #                refresh_deal_details — патч по индексам, точечные пересоздания, без «массового» delete;
 #                разбито на подпункты 2.1.1–2.1.7; фиксы Pylance/тайпинги; «тихая замена» стабилизирована.
 
-# ███ [2.6] SWAP (альтернативы) — ручное назначение кандидата на роль (с РОКИРОВКОЙ, SSOT-uid)
+# ███ [2.6] SWAP (альтернативы) — ручное назначение кандидата на роль (с УМНОЙ РОКИРОВКОЙ)
 # --------------------------------------------------------------------
 @router.callback_query(lambda c: c.data and c.data.startswith("swap_"))
 async def poll_swap_handler(callback: types.CallbackQuery) -> None:
     """
-    Переназначение из альтернатив с интеллектуальной рокировкой и защитой MAIN:
-    callback.data = 'swap_{deal_id}_{role_target}_{uid}'
-
-    Правила:
-      • MAIN (ведущий) — только 🟢; ASSIST (помощник) — 🟢/🟡; ADMIN — только is_admin_eligible=True.
-      • «Липкий ведущий»: если пользователь уже стоит на MAIN, уводить его в другую роль можно
-        только если есть другой подходящий кандидат на MAIN. Иначе — no-op (alert).
-      • Инвариант «1 uid → 1 роль» сохраняется; вытеснённый садится в прежний слот выбранного,
-        если подходит по «Светофору».
+    Переназначение из альтернатив с защитой ролей:
+    • Нельзя уводить человека из его роли, если в эту (прежнюю) роль некем заменить.
+    • MAIN — только 🟢; ASSIST — 🟢/🟡; ADMIN — только is_admin_eligible=True.
+    • Если целевой слот занят — вытеснённый не теряется: либо участвует в swap, либо пересаживается.
     """
     with contextlib.suppress(Exception):
         await callback.answer()  # быстрый ACK
@@ -1656,7 +1651,7 @@ async def poll_swap_handler(callback: types.CallbackQuery) -> None:
             await callback.answer("🔒 Состав уже утверждён.", show_alert=True)
         return
 
-    # ── 2) Достаём сделку и конфиг ролей
+    # ── 2) Сделка и конфиг ролей
     deal = next((d for d in (state.current_poll_deals or []) if int(d.get("id") or 0) == deal_id), None)
     if not deal:
         with contextlib.suppress(Exception):
@@ -1667,14 +1662,13 @@ async def poll_swap_handler(callback: types.CallbackQuery) -> None:
     need_main = int(cfg.get("main_leaders", 1))
     need_assist = int(cfg.get("assistants", 0))
 
-    # ── 3) Текущий кэш распределения
+    # ── 3) Дистрибуция (копия) + утилиты
     dist_all = getattr(state, "distribution_cache", {}) or {}
-    dist: Dict[str, str] = dict(dist_all.get(str(deal_id)) or {})
+    dist: Dict[str, Any] = dict(dist_all.get(str(deal_id)) or {})
 
-    # ── 4) Утилиты
     def uid_of(val: Any) -> Optional[int]:
         try:
-            u = _parse_uid(val)
+            u = _parse_uid(val)  # общий SSOT/локальный парсер
             return int(u) if u is not None else None
         except Exception:
             return None
@@ -1684,24 +1678,34 @@ async def poll_swap_handler(callback: types.CallbackQuery) -> None:
         for k in ("admin", "trainee"):
             if uid_of(str(dist.get(k) or "")) == uid:
                 return ("admin" if k == "admin" else "trainee"), k
-        for i in range(1, max(need_main, 1) + 5):
-            key = f"lead{i}"
-            if uid_of(str(dist.get(key) or "")) == uid:
-                return "main", key
-        for i in range(1, max(need_assist, 0) + 5):
-            key = f"assistant{i}"
-            if uid_of(str(dist.get(key) or "")) == uid:
-                return "assist", key
+        for i in range(1, max(need_main, 1) + 20):
+            k = f"lead{i}"
+            if uid_of(str(dist.get(k) or "")) == uid:
+                return "main", k
+        for i in range(1, max(need_assist, 0) + 20):
+            k = f"assistant{i}"
+            if uid_of(str(dist.get(k) or "")) == uid:
+                return "assist", k
         return None, None
 
     def _first_free(prefix: str, max_needed: int) -> Optional[str]:
         if max_needed <= 0:
             return None
         for i in range(1, max_needed + 1):
-            key = f"{prefix}{i}"
-            if not str(dist.get(key) or "").strip():
-                return key
+            k = f"{prefix}{i}"
+            if not str(dist.get(k) or "").strip():
+                return k
         return None
+
+    def _next_index(prefix: str) -> int:
+        nums = []
+        for k in dist.keys():
+            if isinstance(k, str) and k.startswith(prefix):
+                with contextlib.suppress(Exception):
+                    n = int("".join(ch for ch in k if ch.isdigit()) or "0")
+                    if n > 0:
+                        nums.append(n)
+        return (max(nums) + 1) if nums else 1
 
     def _target_slot_and_displaced(role: str) -> Tuple[str, Optional[int]]:
         if role == "admin":
@@ -1712,12 +1716,12 @@ async def poll_swap_handler(callback: types.CallbackQuery) -> None:
             free = _first_free("lead", need_main)
             if free:
                 return free, None
+            # штатных мест нет — займём крайний и вытесним его владельца
             last_key = None
-            for i in range(need_main, 0, -1):
+            for i in range(max(need_main, 1), 0, -1):
                 k = f"lead{i}"
                 if uid_of(str(dist.get(k) or "")) is not None:
-                    last_key = k
-                    break
+                    last_key = k; break
             last_key = last_key or "lead1"
             return last_key, uid_of(str(dist.get(last_key) or ""))
         if role == "assist":
@@ -1725,16 +1729,15 @@ async def poll_swap_handler(callback: types.CallbackQuery) -> None:
             if free:
                 return free, None
             last_key = None
-            for i in range(need_assist, 0, -1):
+            for i in range(max(need_assist, 1), 0, -1):
                 k = f"assistant{i}"
                 if uid_of(str(dist.get(k) or "")) is not None:
-                    last_key = k
-                    break
+                    last_key = k; break
             last_key = last_key or "assistant1"
             return last_key, uid_of(str(dist.get(last_key) or ""))
         return "trainee", uid_of(str(dist.get("trainee") or ""))
 
-    # Пул откликнувшихся (для проверок «Светофора» и admin-eligibility)
+    # Пул откликнувшихся (для светофора/админа)
     respondents: Dict[int, Dict[str, Any]] = {}
     for pdata in (state.responses or {}).values():
         for u in (pdata.get("deals", {}).get(deal_id, []) or []):
@@ -1762,45 +1765,51 @@ async def poll_swap_handler(callback: types.CallbackQuery) -> None:
                 out.add(u)
         return out
 
-    # ── 5) Где стоит выбранный сейчас?
-    role_old, slot_old = _find_user_slot(uid_alt)
+    async def _find_replacement(for_role: str, *, exclude: Set[int]) -> Optional[int]:
+        """Поиск любого нераспределённого подходящего кандидата в указанную роль."""
+        assigned = _all_assigned_uids()
+        for u in respondents.keys():
+            if u in exclude or u in assigned:
+                continue
+            if await _fits(u, for_role):
+                return u
+        return None
 
+    # ── 4) Текущее положение выбранного
+    role_old, slot_old = _find_user_slot(uid_alt)
     if role_old == role_target:
         with contextlib.suppress(Exception):
             await callback.answer("Уже назначен.", show_alert=False)
         return
 
-    # ── 6) Серверная проверка: выбранный подходит целевой роли?
+    # ── 5) Серверная проверка соответствия целевой роли
     if not await _fits(uid_alt, role_target):
         with contextlib.suppress(Exception):
             await callback.answer("⛔ Не подходит для этой роли.", show_alert=True)
         return
 
-    # ── 7) Целевой слот и потенциально вытесняемый
+    # ── 6) Целевой слот и потенциально вытесняемый
     slot_target, displaced_uid = _target_slot_and_displaced(role_target)
 
-    # ── 8) «Липкий ведущий»: защищаем MAIN
-    if role_old == "main" and role_target != "main":
-        has_alt_main = False
-
-        if displaced_uid and await _fits(displaced_uid, "main"):
-            has_alt_main = True
-
-        if not has_alt_main:
-            assigned = _all_assigned_uids()
-            for u in respondents.keys():
-                if u == uid_alt or u in assigned:
-                    continue
-                if await _fits(u, "main"):
-                    has_alt_main = True
-                    break
-
-        if not has_alt_main:
+    # ── 7) Требование замены прежней роли (умная рокировка для всех core-ролей)
+    sticky_roles = {"main", "assist", "admin"}  # trainee не обязателен
+    replacement_uid: Optional[int] = None
+    if role_old in sticky_roles and role_old != role_target:
+        # сначала — пробуем вытеснённого (если он подходит в прежнюю роль, получится "чистый swap")
+        if displaced_uid and await _fits(displaced_uid, role_old):
+            replacement_uid = displaced_uid
+        else:
+            # ищем любого другого нераспределённого подходящего
+            replacement_uid = await _find_replacement(
+                role_old, exclude={uid_alt, displaced_uid} if displaced_uid else {uid_alt}
+            )
+        if not replacement_uid:
             with contextlib.suppress(Exception):
-                await callback.answer("⚠️ Нельзя уводить единственного подходящего ведущего — нет другого 🟢.", show_alert=True)
+                await callback.answer("⚠️ Нет подходящего кандидата для замены в прежней роли — перенос отменён.", show_alert=True)
             return
 
-    # ── 9) Снимаем выбранного из всех мест
+    # ── 8) Применение изменений (после того, как план валиден)
+    # 8.1 снимаем выбранного из всех мест
     for k, v in list(dist.items()):
         if not isinstance(k, str):
             continue
@@ -1809,41 +1818,50 @@ async def poll_swap_handler(callback: types.CallbackQuery) -> None:
         if uid_of(str(v)) == uid_alt:
             dist[k] = ""
 
-    # ── 10) Ставим выбранного в целевой слот (formatter: _fmt из файла)
+    # 8.2 ставим выбранного в целевой слот
     dist[slot_target] = await _fmt(uid_alt, role_target)
 
-    # ── 11) Рокировка: вытеснённого — в прежний слот выбранного (если подходит)
-    if displaced_uid and role_old in {"main", "assist", "admin", "trainee"}:
-        if await _fits(displaced_uid, role_old):
-            if slot_old:
-                dist[slot_old] = await _fmt(displaced_uid, role_old)
-            else:
-                if role_old == "admin":
-                    dist["admin"] = await _fmt(displaced_uid, "admin")
-                elif role_old == "main":
-                    free = _first_free("lead", need_main)
-                    if free:
-                        dist[free] = await _fmt(displaced_uid, "main")
-                elif role_old == "assist":
-                    free = _first_free("assistant", need_assist)
-                    if free:
-                        dist[free] = await _fmt(displaced_uid, "assist")
-                elif role_old == "trainee":
-                    dist["trainee"] = await _fmt(displaced_uid, "trainee")
+    # 8.3 ставим замену в прежний слот (если требуется)
+    if replacement_uid and role_old and slot_old:
+        dist[slot_old] = await _fmt(replacement_uid, role_old)
 
-    # ── 12) Инварианты и нормализация
+    # 8.4 если целевой слот был занят и для замены использовали НЕ его владельца —
+    #      пересадим вытеснённого так, чтобы не потерять
+    if displaced_uid and replacement_uid != displaced_uid:
+        if role_target == "main":
+            # попытка оставить как ассистента, если он и был ассистентом (слот_target lead*, displaced был из другого lead)
+            # но логичнее посадить по семейству роли ЦЕЛИ (main) — он её занимал, значит подходит
+            free = _first_free("lead", need_main)
+            if free:
+                dist[free] = await _fmt(displaced_uid, "main")
+            else:
+                dist[f"lead{_next_index('lead')}"] = await _fmt(displaced_uid, "main")
+        elif role_target == "assist":
+            free = _first_free("assistant", need_assist)
+            if free:
+                dist[free] = await _fmt(displaced_uid, "assist")
+            else:
+                dist[f"assistant{_next_index('assistant')}"] = await _fmt(displaced_uid, "assist")
+        elif role_target == "admin":
+            # админ — один; попробуем фолбэк в помощники, если подходит
+            if await _fits(displaced_uid, "assist"):
+                free = _first_free("assistant", need_assist)
+                if free:
+                    dist[free] = await _fmt(displaced_uid, "assist")
+                else:
+                    dist[f"assistant{_next_index('assistant')}"] = await _fmt(displaced_uid, "assist")
+            # иначе — оставляем нераспределённым
+
+    # ── 9) Инварианты и нормализация
     await _ensure_single_role(dist, need_main, need_assist)
     await _normalize_tag_texts(dist, need_main, need_assist)
 
-    # ── 13) Сохранить и «тихо» перерисовать
+    # ── 10) Сохранить и «тихо» перерисовать
     state.distribution_cache[str(deal_id)] = dist
     await refresh_deal_details(bot=Bot.get_current(), deal_id=deal_id, uid=callback.from_user.id)
     with contextlib.suppress(Exception):
         await callback.answer("✅ Обновлено")
 
-# История изменений [2.6]:
-# • 2025-08-26 — Пайланс-фикс: убран _format_slot_label, используем глобальный _fmt; «липкий» MAIN;
-#                 серверные проверки статуса; выравнено под SSOT.
 
 
 
