@@ -893,6 +893,121 @@ __all__ = [
     "revert_to_bron_after_swap",
     "get_deal_brief_strings",
 ]
+# ════════════════════════════════════════════════════════════════════
+# [5.7] MONTHLY: счётчики подтверждений по тегам за прошедший месяц
+# ════════════════════════════════════════════════════════════════════
+async def get_monthly_role_tag_counters(
+    period_start: Optional[datetime] = None,
+    period_end: Optional[datetime] = None,
+) -> Dict[int, int]:
+    """
+    Возвращает {uid: count} — сколько раз пользователь фигурировал в подтверждающих тегах
+    ('.1' / '.2' / '.Адм') за ПРОШЕДШИЙ календарный месяц. Если переданы period_start/period_end —
+    используем их (MSK), иначе считаем границы автоматически.
+
+    Алгоритм:
+      1) Строим границы периода (по МСК), если не заданы.
+      2) Грузим нормализованные сделки (get_amocrm_deals), фильтруем по event_datetime ∈ [start, end).
+      3) По всем лидерам строим обратный индекс: «нормализованный тег» → uid
+         (используем _get_short_base_from_uid + _build_expected_user_tags).
+      4) Для каждой сделки берём текущие теги (_get_current_tags_for_deal) и инкрементим счётчики.
+         На сделку пользователя считаем максимум 1 раз (даже если теги '.1' и '.Адм' обе присутствуют).
+
+    Безопасность:
+      • В offline-режиме (нет settings.state.config.domain) вернёт пустой словарь.
+      • Ошибки сетевых вызовов — логируются и пропускаются (не падаем).
+    """
+    cfg: Dict[str, Any] = getattr(state, "config", {}) or {}
+    if not cfg.get("domain"):
+        return {}
+
+    # 1) Границы периода: прошедший календарный месяц
+    now = datetime.now(tz=MSK_TZ)
+    if period_start is None or period_end is None:
+        first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        last_prev = first_this - timedelta(seconds=1)
+        first_prev = last_prev.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        period_start = period_start or first_prev
+        period_end = period_end or first_this
+
+    # 2) Выгрузим сделки и отфильтруем по окну дат (по кастомному полю event_datetime)
+    try:
+        deals = await get_amocrm_deals()  # type: ignore[name-defined]
+    except Exception as exc:
+        logger.warning("[Amo] monthly counters: get_amocrm_deals failed: %s", exc)
+        deals = []
+
+    def _in_range(d: Dict[str, Any]) -> bool:
+        dt = d.get("event_datetime")
+        return isinstance(dt, datetime) and (period_start <= dt < period_end)  # type: ignore[operator]
+
+    deals_in_period = [d for d in (deals or []) if _in_range(d)]
+    if not deals_in_period:
+        return {}
+
+    # 3) Обратный индекс по тегам: «Имя Ф.»-варианты → uid
+    try:
+        from core.db import get_all_leader_uids  # type: ignore
+    except Exception:
+        async def get_all_leader_uids() -> List[int]:  # type: ignore
+            return []
+
+    # Импорт локальных хелперов из этого же модуля
+    # (_build_expected_user_tags, _normalize_tag_name, _get_short_base_from_uid, _get_current_tags_for_deal)
+    name_to_uid: Dict[str, int] = {}
+    try:
+        uids = await get_all_leader_uids()
+    except Exception:
+        uids = []
+
+    for uid in (uids or []):
+        try:
+            base = await _get_short_base_from_uid(int(uid))  # "Имя Ф"
+        except Exception:
+            base = ""
+        if not base:
+            continue
+        for variant in _build_expected_user_tags(f"{base}."):
+            name_to_uid[_normalize_tag_name(variant)] = int(uid)
+
+    if not name_to_uid:
+        return {}
+
+    # 4) Пробежимся по сделкам и соберём счётчики
+    counters: Dict[int, int] = {}
+    sem = asyncio.Semaphore(6)
+
+    async def _one(did: int) -> None:
+        async with sem:
+            try:
+                tags = await _get_current_tags_for_deal(did)
+            except Exception:
+                tags = []
+            if not tags:
+                return
+            seen: set[int] = set()
+            for t in tags:
+                uid = name_to_uid.get(_normalize_tag_name(t))
+                if uid and uid not in seen:
+                    counters[uid] = counters.get(uid, 0) + 1
+                    seen.add(uid)
+
+    tasks: List[asyncio.Task] = []
+    for d in deals_in_period:
+        try:
+            did = int(d.get("id", 0))
+        except Exception:
+            did = 0
+        if did:
+            tasks.append(asyncio.create_task(_one(did)))
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    return counters
+
+# История изменений:
+# 2025-08-24 — [5.7] Добавлен get_monthly_role_tag_counters(): счётчики подтверждающих тегов за прошлый месяц.
 
 # ════════════════════════════════════════════════════════════════════
 # [6] SELF-TEST
