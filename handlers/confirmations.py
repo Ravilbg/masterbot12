@@ -3,7 +3,7 @@
 """
 Подтверждения участия ведущими.
 
-Версия v15.7 · 2025-08-19
+Версия v15.9 · 2025-08-24
 ──────────────────────────────────────────────────────────────────────────────
 • SSOT: short_name/to_uid_list/normalize_roles/resolve_notify_chat_id из core.utils.
 • «✅ Подтвердить» ставит персональный тег в AmoCRM (add-only, без перезаписи).
@@ -11,10 +11,11 @@
 • ВАЖНО: Формат тегов строго берётся из locked_distribution → «Имя Ф.1/2/Адм/Стаж».
   (Берём подпись до «|uid», при отсутствии суффикса — аккуратно добавляем.)
 • Локальная отметка кнопки на «✅ Подтверждено» без «прыжков» UI.
-• Уведомление в общий чат — гендер-нейтрально: «✅ Участие подтверждено: Имя Ф. — 🎭 Роль на „Название“ ДД.ММ ЧЧ:ММ».
+• Уведомление в общий чат: «✅ Участие подтверждено: Имя Ф. — 🎭 Роль на „Название“ ДД.ММ ЧЧ:ММ».
 • Проверка полноты подтверждений: CRM-теги → локальный кэш (fallback).
 • Автоперевод в статус «Завершение сделки» — ТОЛЬКО из «Бронь», если все роли подтверждены.
 • Совместимость с aiogram 3.x и Pylance (строгие типы).
+• ФИКС: после подтверждения из «Мои игры» НЕ открываем детали отчёта; редрав только у зрителей деталей.
 """
 
 from __future__ import annotations
@@ -36,14 +37,14 @@ from core.utils import (
     short_name,              # SSOT: «Имя Ф.»
     to_uid_list,             # SSOT: парсинг uid
     normalize_roles,         # SSOT: нормализация ролей/слотов
-    resolve_notify_chat_id,  # SSOT: резолвер общего чата (sync)
+    resolve_notify_chat_id,  # SSOT: резолвер общего чата (sync/async-совм.)
 )
 
 # AmoCRM (универсальные обёртки)
 from services import amocrm as amo  # type: ignore
 from services.amocrm import update_deal_status  # сетевые действия с Amo — через services.amocrm
 
-# Детали сделки — мягкая перерисовка после подтверждения
+# Детали сделки — мягкая перерисовка после подтверждения (только у зрителей)
 try:
     from handlers.poll_details import refresh_deal_details  # type: ignore
 except Exception:  # pragma: no cover
@@ -60,9 +61,11 @@ BRON_STATUS_ID        = str(getattr(settings, "BRON_STATUS_ID", "") or "")
 SUCCESSFUL_STATUS_ID  = str(getattr(settings, "SUCCESSFUL_STATUS_ID", "") or "")
 PRELIM_STATUS_ID      = str(getattr(settings, "PRELIM_STATUS_ID", getattr(settings, "PRELIMINARY_STATUS_ID", "") or "") or "")
 
-# История изменений [0]: 2025-08-18 — выровнено под SSOT, убраны локальные дубли, фиксы Pylance
-#                       2025-08-19 — фикс формата тегов: берём из locked_distribution (подпись до |uid)
-#                       2025-08-19 — перевод в SUCCESS только из «Бронь» (жёсткая проверка статуса)
+# История изменений [0]:
+# 2025-08-18 — выровнено под SSOT, убраны локальные дубли, фиксы Pylance
+# 2025-08-19 — фикс формата тегов: берём из locked_distribution (подпись до |uid)
+# 2025-08-19 — перевод в SUCCESS только из «Бронь» (жёсткая проверка статуса)
+# 2025-08-24 — ФИКС: убран автопереход в детали из «Мои игры», редрав только у зрителей деталей
 
 
 # ███ [0.1] SAFE HELPERS
@@ -162,36 +165,32 @@ def _mark_confirmed_on_message_kb(callback: CallbackQuery, deal_id: int, role: s
 
 
 # ███ [2] AMOCRM HELPERS (add-only теги и перевод статуса)
-# --------------------------------------------------------------------
+# --------------------------------------------------------
 _TEAM_SUFFIXES: Set[str] = {".1", ".2", ".Адм", ".Стаж"}
 
-
 def _is_team_tag(name: str) -> bool:
-    """Командный тег — любой, что оканчивается на один из служебных суффиксов."""
     return bool(name) and any(str(name).endswith(suf) for suf in _TEAM_SUFFIXES)
 
-
 def _suffix_for_role(role: str) -> str:
-    if role == "main":
-        return "1"
-    if role == "assist":
-        return "2"
-    if role == "admin":
-        return "Адм"
+    if role == "main": return "1"
+    if role == "assist": return "2"
+    if role == "admin": return "Адм"
     return "Стаж"
 
-
-async def _amo_add_tag(lead_id: int, tag: str) -> bool:
-    """Добавляет один командный тег в сделку, НЕ затирая ранее поставленные."""
+async def _amo_add_tag(lead_id: int, tag: str, role_key: str = "tag") -> bool:
+    """
+    Добавляет один командный тег в сделку, НЕ затирая существующие.
+    • Используем SSOT: services.amocrm.update_amocrm_tags({"123": {"role_key": "Имя Ф.1"}})
+    • Ключ role_key не влияет на результат (на стороне сервиса берутся values), но сохраняем для читаемости.
+    """
     try:
-        if hasattr(amo, "add_tag_to_lead"):
-            return bool(await amo.add_tag_to_lead(int(lead_id), str(tag)))  # type: ignore[arg-type]
-        if hasattr(amo, "patch_lead"):
-            payload = {"_embedded": {"tags": [{"name": str(tag)}]}}
-            return bool(await amo.patch_lead(int(lead_id), payload))  # type: ignore[arg-type]
+        from services.amocrm import update_amocrm_tags  # lazy import во избежание циклов
+        payload: Dict[str, Dict[str, str]] = {str(int(lead_id)): {str(role_key): str(tag)}}
+        ok = await update_amocrm_tags(payload)
+        return bool(ok)
     except Exception:
         logger.exception("[confirm] add tag failed lead=%s tag=%s", lead_id, tag)
-    return False
+        return False
 
 
 # ███ [2.1] HUMAN LABELS (ИМЯ ДЛЯ ТЕГА) — ИЗ locked_distribution
@@ -416,7 +415,7 @@ async def _maybe_move_to_success(deal_id: int) -> None:
         if int(deal_id) in moved_set:
             return
 
-        # 0) Проверка комплектности
+        # 0) Проверка комплектности ожидаемых тегов
         expected_map: Dict[str, Set[str]] = _expected_tag_map(deal_id)
         expected_required: Set[str] = set()
         for k in ("main", "assist", "admin"):
@@ -446,27 +445,23 @@ async def _maybe_move_to_success(deal_id: int) -> None:
             logger.debug("[confirm] deal %s tags missing: %s", deal_id, ", ".join(sorted(missing)))
             return
 
-        # best-effort: если каких-то тегов нет в CRM — добавим
-        if crm_tags:
-            pass
-        else:
+        # best-effort: если каких-то тегов нет в CRM — добавим (не критично)
+        if not crm_tags:
             to_add = expected_required - crm_tags
             for tag in sorted(to_add):
                 with contextlib.suppress(Exception):
                     await _amo_add_tag(deal_id, tag)
 
-        # 1) Читаем статус сделки (CRM→state), решение строгое:
-        #    — переводим ТОЛЬКО если это «Бронь»;
-        #    — если «Предварительная заявка» или что-то ещё — не переводим.
+        # 1) Читаем статус сделки (CRM→state), решение строгое
         sid, name = await _read_status_info(deal_id)
         if _is_prelim(sid, name):
             can_move = False
         elif _is_bron(sid, name):
             can_move = True
         else:
-            can_move = False  # неизвестный/иной статус — не трогаем
+            can_move = False
 
-        # Уведомление «все подтвердили» (будет отправлено и без перевода)
+        # уведомление «вся команда подтвердила»
         try:
             from handlers.my_games import announce_if_all_confirmed  # type: ignore
         except Exception:
@@ -475,14 +470,12 @@ async def _maybe_move_to_success(deal_id: int) -> None:
             if callable(announce_if_all_confirmed):
                 await announce_if_all_confirmed(int(deal_id))
 
-        if not can_move:
+        if not can_move or not SUCCESSFUL_STATUS_ID:
+            if not SUCCESSFUL_STATUS_ID:
+                logger.warning("[confirm] SUCCESS status id not configured; lead=%s", deal_id)
             return
 
         # 2) Перевод в «Завершение сделки»
-        if not SUCCESSFUL_STATUS_ID:
-            logger.warning("[confirm] SUCCESS status id not configured; lead=%s", deal_id)
-            return
-
         with contextlib.suppress(Exception):
             await update_deal_status(deal_id, int(SUCCESSFUL_STATUS_ID))
             # Локальный кэш: актуализируем статусы в открытках
@@ -517,6 +510,7 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
     4) Меняем кнопку на «✅ Подтверждено», шлём одно уведомление в общий чат.
     5) Если все роли подтверждены (CRM→LOCAL), пробуем перевод в «Завершение сделки»
        (строгая проверка статуса: только из «Бронь»).
+    6) РЕДРАВ ДЕТАЛЕЙ ОТКЛЮЧЁН: никаких перерисовок отчёта/деталей по факту подтверждения.
     """
     uid = int(callback.from_user.id)
     user_role = await _role_of_user_in_locked(uid, deal_id)
@@ -528,7 +522,7 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
     state.__dict__.setdefault("pending_confirmations", {})
     state.__dict__.setdefault("confirmed", {})
 
-    # Идемпотентность
+    # Идемпотентность (CRM → local)
     expected = _expected_tag_map(deal_id)
     crm_tags = await _crm_confirmation_tags(deal_id)
     local = _confirmed_from_state(deal_id)
@@ -547,28 +541,31 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
     tag_text = _label_for_user_from_locked(deal_id, uid, role)
     if not tag_text:
         suffix = _suffix_for_role(role)
-        tag_text = f"{human}.{suffix}" if human.endswith(".") else f"{human}.{suffix}"
+        tag_text = f"{human}{suffix}" if human.endswith(".") else f"{human}.{suffix}"
     with contextlib.suppress(Exception):
         await _amo_add_tag(deal_id, tag_text)
 
-    # Локальная отметка
+    # Локальная отметка (SSOT-поле pending_confirmations)
     pc = state.pending_confirmations.setdefault(deal_id, {})
     if not isinstance(pc.get("confirmed"), dict):
         pc["confirmed"] = {}
     (pc["confirmed"].setdefault(role, set())).add(uid)  # type: ignore[index]
     state.confirmed.setdefault(deal_id, set()).add(uid)
 
-    # Перекраска кнопки
+    # Перекраска кнопки в текущем сообщении
     kb: Optional[InlineKeyboardMarkup] = _mark_confirmed_on_message_kb(callback, deal_id, role)
     with contextlib.suppress(Exception):
         if kb:
             await callback.message.edit_reply_markup(reply_markup=kb)
 
-    # Уведомление о личном подтверждении (тексты уведомлений не меняем)
+    # Уведомление о личном подтверждении (тексты уведомлений НЕ меняем)
     try:
         bot = callback.message.bot if callback.message else None
         if bot:
-            chat_id = resolve_notify_chat_id()
+            try:
+                chat_id = resolve_notify_chat_id(bot)  # type: ignore[arg-type]
+            except TypeError:
+                chat_id = resolve_notify_chat_id()     # type: ignore[call-arg]
             if chat_id is not None:
                 title = _deal_title_from_state(deal_id)
                 d_s, t_s = _deal_when(deal_id)
@@ -581,7 +578,6 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
 
                 base = f"✅ Участие подтверждено: {human} — {r} {role_human} на «{title}»"
                 text = f"{base} {when}." if when else f"{base}."
-
                 notified: Set[Tuple[int, int, str]] = state.__dict__.setdefault("_confirm_notified", set())  # type: ignore[assignment]
                 key = (int(deal_id), int(uid), str(role))
                 if key not in notified:
@@ -594,18 +590,23 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
     with contextlib.suppress(Exception):
         await _maybe_move_to_success(deal_id)
 
-    # Мягкая перерисовка деталей (если открыты)
+    # ── РЕДРАВ ДЕТАЛЕЙ ОТКЛЮЧЁН ─────────────────────────────────────
+    # Начиная с 2025-08-24, при подтверждении не перерисовываем «детали отчёта опроса».
+    # Импорт оставляем «использованным», чтобы линтеры не ругались.
     with contextlib.suppress(Exception):
-        if callable(refresh_deal_details):
-            await refresh_deal_details(bot=callback.message.bot, deal_id=deal_id, force_approved=False)
+        _ = refresh_deal_details  # noqa: F401
+        logger.debug("[confirm] skip detail-view refresh on confirm for deal=%s", deal_id)
 
     with contextlib.suppress(Exception):
         await _safe_answer(callback, "Готово ✅")
+
 
 # История изменений [4]:
 # 2025-08-18 — добавлен _maybe_move_to_success; resolve_notify_chat_id — sync (SSOT).
 # 2025-08-19 — при проставлении тега берём подпись из locked_distribution (строго «Имя Ф.Суф»).
 # 2025-08-19 — _maybe_move_to_success: переводить только из «Бронь»; антидубли перевода.
+# 2025-08-24 — отключён редрав деталей при подтверждении (во избежание «прыжка» из «Мои игры»).
+
 
 
 # ███ [4.0] CALLBACK: CONFIRM BUTTON «confirm_role_{deal}_{role}»
@@ -668,9 +669,19 @@ async def confirm_from_mygames_handler(callback: CallbackQuery) -> None:
         await _safe_answer(callback, "Роль не найдена или не назначена на вас.", show_alert=True)
         return
 
+    # Помечаем UI-контекст пользователя — это поможет и другим модулям, если нужно.
+    try:
+        ui = getattr(state, "ui_context", None)
+        if not isinstance(ui, dict):
+            ui = {}
+        ui[int(uid)] = "my_games"
+        state.ui_context = ui  # type: ignore[assignment]
+    except Exception:
+        pass
+
     await _perform_confirm(callback, deal_id, role)
 
-# История изменений [4.1]: 2025-08-18 — без изменений логики; добавлен _safe_answer для устойчивости.
+# История изменений [4.1]: 2025-08-18 — базовая логика; 2025-08-24 — пометка ui_context для «Мои игры».
 
 
 # ███ [99] SELF-TEST (минимальный)
@@ -701,8 +712,7 @@ async def _test() -> None:
     assert _label_for_user_from_locked(1, 202, "assist") == "Петр П.2"
     assert _label_for_user_from_locked(1, 303, "admin") == "Света С.Адм"
 
-    # статус: перевод только из Бронь
-    # имитируем кэш статусов
+    # статус: имитация «Бронь»
     state.current_poll_deals = [{"id": 2, "status_id": int(BRON_STATUS_ID) if BRON_STATUS_ID else 12345}]
     state.deal_titles = {2: "Тестовая игра"}
 
@@ -718,3 +728,4 @@ if __name__ == "__main__":
 # 2025-08-18 — self-test под SSOT.
 # 2025-08-19 — проверки формата тегов из locked_distribution.
 # 2025-08-19 — _read_status_info и строгая логика перевода в SUCCESS (только из «Бронь»).
+# 2025-08-24 — предотвращён автопереход в детали при подтверждении из «Мои игры».

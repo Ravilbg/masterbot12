@@ -62,7 +62,6 @@ try:
     from core.state import state  # type: ignore
 except Exception:
     # Минимальная заглушка состояния (для ранних сборок/тестов).
-    from typing import Dict, Any, List, Set, Tuple, Optional
     class _StateStub:
         def __init__(self) -> None:
             self.coordination_cycle_active: bool = False
@@ -87,7 +86,7 @@ except Exception:
             self.ui_context: Dict[int, str] = {}
     state = _StateStub()  # type: ignore
 
-# История изменений: 2025-08-14 — добавлен state.ui_context для фильтрации фоновых перерисовок
+# История изменений: 2025-08-20 — блок выровнен; добавлен ui_context в заглушку state.
 
 
 try:
@@ -139,7 +138,8 @@ router = Router()
 MSK_TZ = timezone("Europe/Moscow")
 
 # История изменений:
-#   • 2025-08-14 — v6.5: добавлены авто-assign из ответов и approve-кнопки в дашборд.
+#   • 2025-08-20 — v6.5-fix: удалён мусор в середине блока, выровнены импорты под SSOT, Pylance-типы сохранены.
+
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -152,7 +152,6 @@ if TYPE_CHECKING:
     async def generate_poll_report() -> str: ...
     def _build_report_keyboard() -> Any: ...
 
-
 # handlers/polls_lifecycle.py
 # ════════════════════════════════════════════════════════════════════
 # [0.96] REPORT + VACUUM (edit-in-place, no ui_context; no-resend-on-not-modified)
@@ -163,19 +162,20 @@ from typing import Optional, Set, Tuple, Dict, Any, List
 
 from aiogram import Bot, types
 from aiogram.types import InlineKeyboardMarkup
+from aiogram.exceptions import TelegramBadRequest
 
 from core.config import settings
 from core.db import get_user_info
 from core.state import state
-from core.utils import delete_previous_private_messages, vacuum_private  # ← добавили vacuum_private
+from core.utils import delete_previous_private_messages, vacuum_private  # ← SSOT
 
 logger = logging.getLogger(__name__)
 
 async def _edit_or_send_report(uid: int, text: str, kb: InlineKeyboardMarkup) -> None:
     """
-    Пытаемся отредактировать действующий отчёт. Если не получилось —
-    полностью чистим ЛС и отправляем новый. Синхронизируем state.
-    Специальный кейс: 'message is not modified' считаем УСПЕХОМ (ничего не пересылаем).
+    Редактирует отчёт, если он есть; если нет — безопасно присылает новый.
+    ВАЖНО: никаких глобальных чисток ЛС здесь НЕТ — не трогаем детали.
+    «Message is not modified» трактуем как успех.
     """
     bot = Bot.get_current()
     mid = getattr(state, "personal_report_message_id", None)
@@ -191,39 +191,64 @@ async def _edit_or_send_report(uid: int, text: str, kb: InlineKeyboardMarkup) ->
                 reply_markup=kb,
                 disable_web_page_preview=True,
             )
-            class _Msg:
-                def __init__(self, message_id: int) -> None:
-                    self.message_id = message_id
-            state.last_user_messages[uid] = [_Msg(mid)]
+            # синхронизируем last_user_messages, не задевая другие сообщения (детали)
+            try:
+                bucket = getattr(state, "last_user_messages", {})
+                if isinstance(bucket, dict):
+                    lst = list(bucket.get(int(uid), []) or [])
+                    # не дублируем один и тот же id
+                    lst = [m for m in lst if getattr(m, "message_id", None) != mid]
+                    class _Msg:  # минимальный объект с message_id, если нет исходного Message
+                        def __init__(self, message_id: int) -> None:
+                            self.message_id = message_id
+                    lst.append(_Msg(mid))
+                    bucket[int(uid)] = lst
+                    setattr(state, "last_user_messages", bucket)
+            except Exception:
+                pass
             return
-        except Exception as e:
-            msg = str(e).lower()
-            # НИЧЕГО НЕ ДЕЛАЕМ, если контент не изменился — считаем, что отчёт актуален
-            if "message is not modified" in msg:
-                class _Msg:
-                    def __init__(self, message_id: int) -> None:
-                        self.message_id = message_id
-                state.last_user_messages[uid] = [_Msg(mid)]
-                logger.debug("[report] edit skipped: content not modified")
+        except TelegramBadRequest as e:
+            s = str(e).lower()
+            if "message is not modified" in s:
+                # ничего не меняем — это ок
                 return
-            logger.debug("[report] edit failed → resend: %s", e)
+            # сообщение потеряно/удалено — удаляем только его и пришлём новое
+            with contextlib.suppress(Exception):
+                await bot.delete_message(uid, mid)
+            setattr(state, "personal_report_message_id", None)
+        except Exception:
+            # Любая иная ошибка редактирования — попробуем прислать новый
+            with contextlib.suppress(Exception):
+                setattr(state, "personal_report_message_id", None)
 
-    # «Жёсткая» очистка и новая отправка
-    with contextlib.suppress(Exception):
-        await delete_previous_private_messages(uid, keep=[])
-
+    # Отправляем новый отчёт (без «пылесоса» ЛС)
     sent = await bot.send_message(
         uid, text, parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True
     )
     state.personal_report_message_id = sent.message_id
-    state.last_user_messages[uid] = [sent]
 
+    # Поддерживаем last_user_messages — не очищая другие сообщения пользователя
+    try:
+        bucket = getattr(state, "last_user_messages", {})
+        if isinstance(bucket, dict):
+            lst = list(bucket.get(int(uid), []) or [])
+            lst = [m for m in lst if getattr(m, "message_id", None) != sent.message_id]
+            lst.append(sent)
+            bucket[int(uid)] = lst
+            setattr(state, "last_user_messages", bucket)
+    except Exception:
+        pass
+
+    # легкий маркер UI-контекста
+    try:
+        (getattr(state, "ui_context", {}) or {}).update({uid: "poll_report"})
+    except Exception:
+        pass
 
 async def _send_leader_report(leader_id: int) -> None:
     text = await generate_poll_report()             # type: ignore[name-defined]
     kb   = _build_report_keyboard()                 # type: ignore[name-defined]
     await _edit_or_send_report(leader_id, text, kb)
-
 
 async def _sync_leader_report(leader_id: Optional[int] = None) -> None:
     lid = leader_id or getattr(state, "current_poll_leader", None)
@@ -237,10 +262,8 @@ async def _sync_leader_report(leader_id: Optional[int] = None) -> None:
         return
     await _send_leader_report(int(lid))
 
-
 async def sync_report() -> None:
     await _sync_leader_report()
-
 
 @router.message(lambda m: (m.text or "") == "📊 Отчёт по опросу")
 async def poll_report_handler(message: types.Message) -> None:
@@ -267,16 +290,13 @@ async def poll_report_handler(message: types.Message) -> None:
     with contextlib.suppress(Exception):
         await message.delete()
 
-
 async def _vacuum_old_messages() -> None:
     """
     Плановая чистка ЛС.
-    • Собираем ПОЛНОЕ множество uid из state: last_user_messages, detail_blocks, menu_message_id,
-      assigned_index, games_by_user.
-    • Бережём главное меню (keep = [menu_message_id]).
-    • Удаляем все прочие «хвосты» через canonical vacuum_private(...).
+    • Собираем множество uid из state.
+    • Бережём главное меню и ВСЕ активные detail_blocks пользователя.
+    • Удаляем прочие «хвосты» через core.utils.vacuum_private(...).
     """
-    # 1) Соберём uid'ы из разных источников
     uids: Set[int] = set()
     try:
         lm: Dict[int, Any] = (getattr(state, "last_user_messages", {}) or {})
@@ -285,7 +305,9 @@ async def _vacuum_old_messages() -> None:
         pass
     try:
         db: Dict[Tuple[int, int], Any] = (getattr(state, "detail_blocks", {}) or {})
-        uids.update(int(k[0]) for k in db.keys() if isinstance(k, tuple) and len(k) >= 2 and isinstance(k[0], int))
+        # detail_blocks хранится под ключом (uid, deal_id)
+        uids.update(int(k[0]) for k in db.keys()
+                    if isinstance(k, tuple) and len(k) >= 2 and isinstance(k[0], int))
     except Exception:
         pass
     try:
@@ -304,25 +326,47 @@ async def _vacuum_old_messages() -> None:
     except Exception:
         pass
 
-    # 2) Для каждого пользователя — vacuum с сохранением главного меню
     try:
-        from core.menu import get_menu_message_id  # берём ID меню, если есть
+        from core.menu import get_menu_message_id  # может отсутствовать в некоторых сборках
     except Exception:
         get_menu_message_id = lambda _uid: None  # type: ignore
 
     for uid in sorted(uids):
         keep_ids: List[int] = []
+
+        # Меню — всегда храним
         with contextlib.suppress(Exception):
             mid = get_menu_message_id(uid)
             if isinstance(mid, int):
                 keep_ids.append(mid)
+
+        # Все активные detail-блоки этого uid — тоже храним
+        try:
+            db_map: Dict[Tuple[int, int], Any] = getattr(state, "detail_blocks", {}) or {}
+            for (k_uid, _deal), raw in list(db_map.items()):
+                if int(k_uid) != int(uid):
+                    continue
+                for it in (raw or []):
+                    if hasattr(it, "message_id"):
+                        keep_ids.append(int(getattr(it, "message_id")))  # Message
+                    elif isinstance(it, dict) and "message_id" in it:
+                        with contextlib.suppress(Exception):
+                            keep_ids.append(int(it["message_id"]))
+                    else:
+                        with contextlib.suppress(Exception):
+                            keep_ids.append(int(it))
+        except Exception:
+            pass
+
         with contextlib.suppress(Exception):
             await vacuum_private(uid, keep=keep_ids)
 
 # История изменений:
-# 2025-08-18 • v0.96d — vacuum: бережём главное меню + чистим по union(uid) из state (выровнено под SSOT).
-# 2025-08-18 • v0.96c — «message is not modified» трактуем как OK; убран resend; синхронизируем last_user_messages.
-# ════════════════════════════════════════════════════════════════════
+# 2025-08-25 • v0.96f — _edit_or_send_report без глобальной чистки ЛС; при resend удаляется только старый отчёт.
+# 2025-08-25 • v0.96f — _vacuum_old_messages сохраняет активные detail_blocks и меню (тихая замена не ломается).
+# 2025-08-18 • v0.96d — vacuum: бережём главное меню + чистим по union(uid) из state (SSOT).
+# 2025-08-18 • v0.96c — «message is not modified» трактуем как OK; синхронизируем last_user_messages.
+
 
 
 
@@ -342,10 +386,7 @@ def _clean(txt: str) -> str:
     return _RE_NON_ALNUM.sub(" ", txt or "").lower().strip()
 
 def _role_cfg(game_name: str) -> Dict[str, int]:
-    """
-    Толерантный поиск конфигурации ролей из settings.GAME_ROLE_MAPPING.
-    Возвращает {"main_leaders": X, "assistants": Y}.
-    """
+    """Толерантный поиск конфигурации ролей из settings.GAME_ROLE_MAPPING."""
     norm = _clean(game_name)
     best_ratio = 0.0
     best_cfg: Optional[Dict[str, int]] = None
@@ -365,7 +406,7 @@ def _need_admin_by_package(pkg_raw: str) -> int:
     return 1 if _clean(pkg_raw) in _ADMIN_PKGS else 0
 
 def _slot_uid(val: Any) -> Optional[int]:
-    """Парсит uid из значения слота: int | 'uid' | 'Имя Ф.1|uid'."""
+    """Парсит uid из значения слота: int | 'uid' | 'Имя Ф.|uid'."""
     if isinstance(val, int):
         return val
     if isinstance(val, str):
@@ -421,20 +462,32 @@ async def _refresh_detail_views(impacted: Set[int], refresh_all: bool = False) -
     Перерисовывает открытые detail-view’ы; refresh_all — перерисовать все текущие игры.
     ВАЖНО: если у пользователя активен контекст «my_games», мы НЕ трогаем его ЛС,
     чтобы не было автопереходов/мигания при работе с дашбордом «🎲 Мои игры».
+
+    Функция вызывает handlers.poll_details.refresh_deal_details с bot=...;
+    при несовпадении сигнатуры делает дауншифт до легаси позиционных аргументов.
     """
     if not callable(refresh_deal_details):
         return
 
-    # Определяем набор deal_id для обновления
+    # Набор deal_id для обновления
     if refresh_all:
         impacted = {
             int(d.get("id", 0)) for d in (state.current_poll_deals or []) if int(d.get("id", 0))
         }
     impacted = {int(x) for x in (impacted or set()) if int(x)}
 
-    # Текущие открытые detail-блоки: ключ (uid, deal_id) → список сообщений
     detail_blocks = (getattr(state, "detail_blocks", {}) or {})
     ui_ctx = (getattr(state, "ui_context", {}) or {})
+    bot = Bot.get_current()
+
+    async def _call_refresh(u: int, d: int) -> Optional[Dict[str, Any]]:
+        try:
+            return await refresh_deal_details(bot=bot, uid=u, deal_id=d)  # type: ignore[call-arg]
+        except TypeError:
+            return await refresh_deal_details(u, d)  # type: ignore[misc]
+        except Exception as e:
+            logger.debug("[details] refresh failed uid=%s deal=%s: %s", u, d, e)
+            return None
 
     tasks: List[asyncio.Task] = []
     for (uid, deal_id), _msgs in list(detail_blocks.items()):
@@ -443,18 +496,173 @@ async def _refresh_detail_views(impacted: Set[int], refresh_all: bool = False) -
         except Exception:
             continue
 
-        # ⛔ Не трогаем пользователей, у кого открыт «Мои игры»
+        # ⛔ не трогаем «Мои игры»
         if ui_ctx.get(uid_i) == "my_games":
             logger.debug("[polls] skip details refresh for uid=%s (context=my_games)", uid_i)
             continue
 
         if did_i in impacted:
-            tasks.append(asyncio.create_task(refresh_deal_details(uid=uid_i, deal_id=did_i)))  # type: ignore
+            tasks.append(asyncio.create_task(_call_refresh(uid_i, did_i)))
 
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
-# История изменений: 2025-08-14 — добавлена фильтрация по state.ui_context == 'my_games'
+# История изменений:
+# 2025-08-25 — исправлен DETAIL-REFRESH: передаём bot=..., дауншифт к легаси; устойчивый лог.
+# 2025-08-14 — фильтрация по state.ui_context == 'my_games'
+
+
+# ════════════════════════════════════════════════════════════════════
+# [2.1] HANDLER: «Детали игры» из отчёта (show_deal_{id}) — ТИХАЯ ПЕРЕРИСОВКА
+# ════════════════════════════════════════════════════════════════════
+
+# ── [2.1.1] Импорты и lazy-imports рендеров/утилит ──────────────────
+
+from typing import List
+import contextlib
+import logging
+import re
+
+from aiogram import F, Bot, Router, types  # ← ВАЖНО: F из aiogram, не из aiogram.filters!
+from core.state import state
+
+logger = logging.getLogger(__name__)
+
+# Рендеры из handlers.poll_details (основной путь)
+try:
+    from handlers.poll_details import (
+        render_detail as _render_detail_public,      # async def render_detail(bot=..., uid=..., deal_id=..., force_approved=False)
+        refresh_deal_details as _refresh_detail,     # async def refresh_deal_details(bot=..., uid=..., deal_id=..., force_approved=False)
+    )
+except Exception:  # pragma: no cover
+    _render_detail_public = None  # type: ignore[assignment]
+    _refresh_detail = None        # type: ignore[assignment]
+
+# Доступ к реестру «детальных» сообщений (может отсутствовать в старых сборках)
+try:
+    from handlers.poll_details import (
+        _get_block as _pd_get_block,     # def _get_block(uid:int, deal_id:int) -> List[types.Message]
+        _detach_from_last_user_messages as _pd_detach,  # def _detach_from_last_user_messages(uid, keep)
+    )
+except Exception:  # pragma: no cover
+    _pd_get_block = None  # type: ignore[assignment]
+    _pd_detach = None     # type: ignore[assignment]
+
+# SSOT-вакуум для точечной чистки дублей
+try:
+    from core.utils import vacuum_private as _vacuum_private  # async def vacuum_private(uid:int, keep:List[int]|None=None)
+except Exception:  # pragma: no cover
+    _vacuum_private = None  # type: ignore[assignment]
+
+# router объявлен выше в модуле; эта аннотация помогает Pylance
+router: Router  # noqa: F401
+
+
+# ── [2.1.2] Вспомогательные функции доступа к блоку сообщений ───────
+def _safe_get_block(uid: int, deal_id: int) -> List[types.Message]:
+    if callable(_pd_get_block):
+        try:
+            return _pd_get_block(uid, deal_id)  # type: ignore[misc]
+        except Exception:
+            return []
+    return []
+
+def _msg_ids(msgs: List[types.Message]) -> List[int]:
+    out: List[int] = []
+    for m in msgs:
+        mid = getattr(m, "message_id", None)
+        if isinstance(mid, int):
+            out.append(mid)
+    return out
+
+
+# ── [2.1.3] Унифицированный вызов рендера (приоритет тихой обёртки) ─
+async def _do_detail_render(bot: Bot, uid: int, deal_id: int) -> None:
+    """
+    Идём через публичную обёртку render_detail(...): она сама решит, делать refresh
+    существующих сообщений или первичный рендер. Фолбэк — прямой refresh_deal_details(...).
+    """
+    if callable(_render_detail_public):
+        await _render_detail_public(bot=bot, uid=uid, deal_id=deal_id, force_approved=False)  # type: ignore[misc]
+        return
+    if callable(_refresh_detail):
+        await _refresh_detail(bot=bot, uid=uid, deal_id=deal_id, force_approved=False)  # type: ignore[misc]
+        return
+    raise RuntimeError("poll_details.render_detail / refresh_deal_details not available")
+
+
+# ── [2.1.4] Пост-гард: удаляем старую пачку, если рендер напечатал новую ─
+async def _post_guard(uid: int, deal_id: int, before: List[types.Message], after: List[types.Message]) -> None:
+    """
+    Если после рендера message_id не совпадают с прежними — считаем, что произошла
+    деградация в «новую печать». Подчищаем «до», оставляем «после».
+    """
+    try:
+        if not before or not after or not callable(_vacuum_private):
+            return
+        b_ids = set(_msg_ids(before))
+        a_ids = set(_msg_ids(after))
+        if b_ids and a_ids and b_ids.isdisjoint(a_ids):
+            with contextlib.suppress(Exception):
+                await _vacuum_private(uid, keep=list(a_ids))  # type: ignore[misc]
+            if callable(_pd_detach):
+                with contextlib.suppress(Exception):
+                    _pd_detach(uid, after)  # type: ignore[misc]
+    except Exception as e:  # pragma: no cover
+        logger.warning("[details] post-guard failed uid=%s deal_id=%s: %s", uid, deal_id, e)
+
+
+# ── [2.1.5] Хендлер кнопки «show_deal_{id}» — тихий показ/перерисовка ─
+@router.callback_query(F.data.startswith("show_deal_"))
+async def _cb_open_detail_from_report(callback: types.CallbackQuery) -> None:
+    """
+    Открывает/перерисовывает блок деталей игры из отчёта.
+    Приоритет — тихая замена. При деградации — страховка от дублей.
+    """
+    # Быстрый ACK
+    with contextlib.suppress(Exception):
+        await callback.answer()
+
+    m = re.search(r"show_deal_(\d+)$", str(callback.data or ""))
+    if not m:
+        with contextlib.suppress(Exception):
+            await callback.answer("⚠️ Ошибочная кнопка.", show_alert=True)
+        return
+
+    deal_id = int(m.group(1))
+    uid = int(callback.from_user.id or 0)
+    bot: Bot = callback.message.bot if callback.message else Bot.get_current()
+
+    before_msgs = _safe_get_block(uid, deal_id)
+
+    try:
+        await _do_detail_render(bot=bot, uid=uid, deal_id=deal_id)
+    except Exception as e:
+        logger.exception("[details] render failed uid=%s deal_id=%s: %s", uid, deal_id, e)
+        with contextlib.suppress(Exception):
+            await callback.answer("Ошибка отрисовки деталей.", show_alert=True)
+        return
+
+    after_msgs = _safe_get_block(uid, deal_id)
+    await _post_guard(uid=uid, deal_id=deal_id, before=before_msgs, after=after_msgs)
+
+    # Помечаем UI-контекст, чтобы внешние авто-апдейты не мешали блоку деталей
+    try:
+        (getattr(state, "ui_context", {}) or {}).update({uid: "poll_details"})
+    except Exception:
+        pass
+
+
+# ── [2.1.6] Мини-тест ───────────────────────────────────────────────
+async def _test__details_sanity() -> None:
+    assert callable(_do_detail_render)
+    assert callable(_msg_ids)
+    logger.debug("[tests] [2.1] smoke-ok")
+
+# История изменений [2.1]:
+# • 2025-08-25 — фикс импорта F (aiogram.F), полная проверка «тихой замены»,
+#                пост-гард через vacuum_private; выровнено под SSOT/фиксы Pylance.
+
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -477,64 +685,76 @@ async def _sv_status(user_id: int, game_name: str) -> str:
 
 # ────────────────────────────────────────────────────────────────────
 # [2.5] АВТОРАСПРЕДЕЛЕНИЕ ИЗ ОТВЕТОВ ОПРОСА → state.distribution_cache
+# (v2: бережное добирание пустых слотов; ручные перестановки сохраняем)
 # ────────────────────────────────────────────────────────────────────
 async def _auto_assign_from_responses(impacted: Set[int], apply_to_all_on_admin_flag: bool = False) -> None:
     """
-    Строит предварительное распределение по каждой игре из ответов опроса:
-      • main_leaders / assistants — из выбранных игр, с учётом «Светофора»;
-      • admin — из «🛡️ Админом» (если пакет требует админа).
-    Инвариант: 1 пользователь = 1 роль. RED → в расчёт готовности не идёт.
+    Пересчитывает предварительное распределение, НЕ затирая ручные перестановки.
 
-    impacted: набор deal_id, для которых пересчитать.
-    apply_to_all_on_admin_flag: если True — пересчитать все текущие игры
-      (когда кто-то отметил «🛡️ Админом», это влияет на все игры).
+    Логика:
+      1) Собираем пул откликнувшихся на сделку (raw_pool) и статусы «Светофора».
+      2) Берём предыдущий dist из state.distribution_cache[str(did)] как БАЗУ.
+      3) Чистим из базы только тех, КОГО НЕТ в raw_pool (пользователь снял отклик),
+         и устраняем дубли (инвариант 1 пользователь = 1 роль) в порядке: lead → assist → admin.
+         «trainee» не влияет на готовность и сохраняется как есть.
+      4) Добираем ТОЛЬКО ПУСТЫЕ слоты по приоритетам:
+         Светофор (green < yellow < red/нет) → меньше игр за месяц → uid.
+         Для core-ролей (lead/assist) red не берём автоматически.
+         Для admin — сперва «могу админом», затем ассист-пул.
+      5) Сохраняем результат обратно в distribution_cache[str(did)].
+
+    apply_to_all_on_admin_flag: True → пересчитать все текущие игры цикла.
     """
+    # Если отметили/сняли «Админом» — пересчитываем все игры текущего цикла
     if apply_to_all_on_admin_flag:
         impacted = {int(d.get("id", 0)) for d in (state.current_poll_deals or []) if int(d.get("id", 0))}
     if not impacted:
         return
 
-    # ранжирование статусов
+    # rank для светофора
     def _rank(status: str) -> int:
-        # green(0) < yellow(1) < red(2) < ''(3)
         s = (status or "").lower()
         return 0 if s == "green" else 1 if s == "yellow" else 2 if s == "red" else 3
 
+    # Метка слота «Имя Ф.|uid»
     def _fmt(info: Dict[str, Any]) -> str:
-        """Метка вида 'Имя Ф.|uid' — парсится _slot_uid()."""
         fn = (info.get("first_name") or "").strip()
         li = (info.get("last_name_initial") or "").strip()
         uid = int(info.get("uid") or info.get("user_id") or 0)
         base = (f"{fn} {li}." if li else fn).strip() or f"user{uid}"
         return f"{base}|{uid}"
 
+    monthly_counters = await _get_monthly_counters()
+
+    # Быстрый доступ к сделкам по id
     deals_by_id: Dict[int, Dict[str, Any]] = {int(d.get("id", 0)): d for d in (state.current_poll_deals or [])}
 
-    # общий пул кандидатов в админы
-    admin_pool: Dict[int, Dict[str, Any]] = {}
+    # Пул «могу админом» (по всем ответам цикла)
+    admin_pool_global: Dict[int, Dict[str, Any]] = {}
     for pdata in (state.responses or {}).values():
         for adm in (pdata.get("admin_available") or []):
             uid = int(adm.get("user_id", 0))
             if uid:
-                admin_pool[uid] = {
+                admin_pool_global[uid] = {
                     "uid": uid,
                     "first_name": adm.get("first_name", ""),
                     "last_name_initial": adm.get("last_name_initial", ""),
                     "is_admin_eligible": True,
                 }
 
-    for did in set(int(x) for x in impacted if int(x)):
+    for did in {int(x) for x in impacted if int(x)}:
         deal = deals_by_id.get(did)
         if not deal:
             continue
-        g_name = str(deal.get("game_name") or deal.get("name") or "")
-        pkg = str(deal.get("package") or "")
-        need = _role_cfg(g_name)
-        need_main = int(need.get("main_leaders", 1))
-        need_assist = int(need.get("assistants", 0))
-        need_admin = _need_admin_by_package(pkg)
 
-        # пул отметившихся за эту игру
+        game_name = str(deal.get("game_name") or deal.get("name") or "")
+        package   = str(deal.get("package") or "")
+        need      = _role_cfg(game_name)
+        need_main = int(need.get("main_leaders", 1))
+        need_ass  = int(need.get("assistants", 0))
+        need_adm  = _need_admin_by_package(package)
+
+        # 1) Пул отметившихся за ЭТУ сделку
         raw_pool: Dict[int, Dict[str, Any]] = {}
         for pdata in (state.responses or {}).values():
             deals_map = (pdata.get("deals") or {})
@@ -549,64 +769,180 @@ async def _auto_assign_from_responses(impacted: Set[int], apply_to_all_on_admin_
                             "is_admin_eligible": False,
                         }
 
-        # объединяем признак admin-eligible
-        for uid, adm in admin_pool.items():
-            if uid in raw_pool:
+        # Обновим признак «могу админом» из глобального пула
+        for uid in list(raw_pool.keys()):
+            if uid in admin_pool_global:
                 raw_pool[uid]["is_admin_eligible"] = True
 
-        # вытянем статусы светофора параллельно
         uids = list(raw_pool.keys())
-        async def _one(uid: int) -> Tuple[int, str]:
-            return uid, await _sv_status(uid, g_name)
+
+        # 2) Статусы «Светофора» параллельно
+        async def _one(uid_: int) -> Tuple[int, str]:
+            return uid_, await _sv_status(uid_, game_name)
+
         sv_pairs = await asyncio.gather(*[_one(u) for u in uids], return_exceptions=True)
         sv: Dict[int, str] = {}
         for p in sv_pairs:
             if isinstance(p, Exception):
                 continue
-            uid, st = p
-            sv[uid] = (st or "")
+            uid_, st = p
+            sv[uid_] = (st or "")
 
-        # кандидаты по приоритетам (green → yellow; red исключаем из core-ролей)
-        pool_main = [raw_pool[u] for u in uids if _rank(sv.get(u, "")) in (0, 1)]
+        # 3) Подготовим отсортированные пулы для автодобора
+        def _key(info: Dict[str, Any]) -> Tuple[int, int, int]:
+            uid_i = int(info.get("uid") or 0)
+            return _rank(sv.get(uid_i, "")), int(monthly_counters.get(uid_i, 0)), uid_i
+
+        pool_main = [raw_pool[u] for u in uids if _rank(sv.get(u, "")) == 0]
         pool_ass  = [raw_pool[u] for u in uids if _rank(sv.get(u, "")) in (0, 1)]
-        pool_admin = [raw_pool[u] for u in uids if raw_pool[u].get("is_admin_eligible")]
+        pool_adm  = [raw_pool[u] for u in uids if raw_pool[u].get("is_admin_eligible")]
 
-        key_fn = lambda info: (_rank(sv.get(int(info["uid"]), "")), int(info["uid"]))
-        pool_main.sort(key=key_fn)
-        pool_ass .sort(key=key_fn)
-        pool_admin.sort(key=key_fn)
+        pool_main.sort(key=_key)
+        pool_ass .sort(key=_key)
+        pool_adm .sort(key=_key)
 
-        used: Set[int] = set()
-        dist: Dict[str, Any] = {}
-
-        # lead*
-        for i in range(1, need_main + 1):
-            pick = next((p for p in pool_main if int(p["uid"]) not in used), None)
-            dist[f"lead{i}"] = _fmt(pick) if pick else None
-            if pick:
-                used.add(int(pick["uid"]))
-
-        # assistant*
-        for i in range(1, need_assist + 1):
-            pick = next((p for p in pool_ass if int(p["uid"]) not in used), None)
-            dist[f"assistant{i}"] = _fmt(pick) if pick else None
-            if pick:
-                used.add(int(pick["uid"]))
-
-        # admin
-        if need_admin:
-            pick = next((p for p in pool_admin if int(p["uid"]) not in used), None)
-            if not pick:
-                pick = next((p for p in pool_ass if int(p["uid"]) not in used), None)  # fallback
-            dist["admin"] = _fmt(pick) if pick else None
-            if pick:
-                used.add(int(pick["uid"]))
-        else:
-            dist["admin"] = None
-
+        # 4) БАЗА: берём существующий dist и аккуратно очищаем из него только «снявшихся»
         if not getattr(state, "distribution_cache", None):
             state.distribution_cache = {}
+
+        base: Dict[str, Any] = dict((state.distribution_cache or {}).get(str(did)) or {})
+
+        # Гарантируем наличие требуемых ключей
+        need_main, need_ass, _need_admin = _ensure_role_slots(base, game_name, package)
+
+        # Порядок для устранения дублей: lead → assist → admin (trainee не трогаем)
+        order_slots: List[str] = []
+        order_slots += [f"lead{i}" for i in range(1, max(1, need_main) + 1)]
+        order_slots += [f"assistant{i}" for i in range(1, max(0, need_ass) + 1)]
+        order_slots += ["admin"]
+
+        # used — у кого уже есть роль в БАЗЕ (после чистки) 
+        used: Set[int] = set()
+        dist: Dict[str, Any] = dict(base)  # начнём с копии; trainee сохраняется автоматически
+
+        # Очистка: сносим из lead/assist/admin всех, кого нет в raw_pool, и убираем дубли
+        for key in order_slots:
+            cur = dist.get(key)
+            uid = _slot_uid(cur)
+            if not uid:
+                dist[key] = None
+                continue
+            if uid not in raw_pool:
+                # пользователь снял отклик → убрать из состава
+                dist[key] = None
+                continue
+            if uid in used:
+                # инвариант «1 пользователь = 1 роль»
+                dist[key] = None
+                continue
+            used.add(uid)
+
+        # 5) Добор пустых слотов из пулов с приоритетами (ручные назначения не трогаем)
+        def _take_from_pool(pool: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+            for p in pool:
+                uid_p = int(p.get("uid") or 0)
+                if uid_p and uid_p not in used:
+                    return p
+            return None
+
+        # Основные ведущие
+        for i in range(1, max(1, need_main) + 1):
+            k = f"lead{i}"
+            if dist.get(k) in (None, "", 0):
+                pick = _take_from_pool(pool_main)
+                if pick:
+                    dist[k] = _fmt(pick)
+                    used.add(int(pick["uid"]))
+
+        # Помощники
+        for i in range(1, max(0, need_ass) + 1):
+            k = f"assistant{i}"
+            if dist.get(k) in (None, "", 0):
+                pick = _take_from_pool(pool_ass)
+                if pick:
+                    dist[k] = _fmt(pick)
+                    used.add(int(pick["uid"]))
+
+        # Админ (если требуется пакетом)
+        if need_adm:
+            if dist.get("admin") in (None, "", 0):
+                pick = _take_from_pool(pool_adm) or _take_from_pool(pool_ass)
+                if pick:
+                    dist["admin"] = _fmt(pick)
+                    used.add(int(pick["uid"]))
+        else:
+            # если пакетом не требуется — слот не обязательный; но не чистим, если там вручную поставили
+            dist.setdefault("admin", None)
+
+        # 6) Сохранение результата
         state.distribution_cache[str(did)] = dist
+
+    # История изменений:
+    # 2025-08-26 — v2: «бережное автораспределение» — сохраняем ручные перестановки, чистим только снятых,
+    #                   добор только пустых слотов; устранение дублей lead→assist→admin; SSOT/инварианты сохранены.
+
+
+# ────────────────────────────────────────────────────────────────────
+# [2.5.1] ПРИОРИТЕТЫ ПО ТЕГАМ (AmoCRM) — кэш месячных счётчиков
+# ────────────────────────────────────────────────────────────────────
+async def _load_monthly_role_counters(force: bool = False) -> Dict[int, int]:
+    """
+    Загружает количество сыгранных игр за прошедший месяц по подтверждающим тегам AmoCRM.
+    Источник данных — сервисный слой services.amocrm (SSOT).
+    Результат кэшируется в state.monthly_role_counters как {uid: count}.
+
+    • Если сервисный хелпер отсутствует/не доступен — возвращает пустой словарь.
+    • Безопасен для ранних сборок: импорт внутри, ошибки заглушаются.
+    """
+    if not force:
+        cached = getattr(state, "monthly_role_counters", None)
+        if isinstance(cached, dict):
+            # приведём к int → int на всякий случай
+            try:
+                return {int(k): int(v) for k, v in cached.items()}
+            except Exception:
+                pass
+
+    # Локальный импорт — чтобы избежать циклических зависимостей на старых сборках
+    try:
+        from services.amocrm import get_monthly_role_tag_counters  # type: ignore
+    except Exception:
+        async def get_monthly_role_tag_counters(*_: Any, **__: Any) -> Dict[int, int]:  # type: ignore
+            return {}
+
+    try:
+        res = get_monthly_role_tag_counters()
+        data = await res if asyncio.iscoroutine(res) else res  # type: ignore
+        if not isinstance(data, dict):
+            data = {}
+    except Exception as exc:  # сетевые/сервисные ошибки не должны ронять цикл
+        logger.debug("[priority] monthly counters load failed: %s", exc)
+        data = {}
+
+    # Нормализуем и кладём в state
+    try:
+        normalized = {int(k): int(v) for k, v in (data or {}).items()}
+    except Exception:
+        normalized = {}
+    setattr(state, "monthly_role_counters", normalized)
+    return normalized
+
+
+async def _get_monthly_counters() -> Dict[int, int]:
+    """
+    Возвращает кэш месячных счётчиков {uid: count}. Если кэша нет — грузит.
+    Используется при автораспределении для приоритизации (меньше игр → выше приоритет).
+    """
+    cached = getattr(state, "monthly_role_counters", None)
+    if isinstance(cached, dict):
+        try:
+            return {int(k): int(v) for k, v in cached.items()}
+        except Exception:
+            pass
+    return await _load_monthly_role_counters(force=False)
+
+# История изменений:
+# 2025-08-24 — новый блок: кэш месячных счётчиков из AmoCRM (выровнено под SSOT, безопасные импорты).
 
 # ════════════════════════════════════════════════════════════════════
 # [2.6] CHAT RESOLVER (куда слать сервисные уведомления)
@@ -770,11 +1106,16 @@ async def create_poll_handler(message: types.Message) -> None:
             await message.delete()
         return
 
-    if not state.admin_chat_id:
+    # Куда публиковать опросы — единый резолвер общего чата (SSOT)
+    from core.utils import resolve_notify_chat_id  # локальный импорт, чтобы не плодить циклы
+    chat_id = resolve_notify_chat_id(bot)
+    if not chat_id:
         await _screen("⚠️ Чат не настроен.", kb=await get_main_menu(uid))
         with contextlib.suppress(Exception):
             await message.delete()
         return
+    # Сохраняем в state для обратной совместимости с остальными участками модуля
+    state.admin_chat_id = chat_id
 
     # 2) загрузка сделок
     try:
@@ -786,22 +1127,45 @@ async def create_poll_handler(message: types.Message) -> None:
             await message.delete()
         return
 
-    now, window = datetime.now(tz=MSK_TZ), datetime.now(tz=MSK_TZ) + timedelta(days=14)
-    poll_deals: List[Dict[str, Any]] = [
-        d for d in (deals or [])
-        if d.get("status_id") in getattr(settings, "NEW_GAMES_STATUS_IDS", [])
-        and isinstance(d.get("event_datetime"), datetime)
-        and now <= d["event_datetime"] <= window
-        and not d.get("team_leads")
-    ]
-    if not poll_deals:
+    # окно дат — settings.POLL_WINDOW_DAYS (фолбэк 10)
+    try:
+        _days = int(getattr(settings, "POLL_WINDOW_DAYS", 0) or 10)
+    except Exception:
+        _days = 10
+    if _days <= 0:
+        _days = 10
+
+    now = datetime.now(tz=MSK_TZ)
+    window = now + timedelta(days=_days)
+
+    def _event_dt(d: Dict[str, Any]) -> Optional[datetime]:
+        dt = d.get("event_datetime")
+        return dt if isinstance(dt, datetime) else None
+
+    # Фильтр по статусам и окну дат
+    valid_statuses = set(getattr(settings, "NEW_GAMES_STATUS_IDS", []) or [])
+    raw_deals: List[Dict[str, Any]] = []
+    for d in (deals or []):
+        try:
+            if d.get("status_id") not in valid_statuses:
+                continue
+            dt = _event_dt(d)
+            if not dt or dt < now or dt > window:
+                continue
+            if d.get("team_leads"):  # уже укомплектована/назначена
+                continue
+            raw_deals.append(d)
+        except Exception:
+            continue
+
+    if not raw_deals:
         await _screen("😔 Нет новых игр.", kb=await get_main_menu(uid))
         with contextlib.suppress(Exception):
             await message.delete()
         return
 
     # 3) инициализация state
-    state.current_poll_deals         = poll_deals
+    state.current_poll_deals         = raw_deals
     state.current_poll_leader        = uid
     state.responses.clear()
     state.distribution_cache.clear()
@@ -830,16 +1194,32 @@ async def create_poll_handler(message: types.Message) -> None:
         bonuses = d.get("bonuses", d.get("bonus", d.get("extra_bonuses", d.get("extra_services"))))
         return pkg, str(bonuses or "").strip()
 
-    urgent = any(d["event_datetime"] <= now + timedelta(days=3) for d in poll_deals)
+    def _title(d: Dict[str, Any]) -> str:
+        return str(d.get("game_name") or d.get("name") or f"Сделка #{d.get('id')}")
+
+    def _is_embedded(d: Dict[str, Any]) -> bool:
+        src = str(d.get("source") or "").strip().lower()
+        return bool(d.get("embedded") or d.get("is_embedded") or src in {"embedded", "inline", "internal"})
+
+    # Разделяем «встроенные» и обычные: встроенные публикуем отдельными постами
+    embedded = [d for d in raw_deals if _is_embedded(d)]
+    regular  = [d for d in raw_deals if not _is_embedded(d)]
+
+    urgent = any((_event_dt(d) or now) <= now + timedelta(days=3) for d in raw_deals)
     header_base = "🚨 Срочные!" if urgent else "📊 Новые игры"
-    chunks = [poll_deals[i:i + 8] for i in range(0, len(poll_deals), 8)]
-    for idx, chunk in enumerate(chunks, 1):
-        header = f"{header_base} (Часть {idx})" if len(chunks) > 1 else header_base
+
+    # общий план постов: каждый embedded — отдельный «чанк», обычные — пачками по 8
+    chunks: List[List[Dict[str, Any]]] = [[d] for d in embedded]
+    chunks += [regular[i:i + 8] for i in range(0, len(regular), 8)] or []
+
+    # функция публикации одного чанка
+    async def _post_chunk(idx: int, total: int, chunk: List[Dict[str, Any]]) -> None:
+        header = f"{header_base} (Часть {idx})" if total > 1 else header_base
         opts: List[str] = []
         idx_map: Dict[int, int] = {}
 
         for i, d in enumerate(chunk):
-            title = _deal_title(d)
+            title = _title(d)
             date_s, time_s = _deal_dt_parts(d)
             pkg_s, bonus_s = _deal_extras(d)
             parts: List[str] = [f"🎉 {title} — {date_s} {time_s}"]
@@ -848,25 +1228,31 @@ async def create_poll_handler(message: types.Message) -> None:
             if bonus_s:
                 parts.append(bonus_s)
             opts.append(truncate(" ".join(parts)))
-            idx_map[i] = int(d["id"])
+            idx_map[i] = int(d.get("id", 0))
 
         # служебные опции
         opts += ["🚫 Не смогу работать", "🛡️ Могу Администратором"]
 
         poll = await bot.send_poll(
-            state.admin_chat_id,
+            chat_id,
             header,
             opts,
             is_anonymous=False,
             allows_multiple_answers=True,
         )
         state.responses[poll.poll.id] = {
-            "deals": {int(d["id"]): [] for d in chunk},
+            "deals": {int(d.get("id", 0)): [] for d in chunk},
             "not_available": [],
             "admin_available": [],
             "deal_indices": idx_map,
         }
         logger.debug("[create_poll] poll sent: id=%s, deals=%s", poll.poll.id, list(idx_map.values()))
+
+    total_chunks = len(chunks)
+    for idx, chunk in enumerate(chunks, 1):
+        if not chunk:
+            continue
+        await _post_chunk(idx, total_chunks, chunk)
 
     # 5) финальный экран в ЛС лидера: «Опросы отправлены»
     await _screen("✅ Опросы отправлены.")
@@ -875,13 +1261,19 @@ async def create_poll_handler(message: types.Message) -> None:
     with contextlib.suppress(Exception):
         await message.delete()
 
+# История изменений:
+# 2025-08-20 — v6.6-SSOT: окно дат = settings.POLL_WINDOW_DAYS (фолбэк 10);
+#                публикация в чат через resolve_notify_chat_id();
+#                «встроенные» сделки публикуются отдельными опросами; Pylance-типы сохранены.
+
+
 # ════════════════════════════════════════════════════════════════════
 # [4] ОТЧЁТ ЛИДЕРУ / ПРИЁМ ОТВЕТОВ — редактирование «на месте»
-# Версия 6.6 · 2025-08-18
+# Версия 6.6 · 2025-08-20 (выровнено под SSOT; дубль хендлеров удалён)
 # ────────────────────────────────────────────────────────────────────
-# • Используем _edit_or_send_report() → отчёт не копится в ЛС.
-# • Удаляем только триггер пользователя; «старый отчёт» редактируется.
-# • Остальная логика без изменений: ready-счёт, auto-assign, refresh.
+# • Используем _edit_or_send_report() из [0.96] → отчёт не копится в ЛС.
+# • Хендлер "📊 Отчёт по опросу" и _sync_leader_report уже определены в [0.96].
+# • Здесь оставлены только построитель отчёта/клавиатуры и приём ответов.
 # ════════════════════════════════════════════════════════════════════
 
 def _merge_keyboards(k1: InlineKeyboardMarkup, k2: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
@@ -979,77 +1371,50 @@ def _build_report_keyboard() -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(inline_keyboard=rows if rows else [[InlineKeyboardButton(text="Обновить", callback_data="poll_back_to_games_list")]])
 
-async def _send_leader_report(leader_id: int) -> None:
-    """
-    Обновляет «личный» отчёт лидеру без размножения сообщений:
-    пробуем редактировать, иначе — подчистка и отправка нового.
-    """
-    text = await generate_poll_report()
-    kb = _build_report_keyboard()
-    await _edit_or_send_report(leader_id, text, kb)
-
-async def _sync_leader_report(leader_id: Optional[int] = None) -> None:
-    """Обратная совместимость: обновить отчёт лидеру (старый коллбэк)."""
-    lid = leader_id or getattr(state, "current_poll_leader", None)
-    if not lid:
-        with contextlib.suppress(Exception):
-            uids = await get_all_leader_uids()
-            lid = (uids or [None])[0]
-    if not lid:
-        logger.debug("[sync_report] leader_id undefined — skip")
-        return
-    await _send_leader_report(int(lid))
-
-# Алиас для внешних вызовов (polls_distribution._try_sync_report)
-async def sync_report() -> None:
-    await _sync_leader_report()
-
-@router.message(lambda m: (m.text or "") == "📊 Отчёт по опросу")
-async def poll_report_handler(message: types.Message) -> None:
-    """
-    Показывает «Отчёт по опросу» без копий:
-      • права доступа — как раньше,
-      • отчёт редактируется «на месте» (_edit_or_send_report),
-      • триггер пользователя удаляется.
-    """
-    uid = message.from_user.id
-    ui = await get_user_info(uid) or {}
-    if ui.get("role") not in getattr(settings, "ACCESS", {}).get("poll", ["admin", "leader"]):
-        await message.answer("⛔ Нет доступа.", reply_markup=await get_main_menu(uid))
-        await _delete_trigger(message)
-        return
-    if not state.coordination_cycle_active:
-        await message.answer("⚠️ Нет активных опросов.", reply_markup=await get_main_menu(uid))
-        await _delete_trigger(message)
-        return
-
-    # редактируем существующий отчёт или отправляем новый (жёсткая очистка внутри)
-    text = await generate_poll_report()
-    kb = _build_report_keyboard()
-    await _edit_or_send_report(uid, text, kb)
-
-    # обновим меню и удалим триггер
-    with contextlib.suppress(Exception):
-        await _refresh_menu(uid)
-    await _delete_trigger(message)
-
 @router.poll_answer()
 async def handle_poll_answer(event: types.PollAnswer) -> None:
-    """Фиксируем выборы пользователя, автораспределяем и пересчитываем готовность."""
-    uid, poll_id, chosen = event.user.id, event.poll_id, (event.option_ids or [])
+    """
+    Фиксируем текущее состояние ответов пользователя:
+    • удаляем его прошлые следы из текущего poll-чунка (deals/not_available/admin_available);
+    • добавляем новые выборы;
+    • пересчитываем distribution_cache как минимум для:
+        – всех сделок, из которых пользователь был удалён (отмена голоса);
+        – всех сделок, на которые он только что откликнулся;
+      и для ВСЕХ игр цикла, если изменился флаг «🛡️ Админом» (поставлен или снят).
+    """
+    uid: int = event.user.id
+    poll_id: str = event.poll_id
+    chosen: List[int] = list(event.option_ids or [])
+
     data = (state.responses or {}).get(poll_id)
-    if not data:
+    if not isinstance(data, dict):
         return
 
     logger.debug("[answer] uid=%d poll=%s choices=%s", uid, poll_id, chosen)
 
-    # 1) очистим следы прежних ответов этого uid
+    # --- 0) собрать «прежние» следы пользователя в этом poll-чунке
+    prev_impacted: Set[int] = set()
+    try:
+        deals_map: Dict[int, List[Dict[str, Any]]] = data.get("deals") or {}
+        for did, arr in deals_map.items():
+            if any(int(u.get("user_id", 0)) == uid for u in (arr or [])):
+                prev_impacted.add(int(did))
+    except Exception:
+        pass
+
+    prev_admin_flag = False
+    try:
+        prev_admin_flag = any(int(u.get("user_id", 0)) == uid for u in (data.get("admin_available") or []))
+    except Exception:
+        prev_admin_flag = False
+
+    # --- 1) удалить старые следы пользователя из этого poll-чунка
     for lst in (data.get("deals") or {}).values():
         lst[:] = [u for u in (lst or []) if int(u.get("user_id", 0)) != uid]
     data["not_available"][:] = [u for u in (data.get("not_available") or []) if int(u.get("user_id", 0)) != uid]
     data["admin_available"][:] = [u for u in (data.get("admin_available") or []) if int(u.get("user_id", 0)) != uid]
 
-    # 2) запишем новые
+    # --- 2) записать новые выборы пользователя
     ui = await get_user_info(uid) or {}
     base = {
         "user_id": uid,
@@ -1057,35 +1422,59 @@ async def handle_poll_answer(event: types.PollAnswer) -> None:
         "last_name_initial": ui.get("last_name_initial", ""),
         "is_admin_eligible": False,
     }
-    num = len(data.get("deal_indices") or {})
-    impacted: Set[int] = set()
-    admin_flag = False
+
+    deal_indices: Dict[int, int] = data.get("deal_indices") or {}
+    deals_count = len(deal_indices)
+    new_impacted: Set[int] = set()
+    new_admin_flag = False
 
     for idx in chosen:
-        if idx < num:
-            did = int((data["deal_indices"] or {})[idx])
+        if idx < deals_count:
+            did = int(deal_indices[idx])
             if did not in (state.deal_force_closed or set()):
-                (data["deals"][did]).append(base.copy())
-                impacted.add(did)
-        elif idx == num:
-            (data["not_available"]).append(base.copy())
+                (data["deals"][did]).append(dict(base))
+                new_impacted.add(did)
+        elif idx == deals_count:
+            (data["not_available"]).append(dict(base))
         else:
-            adm = base.copy()
-            adm["is_admin_eligible"] = True
+            adm = dict(base); adm["is_admin_eligible"] = True
             (data["admin_available"]).append(adm)
-            admin_flag = True  # влияет на ВСЕ игры
+            new_admin_flag = True
 
-    # 3) автораспределение (сразу обновит distribution_cache)
-    await _auto_assign_from_responses(impacted=impacted, apply_to_all_on_admin_flag=admin_flag)
+    # --- 3) определить область пересчёта
+    #    • всегда пересчитываем снятые и новые сделки;
+    #    • если изменился админ-флаг (поставили или сняли) — пересчитываем все игры цикла.
+    impacted: Set[int] = set(prev_impacted) | set(new_impacted)
+    admin_flag_changed: bool = (new_admin_flag != prev_admin_flag)
 
-    # 4) эффекты UI/индикации
-    await _sync_leader_report()
-    scope = impacted if not admin_flag else {int(d.get("id", 0)) for d in (state.current_poll_deals or [])}
-    await _check_ready_state(scope)
-    asyncio.create_task(_refresh_detail_views(scope, refresh_all=admin_flag))
+    if admin_flag_changed:
+        # все текущие игры цикла
+        impacted = {int(d.get("id", 0)) for d in (state.current_poll_deals or []) if int(d.get("id", 0))}
+    # если impacted пуст (например, пользователь снял ВСЕ галочки, кроме «не смогу»),
+    # но ранее был где-то отмечен — пересчитаем хотя бы прежние
+    if not impacted and prev_impacted:
+        impacted = set(prev_impacted)
 
+    # --- 4) автораспределение (обновит distribution_cache)
+    await _auto_assign_from_responses(
+        impacted=impacted,
+        apply_to_all_on_admin_flag=admin_flag_changed or new_admin_flag,
+    )
+
+    # --- 5) эффекты UI/индикации
+    await _sync_leader_report()  # отчёт лидеру всегда «редактируется на месте»
+    await _check_ready_state(impacted or set())
+    asyncio.create_task(_refresh_detail_views(impacted or set(), refresh_all=admin_flag_changed))
+
+    logger.debug(
+        "[answer] uid=%d prev_impacted=%s new_impacted=%s admin_changed=%s → recomputed=%s",
+        uid, sorted(prev_impacted), sorted(new_impacted), admin_flag_changed, sorted(impacted),
+    )
 # История изменений:
-# 2025-08-18 — v6.6: отчёт редактируется «на месте», пылесос устранён; остальное без изменений.
+# 2025-08-26 — при отмене голоса удаляем пользователя из кэша и пересчитываем затронутые сделки;
+#               изменение флага «🛡️ Админом» триггерит пересчёт всех игр цикла.
+
+
 
 # ════════════════════════════════════════════════════════════════════
 # [4.8] HANDLER: «Замена» из «Мои игры» (mygame_swap_{deal_id})

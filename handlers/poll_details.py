@@ -3,28 +3,30 @@
 """
 Реактивные карточки игр (detail-view) для цикла распределения.
 
-Версия 13.2 · 2025-08-13
+Версия 13.4 · 2025-08-24
 ──────────────────────────────────────────────────────────────────────────────
 • Единый источник правды по распределению — state.distribution_cache[str(deal_id)].
 • Жёсткая инварианта «1 пользователь = 1 роль» (приоритет main > assist > admin > trainee).
-• Автоподбор в пустые слоты по «Светофору» (green→main, yellow→assist).
+• Автоподбор в пустые слоты по «Светофору» (green→main, green|yellow→assist).
 • Стажёр: только «красный», не занятый в других ролях; стажёр не влияет на укомплектованность.
 • SWAP переносит кандидата между ролями, автоматически убирая его из прежних ролей.
 • Кнопка «Утвердить» делегируется в handlers.polls_distribution, без автопереходов.
-• Пылесос в ЛС: остаётся только текущая группа сообщений с деталями.
+• Пылесос в ЛС: перед рендером деталей удаляются старые сообщения; после действий — перерисовка.
 • Совместимость сигнатур refresh_deal_details:
   – новый стиль: refresh_deal_details(bot=Bot, deal_id=int, force_approved:bool=False, uid:Optional[int]=None)
   – старый стиль: refresh_deal_details(uid:int, deal_id:int)
 """
+
 # ███ [0] IMPORTS & SETUP
 # --------------------------------------------------------------------
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import time
-import contextlib  # ← добавлено для suppress(...) в [2]
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from aiogram import Bot, Router, types
@@ -34,6 +36,12 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from core.config import settings
 from core.state import state
 from core.utils import truncate, delete_previous_private_messages
+try:
+    # если есть современное ядро с вакуумом — используем
+    from core.utils import vacuum_private as _vacuum_private  # type: ignore
+except Exception:  # pragma: no cover
+    _vacuum_private = None  # type: ignore
+
 from services.gsheets import get_user_status_from_svetofor
 
 logger = logging.getLogger(__name__)
@@ -52,29 +60,18 @@ STATUS_CACHE_TTL = 60 * 60 * 4  # 4 часа
 
 # История изменений:
 # • 2025-08-13 — пересобран импорт, единая точка пылесоса, локальный статус-кэш.
-# • 2025-08-15 — добавлен import contextlib для suppress() в блоке [2].
+# • 2025-08-15 — добавлен import contextlib для suppress().
+# • 2025-08-24 — починен SWAP (ручная установка), стабилизирован рендер и пылесос.
 
 
 # ███ [1] HELPERS (normalize, role cfg, svetofor cache, tags/ids, invariants)
 # --------------------------------------------------------------------
-"""
-Хелперы для detail-view:
-• нормализация имени игры и толерантный поиск конфигурации ролей;
-• локальный кэш «Светофора»;
-• форматирование тегов «Имя.Суффикс|uid» и извлечение uid;
-• инварианта «1 пользователь → 1 роль» внутри одной игры.
-"""
-
 def _clean(s: str) -> str:
     return _STATUS_RE.sub(" ", (s or "")).lower().strip()
 
 
 def _role_cfg(game_name: str) -> Dict[str, int]:
-    """
-    Возвращает требуемые количества ролей для игры (толерантный поиск).
-    Формат: {"main_leaders": int, "assistants": int}
-    """
-    from difflib import SequenceMatcher
+    """Возвращает требуемые количества ролей для игры (толерантный поиск)."""
     norm = _clean(game_name)
     best_ratio = 0.0
     best_cfg: Optional[Dict[str, int]] = None
@@ -98,65 +95,53 @@ async def _status_cached(uid: int, game: str) -> str:
             return status
     try:
         status = await get_user_status_from_svetofor(uid, game)
-    except Exception as e:
+    except Exception as e:  # pragma: no cover
         logger.warning("[svetofor] fail uid=%s game=%s: %s", uid, game, e)
         status = ""
     _local_status_cache[key] = (status, now)
     return status
 
 
+# — регэксп валидного «Имя Ф.» (есть пробел и инициал с точкой)
+_NAME_WITH_INITIAL_RE = re.compile(r"^\S+\s[А-ЯA-Z]\.$")
+
+
 async def _short_name(uid: int) -> str:
-    """Имя в формате «Имя Ф.»; надёжный фолбэк по uid."""
+    """
+    Имя в формате «Имя Ф.».
+    1) если в state.user_short лежит валидное «Имя Ф.» — используем его;
+    2) иначе берём ФИО из БД и форматируем через core.utils.short_name();
+    3) фолбэк «uid:{uid}».
+    """
+    try:
+        cached = (getattr(state, "user_short", {}) or {}).get(uid)
+        if isinstance(cached, str) and _NAME_WITH_INITIAL_RE.match(cached.strip()):
+            return cached.strip()
+    except Exception:
+        pass
+
+    # получаем ФИО из БД (совместимо с sync/async)
     try:
         from core.db import get_user_info
         ui = get_user_info(uid)
-        if hasattr(ui, "__await__"):
-            ui = await ui  # поддержка async реализации
+        if hasattr(ui, "__await__"):  # async-совместимость
+            ui = await ui  # type: ignore[func-returns-value]
         ui = ui or {}
     except Exception:
         ui = {}
-    fn = str(ui.get("first_name") or "").strip()
-    ln = str(ui.get("last_name") or "").strip()
-    li = (ln[:1].upper() + ".") if ln else str(ui.get("last_name_initial") or "").strip()
-    res = (f"{fn} {li}".strip() or f"uid:{uid}").strip()
-    return res
 
+    first = str(ui.get("first_name") or "").strip()
+    last = str(ui.get("last_name") or "").strip()
+    if not first and not last:
+        return f"uid:{uid}"
 
-async def _fmt(uid_: int, role_key: str) -> str:
-    """
-    Формирует тег для кэша распределения/подтверждений:
-      main    -> «Имя Ф.1|uid»
-      assist  -> «Имя Ф.2|uid»
-      admin   -> «Имя Ф.Адм|uid»
-      trainee -> «Имя Ф.Стаж|uid»
-    Источник имени — сначала state.user_short (там уже «Имя Ф.»), затем fallback на БД.
-    """
-    # 1) предпочитаем кэш коротких имён (формат «Имя Ф.»)
-    human = None
-    try:
-        human = getattr(state, "user_short", {}).get(uid_)
-    except Exception:
-        human = None
-    # 2) фолбэк на базу
-    if not human:
-        human = await _short_name(uid_)
-
-    suffix = {
-        "main": ".1",
-        "assist": ".2",
-        "admin": ".Адм",
-        "trainee": ".Стаж",
-    }.get(role_key, "")
-    return f"{human}{suffix}|{uid_}".strip()
-
-
-def _tag_uid(tag: Optional[str]) -> Optional[int]:
-    if not tag or "|" not in str(tag):
-        return None
-    try:
-        return int(str(tag).rsplit("|", 1)[-1])
-    except Exception:
-        return None
+    # используем SSOT функцию short_name на словаре (чтобы получить «Имя Ф.»)
+    from core.utils import short_name as _ssot_short_name
+    subj = {"first_name": first, "last_name": last}
+    sn = _ssot_short_name(subj)
+    if hasattr(sn, "__await__"):
+        sn = await sn  # type: ignore[func-returns-value]
+    return str(sn or f"uid:{uid}").strip()
 
 
 def _role_slots(need_main: int, need_assist: int) -> Tuple[List[str], List[str]]:
@@ -170,20 +155,42 @@ def _need_admin_by_package(pkg_raw: str) -> int:
     return 1 if _clean(pkg_raw) in _ADMIN_PKGS else 0
 
 
+def _parse_uid(tag: Optional[str]) -> Optional[int]:
+    """SSOT-парсер uid из строки слота/тега «…|uid»."""
+    if not tag:
+        return None
+    s = str(tag).strip()
+    if "|" in s:
+        with contextlib.suppress(Exception):
+            return int(s.rsplit("|", 1)[-1])
+    with contextlib.suppress(Exception):
+        return int(s)
+    return None
+
+
+async def _fmt(uid_: int, role_key: str) -> str:
+    """
+    Формирует тег для кэша распределения/подтверждений:
+      main    -> «Имя Ф.1|uid»
+      assist  -> «Имя Ф.2|uid»
+      admin   -> «Имя Ф.Адм|uid»
+      trainee -> «Имя Ф.Стаж|uid»
+    """
+    from core.utils import role_suffix as _role_suffix
+    human = await _short_name(uid_)
+    idx = 1 if role_key == "main" else (2 if role_key == "assist" else None)
+    suffix = _role_suffix(role_key, idx)
+    return f"{human}{suffix}|{uid_}".strip()
+
+
 async def _ensure_single_role(dist: Dict[str, str], need_main: int, need_assist: int) -> None:
-    """
-    Инварианта «один UID — одна роль» для одной игры.
-    Если UID встречается в нескольких местах, сохраняем первое в порядке приоритета:
-      main > assist > admin > trainee; остальные вхождения вычищаем.
-    Также подчищаем слоты вне допустимых диапазонов.
-    """
+    """Инварианта «один UID — одна роль»; приоритет: main > assist > admin > trainee."""
     leads, assis = _role_slots(need_main, need_assist)
     priority_keys: List[str] = [*leads, *assis, "admin", "trainee"]
 
     seen: Set[int] = set()
     for key in priority_keys:
-        val = dist.get(key)
-        uid = _tag_uid(val)
+        uid = _parse_uid(dist.get(key))
         if uid is None:
             continue
         if uid in seen:
@@ -191,597 +198,1680 @@ async def _ensure_single_role(dist: Dict[str, str], need_main: int, need_assist:
         else:
             seen.add(uid)
 
-    # убрать мусорные ключи вне диапазона
     for key in list(dist.keys()):
         if key.startswith("lead"):
-            try:
-                idx = int("".join(ch for ch in key if ch.isdigit()) or "0")
-            except Exception:
-                idx = 0
+            idx = int("".join(ch for ch in key if ch.isdigit()) or "0")
             if idx < 1 or idx > need_main:
                 dist.pop(key, None)
         elif key.startswith("assistant"):
-            try:
-                idx = int("".join(ch for ch in key if ch.isdigit()) or "0")
-            except Exception:
-                idx = 0
+            idx = int("".join(ch for ch in key if ch.isdigit()) or "0")
             if idx < 1 or idx > need_assist:
                 dist.pop(key, None)
 
 
 async def _normalize_tag_texts(dist: Dict[str, str], need_main: int, need_assist: int) -> None:
-    """
-    Приводит текст тегов к каноническому виду «Имя Ф.+суффикс|uid», пересобирая по uid.
-    Чинит старые записи вида «Антон.1|uid», где отсутствовал инициал.
-    """
+    """Приводит тексты слотов к «Имя Ф.+суффикс|uid», пересобирая по uid."""
     leads, assis = _role_slots(need_main, need_assist)
-
-    # main / assist
     for role, keys in (("main", leads), ("assist", assis)):
         for k in keys:
-            uid = _tag_uid(dist.get(k))
+            uid = _parse_uid(dist.get(k))
             if uid:
                 dist[k] = await _fmt(uid, role)
-
-    # admin / trainee
     for role, k in (("admin", "admin"), ("trainee", "trainee")):
-        uid = _tag_uid(dist.get(k))
+        uid = _parse_uid(dist.get(k))
         if uid:
             dist[k] = await _fmt(uid, role)
 
-# История изменений: добавлены _need_admin_by_package, жёсткая инварианта и нормализация текстов тегов (2025-08-13)
 
-# ███ [1.5] UTILS: enforce_single_role (совместимо с polls_distribution)
-# --------------------------------------------------------------------
-from typing import Any, Dict, List, Optional, Set
-
-def _enforce_single_role(data: Dict[str, Any], *, need_main: Optional[int] = None, need_assist: Optional[int] = None) -> Dict[str, Any]:
+async def _vacuum(uid: int, *, keep: Optional[List[int]] = None, bot: Optional[Bot] = None) -> None:
     """
-    Универсальная защита «1 uid → 1 роль» с приоритетом: main > assist > admin > trainee.
-
-    Принимает два типа структур:
-    1) РОЛЕВАЯ:
-       {"main":[int], "assist":[int], "admin":[int]} → вернёт НОВЫЙ dict без дублей.
-    2) СЛОТОВАЯ (distribution_cache/poll_details):
-       {"lead1":"Имя.1|uid", "assistant1":"Имя.2|uid", "admin":"Имя.Адм|uid", ...}
-       → чистит ДУБЛИ НА МЕСТЕ и подрезает лишние слоты за пределами need_main/need_assist.
-         Возвращает исходный dict (для удобства чейнинга).
-
-    Параметры need_main/need_assist нужны только для слотовой схемы.
-    Если не заданы — определяются по максимальному индексу lead*/assistant* в data.
+    Унифицированный вызов «пылесоса».
+    Если есть core.utils.vacuum_private — используем его. Иначе fallback на delete_previous_private_messages.
     """
-    # Ветка 1: ролевая структура
-    if any(k in data for k in ("main", "assist", "admin")) and not any(
-        k for k in data.keys() if isinstance(k, str) and (k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"})
-    ):
-        roles_in = {
-            "main":  [int(u) for u in (data.get("main")   or []) if isinstance(u, int)],
-            "assist":[int(u) for u in (data.get("assist") or []) if isinstance(u, int)],
-            "admin": [int(u) for u in (data.get("admin")  or []) if isinstance(u, int)],
-        }
-        seen: Set[int] = set()
-        out: Dict[str, List[int]] = {"main": [], "assist": [], "admin": []}
-        for u in roles_in["main"]:
-            if u not in seen:
-                out["main"].append(u); seen.add(u)
-        for u in roles_in["assist"]:
-            if u not in seen:
-                out["assist"].append(u); seen.add(u)
-        for u in roles_in["admin"]:
-            if u not in seen:
-                out["admin"].append(u); seen.add(u)
-        return out  # новый объект
-
-    # Ветка 2: слотовая структура
-    dist: Dict[str, Any] = data
-
-    # Определяем потребности, если не заданы
-    if need_main is None:
-        max_lead = 0
-        for k in dist.keys():
-            if isinstance(k, str) and k.startswith("lead"):
-                with contextlib.suppress(Exception):
-                    max_lead = max(max_lead, int("".join(ch for ch in k if ch.isdigit()) or "0"))
-        need_main = max(1, max_lead)
-    if need_assist is None:
-        max_asst = 0
-        for k in dist.keys():
-            if isinstance(k, str) and k.startswith("assistant"):
-                with contextlib.suppress(Exception):
-                    max_asst = max(max_asst, int("".join(ch for ch in k if ch.isdigit()) or "0"))
-        need_assist = max(0, max_asst)
-
-    leads = [f"lead{i}" for i in range(1, max(1, int(need_main)) + 1)]
-    assis = [f"assistant{i}" for i in range(1, max(0, int(need_assist)) + 1)]
-    priority_keys: List[str] = [*leads, *assis, "admin", "trainee"]
-
-    seen_uids: Set[int] = set()
-    # проход по приоритету: первое вхождение uid остаётся, последующие вычищаем
-    for key in priority_keys:
-        val = dist.get(key)
-        uid = _tag_uid(val) if isinstance(val, str) else None
-        if uid is None:
-            continue
-        if uid in seen_uids:
-            dist.pop(key, None)
+    keep = keep or []
+    if _vacuum_private:
+        with contextlib.suppress(Exception):
+            await _vacuum_private(uid, keep=keep)  # type: ignore[misc]
+        return
+    # fallback на старую функцию
+    try:
+        if bot is not None:
+            await delete_previous_private_messages(bot, uid, keep=keep)  # новая сигнатура
         else:
-            seen_uids.add(uid)
+            await delete_previous_private_messages(uid)  # старая сигнатура
+    except TypeError:
+        with contextlib.suppress(Exception):
+            await delete_previous_private_messages(uid)  # type: ignore[misc]
 
-    # подрезаем мусорные ключи вне диапазонов
-    for key in list(dist.keys()):
-        if isinstance(key, str) and key.startswith("lead"):
-            with contextlib.suppress(Exception):
-                idx = int("".join(ch for ch in key if ch.isdigit()) or "0")
-                if idx < 1 or idx > int(need_main):
-                    dist.pop(key, None)
-        elif isinstance(key, str) and key.startswith("assistant"):
-            with contextlib.suppress(Exception):
-                idx = int("".join(ch for ch in key if ch.isdigit()) or "0")
-                if idx < 1 or idx > int(need_assist):
-                    dist.pop(key, None)
 
-    return dist  # тот же объект (in-place), для удобства использования
-
-# ███ [2] CORE RENDER — общий рендер карточки (используется show/refresh)
-# --------------------------------------------------------------------
 async def _render_detail(uid: int, deal_id: int, bot: Bot, *, force_approved: bool = False) -> None:
     """
-    Рисует карточку игры user→deal_id:
-      • автоподбор в пустые слоты с учётом «Светофора»;
-      • инварианта «1 uid → 1 роль»;
-      • стажёр (красный);
+    Рисует карточку игры user→deal_id через единый билдер (_build_blocks):
+      • стабильная последовательность секций (header → role → role_alt → … → trainee → mgr → back);
+      • инварианта «1 uid → 1 роль» и автоподбор/стажёр — внутри билдера;
       • кнопки «Утвердить/Стоп/Назад».
 
     ВАЖНО:
-    • Перед показом — жёсткий пылесос delete_previous_private_messages(bot, uid).
-    • Все отправленные сообщения добавляем в state.last_user_messages[uid].
-    • detail-блоки храним в state.detail_blocks[(uid, deal_id)] (utils их затем чистит).
+    • Перед показом — жёсткий пылесос (оставляем только новый блок).
+    • После отправки — фиксируем реестр сообщений через _set_block(...),
+      а также ЛИНКУЕМ блок в last_user_messages, чтобы глобальные вакуумы могли корректно его убирать.
     """
-    # Пылесос: в деталях оставляем только текущий блок
+    # Диагностика: снимок реестра до рендера
     try:
-        await delete_previous_private_messages(bot, uid, keep=[])
-    except TypeError:
-        # совместимость со старой сигнатурой
-        with contextlib.suppress(Exception):
-            await delete_previous_private_messages(uid)  # type: ignore
+        from core.state import state as _st
+        snapshot_before = {
+            did: len(v or [])
+            for (u, did), v in (getattr(_st, "detail_blocks", {}) or {}).items()
+            if int(u) == int(uid)
+        }
+        logger.info("poll_details[render] pre-vacuum uid=%s deal=%s blocks=%s", uid, deal_id, snapshot_before)
+    except Exception:
+        pass
 
-    # Поиск сделки в текущем опросе
-    deal = next((d for d in (state.current_poll_deals or []) if int(d.get("id") or 0) == deal_id), None)
+    # 0) Пылесос перед рендером
+    await _vacuum(uid, bot=bot, keep=[])
+
+    # 1) Проверяем, что сделка есть в текущем опросе
+    deal = next((d for d in (state.current_poll_deals or []) if int(d.get("id") or 0) == int(deal_id)), None)
     if not deal:
+        # Сообщение об ошибке тоже фиксируем как блок, чтобы не потерять контекст
         msg = await bot.send_message(uid, "⚠️ Игра не найдена или уже закрыта.")
-        # даже в случае ошибки положим сообщение в last_user_messages
-        (getattr(state, "last_user_messages", {}) or {}).setdefault(uid, [])
-        state.last_user_messages[uid] = [msg]
+        _set_block(uid, deal_id, [msg])
+        _link_to_last_user_messages(uid, [msg])
+        logger.info("poll_details[render] created-ERROR uid=%s deal=%s mids=[%s]", uid, deal_id, getattr(msg, "message_id", None))
         return
 
-    g_name = str(deal.get("game_name") or deal.get("name") or "Игра")
-    # дата/время
-    date_s = deal.get("event_datetime")
-    date_s = date_s.strftime("%d.%m.%Y") if hasattr(date_s, "strftime") else str(deal.get("event_date") or "—")
-    time_s = str(deal.get("event_time") or "—")
-    # пакет/игроки
-    pkg_raw = str(deal.get("package") or "—").strip()
-    pkg_icon = {"компакт": "🎒", "стандарт": "📦", "стандарт+": "📦➕", "премиум": "💎", "vip": "👑", "вип": "👑"}.get(_clean(pkg_raw), "🎁")
-    players = truncate(str(deal.get("players") or deal.get("players_count") or "—"), 40)
+    # 2) Строим тексты/кнопки единственным источником (совпадает с refresh)
+    built = await _build_blocks(bot=bot, uid=uid, deal_id=deal_id, force_approved=force_approved)  # type: ignore[name-defined]
+    seq = built.get("sequence") or []
 
-    header = (
-        f"🎮 *{g_name}*\n"
-        f"📅 {date_s} · 🕒 {time_s}\n"
-        f"📦 *Пакет:* {pkg_icon} {pkg_raw}\n"
-        f"👥 *Игроки:* {players}"
+    # 3) Нормализуем и отправляем сообщения в точном порядке
+    msgs: List[types.Message] = []
+    for text, kb in seq:
+        t = (text if text is not None else "\u2060") or "\u2060"
+        m = await bot.send_message(
+            uid,
+            t,
+            parse_mode="Markdown",
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+        msgs.append(m)
+
+    # 4) Сохраняем реестр и линкуем в last_user_messages — для корректной уборки внешним пылесосом
+    _set_block(uid, deal_id, msgs)
+    _link_to_last_user_messages(uid, msgs)
+
+    # Диагностика: снимок реестра после рендера
+    try:
+        from core.state import state as _st
+        snapshot_after = {
+            did: len(v or [])
+            for (u, did), v in (getattr(_st, "detail_blocks", {}) or {}).items()
+            if int(u) == int(uid)
+        }
+        logger.info(
+            "poll_details[render] created uid=%s deal=%s msgs=%s blocks=%s",
+            uid, deal_id, [getattr(m, "message_id", None) for m in msgs], snapshot_after
+        )
+    except Exception:
+        logger.info(
+            "poll_details[render] created uid=%s deal=%s msgs=%s",
+            uid, deal_id, [getattr(m, "message_id", None) for m in msgs]
+        )
+
+
+
+# ███ [2.1] RENDER & REFRESH
+# --------------------------------------------------------------------
+
+# ────────────────────────────────────────────────────────────────────
+# [2.1.1] Импорты и базовые константы
+# ────────────────────────────────────────────────────────────────────
+
+import contextlib
+import logging
+from typing import Any, Dict, List, Optional, Tuple, Set
+
+from aiogram import Bot, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest
+
+logger = logging.getLogger(__name__)
+
+# Если константа объявлена выше в файле — используем её. Иначе — мягкий дефолт.
+try:  # noqa: SIM105
+    POLL_BACK  # type: ignore[name-defined]
+except NameError:  # pragma: no cover
+    POLL_BACK = "poll_back_to_games_list"  # type: ignore[assignment]
+
+# Пояснение:
+# _render_detail (из блока [2]) — полный первичный рендер.
+# render_detail  — обёртка: если уже есть сообщения → тихий refresh, иначе полный рендер.
+# refresh_deal_details — «тихий» апдейт; точечно правит текст/markup по позициям, без массового удаления.
+
+
+# ────────────────────────────────────────────────────────────────────
+# [2.1.2] Утилиты последовательностей и «тихих» правок в Telegram
+# ────────────────────────────────────────────────────────────────────
+def _normalize_seq(
+    sequence: List[Tuple[Optional[str], Optional[InlineKeyboardMarkup]]]
+) -> List[Tuple[str, Optional[InlineKeyboardMarkup]]]:
+    """Гарантируем текст для каждого элемента (None → U+2060)."""
+    out: List[Tuple[str, Optional[InlineKeyboardMarkup]]] = []
+    for text, kb in sequence:
+        t = (text if text is not None else "\u2060") or "\u2060"
+        out.append((t, kb))
+    return out
+
+
+async def _safe_send(bot: Bot, chat_id: int, text: str, kb: Optional[InlineKeyboardMarkup]) -> types.Message:
+    """Единообразная отправка (Markdown, без превью)."""
+    return await bot.send_message(
+        chat_id, text, parse_mode="Markdown",
+        reply_markup=kb, disable_web_page_preview=True
     )
-    msgs: List[types.Message] = [await bot.send_message(uid, header, parse_mode="Markdown")]
 
-    # Требуемые роли
+
+async def _safe_edit_text_and_markup(
+    bot: Bot,
+    chat_id: int,
+    msg: types.Message,
+    *,
+    text: Optional[str],
+    kb: Optional[InlineKeyboardMarkup],
+) -> Tuple[str, Optional[types.Message]]:
+    """
+    Пробуем тихо обновить сообщение:
+      • если text is not None — edit_message_text(+reply_markup),
+      • иначе — edit_message_reply_markup.
+    Возврат: ("ok" | "not_modified" | "not_found" | "error", new_msg_if_replaced)
+    """
+    if text is not None:
+        st = await _edit_text_status(bot, chat_id, msg.message_id, text)
+        if st == "not_found":
+            # Сообщение исчезло — шлём новое
+            new_msg = await _safe_send(bot, chat_id, text or (msg.text or "\u2060") or "\u2060", kb)
+            return "ok", new_msg
+        if st in {"ok", "not_modified"}:
+            st_m = await _edit_markup_status(bot, chat_id, msg.message_id, kb)
+            if st_m == "not_found":
+                new_msg = await _safe_send(bot, chat_id, text or (msg.text or "\u2060") or "\u2060", kb)
+                return "ok", new_msg
+            return st, None
+        return st, None
+    else:
+        st = await _edit_markup_status(bot, chat_id, msg.message_id, kb)
+        if st == "not_found":
+            new_msg = await _safe_send(bot, chat_id, (msg.text or "\u2060") or "\u2060", kb)
+            return "ok", new_msg
+        return st, None
+
+
+# ────────────────────────────────────────────────────────────────────
+# [2.1.3] Реестр сообщений деталей: хранение (List[int]) + миграция ключей
+# ────────────────────────────────────────────────────────────────────
+def _who_called(max_up: int = 3) -> str:
+    """Короткая цепочка вызовов — для быстрой диагностики, кто изменил реестр."""
+    import inspect
+    frm = inspect.stack()[2:max_up+2]
+    chain = [f"{f.function}:{f.lineno}" for f in frm]
+    return " <= ".join(chain)
+
+
+def _ensure_registry() -> None:
+    """
+    Инициализирует контейнеры в state:
+      • detail_blocks: Dict[Tuple[int,int], List[int]] — список message_id карточки деталей (SSOT)
+      • detail_index : Dict[Tuple[int,int], Dict[str,int]] — карта key->message_id (header/main/…)
+      • last_user_messages: Dict[int, List[int|Message]] — общий список сообщений в ЛС
+    """
+    from core.state import state as _st
+    if not isinstance(getattr(_st, "detail_blocks", None), dict):
+        _st.detail_blocks = {}
+    if not isinstance(getattr(_st, "detail_index", None), dict):
+        _st.detail_index = {}
+    if not isinstance(getattr(_st, "last_user_messages", None), dict):
+        _st.last_user_messages = {}
+
+
+def _reg_key(uid: int, deal_id: int) -> Tuple[int, int]:
+    return (int(uid), int(deal_id))
+
+
+class _MsgStub:
+    """Лёгкая обёртка вокруг message_id, чтобы обращаться как к Message."""
+    __slots__ = ("message_id", "text")
+    def __init__(self, mid: int, text: Optional[str] = None) -> None:
+        self.message_id = int(mid)
+        self.text = (text or "").strip()
+
+
+def _to_msg_list(raw: Any) -> List[types.Message]:
+    """
+    Унифицирует разные форматы хранения блока:
+      • List[Message]         — старый формат
+      • List[int] / int       — SSOT-формат
+      • None/прочее           — пусто
+    Возвращает List[Message]-совместимый список (stub'ы на id).
+    """
+    out: List[types.Message] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, types.Message):
+                out.append(item)
+            else:
+                with contextlib.suppress(Exception):
+                    out.append(_MsgStub(int(item)))  # type: ignore[return-value]
+    elif isinstance(raw, int) and raw > 0:
+        out.append(_MsgStub(raw))  # type: ignore[return-value]
+    return out
+
+
+def _extract_ids(msgs: List[types.Message]) -> List[int]:
+    ids: List[int] = []
+    for m in msgs:
+        mid = getattr(m, "message_id", None)
+        if isinstance(mid, int):
+            ids.append(mid)
+    return ids
+
+
+def _cleanup_registry_keys() -> None:
+    """
+    Нормализует ключи detail_blocks/detail_index к виду (uid:int, deal_id:int).
+    Чистит строки вида "uid:deal", "uid|deal", ("uid","deal") и т.п., переводя в tuple[int,int].
+    Удаляет мусорные ключи, чтобы фоновые итераторы `for (uid, deal_id), ...` не падали.
+    """
+    from core.state import state as _st
+
+    def _normalize_dict_keys(d: Any) -> None:
+        if not isinstance(d, dict):
+            return
+        add: Dict[Tuple[int, int], Any] = {}
+        remove: List[Any] = []
+        for k, v in list(d.items()):
+            # уже корректный ключ-двойка
+            if isinstance(k, tuple) and len(k) == 2:
+                try:
+                    nk = (int(k[0]), int(k[1]))
+                except Exception:
+                    remove.append(k)
+                    continue
+                if nk != k:
+                    add[nk] = v
+                    remove.append(k)
+                continue
+            # строковые ключи "uid:deal" / "uid|deal" / "uid,deal" / "uid/deal"
+            if isinstance(k, str):
+                for sep in (":", "|", ",", "/"):
+                    if sep in k:
+                        left, right = k.split(sep, 1)
+                        with contextlib.suppress(Exception):
+                            nk = (int(left.strip()), int(right.strip()))
+                            add[nk] = v
+                            remove.append(k)
+                        break
+                else:
+                    remove.append(k)
+                continue
+            # что-то ещё — удаляем
+            remove.append(k)
+        for k in remove:
+            d.pop(k, None)
+        d.update(add)
+
+    _normalize_dict_keys(getattr(_st, "detail_blocks", None))
+    _normalize_dict_keys(getattr(_st, "detail_index", None))
+
+
+def _get_block(uid: int, deal_id: int) -> List[types.Message]:
+    from core.state import state as _st
+    _ensure_registry()
+    _cleanup_registry_keys()
+    raw = (_st.detail_blocks or {}).get(_reg_key(uid, deal_id))
+    msgs = _to_msg_list(raw)
+    logger.debug(
+        "poll_details[registry] get_block uid=%s deal=%s mids=%s len=%s",
+        uid, deal_id, [getattr(m, "message_id", None) for m in msgs], len(msgs)
+    )
+    return msgs
+
+
+def _save_detail_index(uid: int, deal_id: int, msgs: List[types.Message]) -> None:
+    """
+    Построить и сохранить карту key->message_id для деталей (header/main/main_alt/assist/...).
+    Добавлены страховки: если эвристика не нашла header/back — берём первый/последний сообщения.
+    """
+    from core.state import state as _st
+    _ensure_registry()
+    _cleanup_registry_keys()
+
+    idx_msgs = _index_current_blocks(msgs)
+    mapping: Dict[str, int] = {}
+    for k, m in idx_msgs.items():
+        mid = getattr(m, "message_id", None)
+        if isinstance(mid, int):
+            mapping[k] = mid
+
+    if "header" not in mapping and msgs:
+        hmid = getattr(msgs[0], "message_id", None)
+        if isinstance(hmid, int):
+            mapping["header"] = hmid
+    if "back" not in mapping and msgs:
+        bmid = getattr(msgs[-1], "message_id", None)
+        if isinstance(bmid, int):
+            mapping["back"] = bmid
+
+    _st.detail_index[_reg_key(uid, deal_id)] = mapping
+    logger.debug("poll_details[registry] index-saved uid=%s deal=%s map=%s", uid, deal_id, mapping)
+
+
+def _get_index_by_mapping(uid: int, deal_id: int) -> Dict[str, types.Message]:
+    """
+    Вернуть карту key->MessageStub по сохранённой detail_index.
+    Это позволяет refresh-у адресно редактировать сообщения по ID, даже если у нас только List[int].
+    """
+    from core.state import state as _st
+    _ensure_registry()
+    _cleanup_registry_keys()
+
+    mapping: Dict[str, int] = {}
+    try:
+        mapping = (getattr(_st, "detail_index", {}) or {}).get(_reg_key(uid, deal_id), {}) or {}
+    except Exception:
+        mapping = {}
+
+    out: Dict[str, types.Message] = {}
+    for k, mid in mapping.items():
+        with contextlib.suppress(Exception):
+            out[k] = _MsgStub(int(mid))  # type: ignore[return-value]
+
+    logger.debug("poll_details[registry] get_index uid=%s deal=%s keys=%s", uid, deal_id, sorted(mapping.keys()))
+    return out
+
+
+def _update_detail_index(uid: int, deal_id: int, key: str, message_id: Optional[int]) -> None:
+    """
+    Обновить карту key->message_id: записать новый id для ключа (или удалить ключ, если message_id=None).
+    """
+    from core.state import state as _st
+    _ensure_registry()
+    _cleanup_registry_keys()
+
+    reg_key = _reg_key(uid, deal_id)
+    entry = (getattr(_st, "detail_index", {}) or {}).get(reg_key)
+    if not isinstance(entry, dict):
+        entry = {}
+        _st.detail_index[reg_key] = entry
+
+    prev = entry.get(key) if isinstance(entry.get(key), int) else None
+    if message_id is None:
+        entry.pop(key, None)
+    else:
+        entry[key] = int(message_id)
+
+    logger.debug(
+        "poll_details[registry] index-updated uid=%s deal=%s key=%s %s->%s caller=%s",
+        uid, deal_id, key, prev, message_id, _who_called()
+    )
+
+
+def _set_block(uid: int, deal_id: int, msgs: List[types.Message]) -> None:
+    """
+    Сохраняем реестр сообщений деталей как List[int] — SSOT-совместимо.
+    Дополнительно сохраняем карту key->message_id (detail_index), чтобы refresh мог работать с ID.
+    """
+    from core.state import state as _st
+    _ensure_registry()
+    _cleanup_registry_keys()
+
+    key = _reg_key(uid, deal_id)
+    new_ids = _extract_ids(msgs)
+
+    # прежнее состояние — для диагностики
+    prev_ids = []
+    if isinstance(getattr(_st, "detail_blocks", None), dict):
+        prev_raw = (getattr(_st, "detail_blocks", {}) or {}).get(key)
+        prev_ids = prev_raw if isinstance(prev_raw, list) else ([prev_raw] if isinstance(prev_raw, int) else [])
+        prev_ids = [int(x) for x in prev_ids if isinstance(x, int)]
+
+    if not isinstance(getattr(_st, "detail_blocks", None), dict):
+        _st.detail_blocks = {}
+    _st.detail_blocks[key] = new_ids
+
+    try:
+        _save_detail_index(uid, deal_id, msgs)
+    finally:
+        logger.debug(
+            "poll_details[registry] set_block uid=%s deal=%s was=%s -> new=%s caller=%s",
+            uid, deal_id, prev_ids, new_ids, _who_called()
+        )
+        if not new_ids:
+            logger.info("poll_details[registry] set_block EMPTY uid=%s deal=%s", uid, deal_id)
+
+
+def _detach_from_last_user_messages(uid: int, keep: List[types.Message]) -> None:
+    """
+    Удаляет detail-сообщения из state.last_user_messages[uid], чтобы внешние вакуумы
+    не сносили карточку, и «тихие» правки были возможны.
+    Поддерживает как Message-объекты, так и int message_id в текущем списке пользователя.
+    """
+    from core.state import state as _st
+    lst = getattr(_st, "last_user_messages", None)
+    if not isinstance(lst, dict):
+        logger.debug("poll_details[registry] detach skipped: no last_user_messages dict")
+        return
+    cur = lst.get(int(uid))
+    if not isinstance(cur, list):
+        logger.debug("poll_details[registry] detach skipped: last_user_messages[%s] is not list", uid)
+        return
+
+    keep_ids = set(_extract_ids(keep))
+
+    def _id_of(x: Any) -> Optional[int]:
+        mid = getattr(x, "message_id", None)
+        if isinstance(mid, int):
+            return mid
+        with contextlib.suppress(Exception):
+            return int(x)
+        return None
+
+    before_len = len(cur)
+    filtered: List[Any] = []
+    removed: List[int] = []
+    for item in cur:
+        mid = _id_of(item)
+        if isinstance(mid, int) and mid in keep_ids:
+            removed.append(mid)
+            continue
+        filtered.append(item)
+    lst[int(uid)] = filtered
+    logger.debug(
+        "poll_details[registry] detach uid=%s removed=%s before=%s after=%s keep=%s",
+        uid, removed, before_len, len(filtered), sorted(list(keep_ids))
+    )
+
+
+def _link_to_last_user_messages(uid: int, keep: List[types.Message]) -> None:
+    """
+    Регистрирует detail-сообщения в state.last_user_messages[uid], чтобы
+    глобальные вакуумы (меню/дашборд) могли их корректно удалить.
+    Не добавляет дубликаты; поддерживает и int, и Message.
+    """
+    from core.state import state as _st
+    lst = getattr(_st, "last_user_messages", None)
+    if not isinstance(lst, dict):
+        _st.last_user_messages = {}
+        lst = _st.last_user_messages
+
+    cur = lst.get(int(uid))
+    if not isinstance(cur, list):
+        cur = []
+        lst[int(uid)] = cur
+
+    def _id_of(x: Any) -> Optional[int]:
+        mid = getattr(x, "message_id", None)
+        if isinstance(mid, int):
+            return mid
+        with contextlib.suppress(Exception):
+            return int(x)
+        return None
+
+    existing_ids: Set[int] = {m for m in (_id_of(x) for x in cur) if isinstance(m, int)}
+    added: List[int] = []
+    for mid in _extract_ids(keep):
+        if mid not in existing_ids:
+            cur.append(mid)  # храним как int — SSOT-совместимо
+            existing_ids.add(mid)
+            added.append(mid)
+
+    logger.debug("poll_details[registry] link uid=%s added=%s total=%s", uid, added, len(cur))
+
+
+
+
+# ────────────────────────────────────────────────────────────────────
+# [2.1.4] Публичные функции рендера (обёртка и «тихий» апдейт)
+# ────────────────────────────────────────────────────────────────────
+async def render_detail(*, bot: Bot, uid: int, deal_id: int, force_approved: bool = False) -> None:
+    """
+    Если блок уже открыт — делаем «тихий» refresh.
+    Если блока нет — выполняем первичный рендер через _render_detail().
+    ВАЖНО: _render_detail сам записывает detail_blocks/detail_index и
+    отвязывает их от last_user_messages — здесь повторно ничего не трогаем.
+    """
+    prev_msgs = _get_block(uid, deal_id)
+    logger.info("poll_details[render] start uid=%s deal=%s has_prev=%s", uid, deal_id, bool(prev_msgs))
+    if prev_msgs:
+        await refresh_deal_details(bot=bot, uid=uid, deal_id=deal_id, force_approved=force_approved)
+        return
+
+    await _render_detail(uid=uid, deal_id=deal_id, bot=bot, force_approved=force_approved)
+    created = _get_block(uid, deal_id)
+    logger.info(
+        "poll_details[render] created uid=%s deal=%s msgs=%s",
+        uid, deal_id, [getattr(m, "message_id", None) for m in created]
+    )
+    # _render_detail уже сделал _set_block и _detach_from_last_user_messages
+
+
+async def refresh_deal_details(*, bot: Bot, uid: int, deal_id: int, force_approved: bool = False) -> None:
+    """
+    «Тихий» апдейт карточки деталей. Ничего массово не удаляет:
+    правит текст/markup по адресным message_id из detail_index,
+    при рассинхроне дописывает «хвост» и обновляет реестр.
+    """
+    # 0) Текущее состояние блока
+    current_msgs: List[types.Message] = _get_block(uid, deal_id)
+    index = _get_index_by_mapping(uid, deal_id)
+
+    cur_ids = [getattr(m, "message_id", None) for m in current_msgs]
+    logger.debug(
+        "poll_details[refresh] precheck uid=%s deal=%s cur_ids=%s index_keys=%s",
+        uid, deal_id, cur_ids, sorted(index.keys())
+    )
+
+    if not current_msgs and not index:
+        logger.info("poll_details[refresh] skip: block-not-open uid=%s deal=%s", uid, deal_id)
+        return
+
+    if not current_msgs and index:
+        logger.warning(
+            "poll_details[refresh] anomaly: index-exists-but-cur_ids-empty uid=%s deal=%s. "
+            "Вероятно, внешний вакуум. Будет выполнена хвостовая перезапись.",
+            uid, deal_id
+        )
+
+    # 1) Собираем свежие тексты/кнопки
+    built = await _build_blocks(bot=bot, uid=uid, deal_id=deal_id, force_approved=force_approved)
+    header_text = built.get("header_text")
+    main_text, main_alt = built.get("main_text"), built.get("main_alt")
+    assist_text, assist_alt = built.get("assist_text"), built.get("assist_alt")
+    admin_text, admin_alt = built.get("admin_text"), built.get("admin_alt")
+    trainee_text = built.get("trainee_text")
+    mgr_kb = built.get("mgr_kb")
+    back_kb = built.get("back_kb")
+
+    # 2) Эталонная последовательность (alt сразу после своей роли)
+    expected_keys: List[str] = ["header"]
+    if main_text:
+        expected_keys += ["main", "main_alt"]
+    if assist_text:
+        expected_keys += ["assist", "assist_alt"]
+    if admin_text:
+        expected_keys += ["admin", "admin_alt"]
+    if trainee_text:
+        expected_keys.append("trainee")
+    if mgr_kb is not None:
+        expected_keys.append("mgr")
+    expected_keys.append("back")
+
+    logger.debug("poll_details[refresh] expected_keys uid=%s deal=%s -> %s", uid, deal_id, expected_keys)
+
+    # 3) Ключи текущих сообщений (по сохранённой карте key->id)
+    mid_to_key: Dict[int, str] = {}
+    for k, stub in index.items():
+        mid = getattr(stub, "message_id", None)
+        if isinstance(mid, int):
+            mid_to_key[mid] = k
+
+    current_keys_in_order: List[str] = []
+    for m in current_msgs:
+        mid = getattr(m, "message_id", None)
+        if isinstance(mid, int):
+            k = mid_to_key.get(mid)
+            if k in expected_keys:
+                current_keys_in_order.append(k)
+
+    logger.info(
+        "poll_details[refresh] begin uid=%s deal=%s cur_ids=%s index_keys=%s",
+        uid, deal_id, cur_ids, sorted(index.keys())
+    )
+    logger.debug("poll_details[refresh] current_keys_in_order uid=%s deal=%s -> %s",
+                 uid, deal_id, current_keys_in_order)
+
+    # 4) Проверка порядка/целостности
+    pos_by_key: Dict[str, int] = {k: i for i, k in enumerate(current_keys_in_order)}
+    cut_from_ix = 0 if not current_msgs else len(expected_keys)
+
+    if current_msgs:
+        last_pos = -1
+        for i, k in enumerate(expected_keys):
+            msg_stub = index.get(k)
+            if not msg_stub or not isinstance(getattr(msg_stub, "message_id", None), int):
+                cut_from_ix = min(cut_from_ix, i); break
+            pos = pos_by_key.get(k)
+            if pos is None:
+                cut_from_ix = min(cut_from_ix, i); break
+            if k.endswith("_alt") and pos != last_pos + 1:
+                cut_from_ix = min(cut_from_ix, i - 1 if i > 0 else 0); break
+            last_pos = pos
+        else:
+            cut_from_ix = len(expected_keys)
+
+    # 5) Правки «на месте»
+    if cut_from_ix >= len(expected_keys):
+        logger.info("poll_details[refresh] order-ok uid=%s deal=%s → edit-in-place", uid, deal_id)
+
+        async def _edit_text(key: str, text: Optional[str]) -> None:
+            if not text:
+                return
+            m = index.get(key)
+            if not m:
+                return
+            st = await _edit_text_status(bot, uid, m.message_id, text)
+            logger.debug("poll_details[refresh] edit-text key=%s mid=%s status=%s", key, m.message_id, st)
+
+        async def _edit_kb(key: str, kb: Optional[InlineKeyboardMarkup]) -> None:
+            m = index.get(key)
+            if not m:
+                return
+            st = await _edit_markup_status(bot, uid, m.message_id, kb)
+            logger.debug("poll_details[refresh] edit-kb key=%s mid=%s status=%s", key, m.message_id, st)
+
+        await _edit_text("header", header_text)
+        await _edit_text("main", main_text)
+        await _edit_text("assist", assist_text)
+        await _edit_text("admin", admin_text)
+        await _edit_text("trainee", trainee_text)
+
+        await _edit_kb("main_alt", main_alt)
+        await _edit_kb("assist_alt", assist_alt)
+        await _edit_kb("admin_alt", admin_alt)
+        await _edit_kb("mgr", mgr_kb)
+        await _edit_kb("back", back_kb)
+        return
+
+    # 6) Хвостовая перезапись
+    logger.warning(
+        "poll_details[refresh] order-fix uid=%s deal=%s cut_from_ix=%s exp=%s cur=%s",
+        uid, deal_id, cut_from_ix, expected_keys, current_keys_in_order
+    )
+
+    # 6.1 Удаляем хвост и чистим индекс
+    for k in expected_keys[cut_from_ix:]:
+        stub = index.get(k)
+        if not stub:
+            continue
+        mid = getattr(stub, "message_id", None)
+        if isinstance(mid, int):
+            with contextlib.suppress(Exception):
+                await bot.delete_message(uid, mid)
+                logger.debug("poll_details[refresh] deleted key=%s mid=%s", k, mid)
+        _update_detail_index(uid, deal_id, k, None)
+
+    # 6.2 Живой префикс
+    prefix_msgs: List[types.Message] = []
+    if current_msgs:
+        prefix_keys = set(expected_keys[:cut_from_ix])
+        for m in current_msgs:
+            mid = getattr(m, "message_id", None)
+            if isinstance(mid, int) and mid_to_key.get(mid) in prefix_keys:
+                prefix_msgs.append(m)
+
+    # 6.3 Досылаем хвост по эталону
+    fresh: List[types.Message] = []
+
+    async def _send_text(key: str, text: Optional[str]) -> None:
+        if text is None:
+            return
+        msg = await bot.send_message(uid, text, parse_mode="Markdown", disable_web_page_preview=True)
+        _update_detail_index(uid, deal_id, key, getattr(msg, "message_id", None))
+        fresh.append(msg)
+
+    async def _send_caption(key: str, kb: Optional[InlineKeyboardMarkup], caption: str) -> None:
+        if kb is None:
+            return
+        msg = await bot.send_message(uid, caption, reply_markup=kb)
+        _update_detail_index(uid, deal_id, key, getattr(msg, "message_id", None))
+        fresh.append(msg)
+
+    for key in expected_keys[cut_from_ix:]:
+        if key == "header":
+            await _send_text("header", header_text)
+        elif key == "main":
+            await _send_text("main", main_text)
+        elif key == "main_alt":
+            await _send_caption("main_alt", main_alt, "🔁 Альтернатива:")
+        elif key == "assist":
+            await _send_text("assist", assist_text)
+        elif key == "assist_alt":
+            await _send_caption("assist_alt", assist_alt, "🔁 Альтернатива:")
+        elif key == "admin":
+            await _send_text("admin", admin_text)
+        elif key == "admin_alt":
+            await _send_caption("admin_alt", admin_alt, "🔁 Альтернатива:")
+        elif key == "trainee":
+            await _send_text("trainee", trainee_text)
+        elif key == "mgr":
+            await _send_caption("mgr", mgr_kb, "🛠 Управление:")
+        elif key == "back":
+            await _send_caption("back", back_kb, "\u2060")
+
+    # 6.4 Обновляем реестр
+    alive = prefix_msgs + fresh
+    _set_block(uid, deal_id, alive)
+    _detach_from_last_user_messages(uid, alive)
+
+    logger.info(
+        "poll_details[refresh] order-fixed uid=%s deal=%s kept=%s appended=%s",
+        uid, deal_id, [getattr(m, "message_id", None) for m in prefix_msgs],
+        [getattr(m, "message_id", None) for m in fresh],
+    )
+    if not alive:
+        logger.error(
+            "poll_details[refresh] FAILED-EMPTY uid=%s deal=%s — после перезаписи нет сообщений в блоке!"
+        )
+
+# ────────────────────────────────────────────────────────────────────
+# [2.1.5] Вспомогательные функции детекции статусов правок
+# ────────────────────────────────────────────────────────────────────
+async def _edit_text_status(bot: Bot, uid: int, message_id: int, new_text: str) -> str:
+    """
+    Возвращает: 'ok' | 'not_modified' | 'not_found' | 'error'
+    """
+    try:
+        await bot.edit_message_text(
+            chat_id=uid, message_id=message_id,
+            text=new_text, parse_mode="Markdown", disable_web_page_preview=True
+        )
+        return "ok"
+    except TelegramBadRequest as e:
+        msg = str(e).lower()
+        if "message is not modified" in msg:
+            return "not_modified"
+        if "message to edit not found" in msg:
+            return "not_found"
+        return "error"
+    except Exception:
+        return "error"
+
+
+async def _edit_markup_status(bot: Bot, uid: int, message_id: int, kb: Optional[InlineKeyboardMarkup]) -> str:
+    try:
+        await bot.edit_message_reply_markup(chat_id=uid, message_id=message_id, reply_markup=kb)
+        return "ok"
+    except TelegramBadRequest as e:
+        msg = str(e).lower()
+        if "message to edit not found" in msg:
+            return "not_found"
+        if "message is not modified" in msg:
+            return "not_modified"
+        return "error"
+    except Exception:
+        return "error"
+
+
+async def _patch_role_block(
+    bot: Bot,
+    uid: int,
+    index: Dict[str, types.Message],
+    role_key: str,
+    new_text: Optional[str],
+    new_alt_kb: Optional[InlineKeyboardMarkup],
+) -> str:
+    """
+    Правит блок роли (текст + клавиатуру 'Альтернатива') по ключу role_key ∈ {main, assist, admin}.
+    Возвращает: 'ok' | 'not_found' | 'error'
+    """
+    status = "ok"
+    if new_text:
+        msg = index.get(role_key)
+        if msg:
+            st = await _edit_text_status(bot, uid, msg.message_id, new_text)
+            if st == "not_found":
+                status = "not_found"
+    alt_msg_key = f"{role_key}_alt"
+    alt_msg = index.get(alt_msg_key)
+    if alt_msg:
+        st = await _edit_markup_status(bot, uid, alt_msg.message_id, new_alt_kb)
+        if st == "not_found":
+            status = "not_found"
+    return status
+
+
+# ────────────────────────────────────────────────────────────────────
+# [2.1.6] Построение данных/текстов деталей (SSOT-совместимо)
+# ────────────────────────────────────────────────────────────────────
+import contextlib
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple, Set
+
+from aiogram import Bot, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+# Внешние зависимости (SSOT)
+from core.utils import short_name as _short_name  # async
+from core.state import state
+
+# Константы и небольшие утилиты локально (без дубликатов SSOT)
+_OK_STATUSES = {"green", "yellow"}  # кого можно ставить в core-ролях
+
+
+def _parse_uid(val: Any) -> Optional[int]:
+    """int | 'uid' | 'Имя Ф.|uid' → uid|None."""
+    # Пытаемся использовать SSOT-парсер, если доступен
+    try:
+        from core.utils import parse_uid as _parse_uid_ssot  # type: ignore
+        with contextlib.suppress(Exception):
+            u = _parse_uid_ssot(val)
+            return int(u) if u is not None else None
+    except Exception:
+        pass
+
+    # Локальный фолбэк
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if "|" in s:
+            s = s.rsplit("|", 1)[-1]
+        with contextlib.suppress(Exception):
+            return int(s)
+    return None
+
+
+async def _fmt(uid: int, _role: str = "") -> str:
+    """
+    Формат слота 'Имя Ф.<суффикс>|uid' (имя — строго через SSOT short_name).
+    Суффиксы ролей (.1/.2/.Адм/.Стаж) — через core.utils.role_suffix.
+    ВНИМАНИЕ: индекс для main/assist здесь символический (1/2), как и в остальном проекте.
+    """
+    human = (getattr(state, "user_short", {}) or {}).get(uid) or (await _short_name(uid))
+    base = (human or f"user{uid}").strip()
+    try:
+        from core.utils import role_suffix as _role_suffix  # SSOT
+        idx = 1 if _role == "main" else (2 if _role == "assist" else None)
+        suf = _role_suffix(_role, idx)
+    except Exception:
+        suf = ""  # мягкий фолбэк: без суффикса
+    return f"{base}{suf}|{uid}"
+
+
+def _role_cfg(game_name: str) -> Dict[str, int]:
+    """Минимальный адаптер; основная логика выбора ролей — в handlers/polls_lifecycle.py."""
+    try:
+        from core.config import settings
+        from difflib import SequenceMatcher
+        mapping = getattr(settings, "GAME_ROLE_MAPPING", {}) or {}
+        norm = str(game_name or "").strip().lower()
+
+        best_ratio = 0.0
+        best_cfg: Optional[Dict[str, int]] = None
+        for key, cfg in mapping.items():
+            k_norm = str(key or "").strip().lower()
+            # точные и частичные совпадения — приоритетно
+            if norm == k_norm or (norm and (norm in k_norm or k_norm in norm)):
+                return {
+                    "main_leaders": int(cfg.get("main_leaders", 1)),
+                    "assistants": int(cfg.get("assistants", 0)),
+                }
+            # иначе — фуззи
+            ratio = SequenceMatcher(None, norm, k_norm).ratio()
+            if ratio > best_ratio:
+                best_ratio, best_cfg = ratio, cfg
+
+        if best_cfg:
+            return {
+                "main_leaders": int(best_cfg.get("main_leaders", 1)),
+                "assistants": int(best_cfg.get("assistants", 0)),
+            }
+    except Exception:
+        pass
+    return {"main_leaders": 1, "assistants": 0}
+
+
+def _need_admin_by_package(pkg_raw: str) -> int:
+    return 1 if (pkg_raw or "").strip().lower() in {"стандарт", "стандарт+", "премиум", "vip", "вип", "биглион"} else 0
+
+
+async def _status_cached(uid: int, game_name: str) -> str:
+    """
+    Кеш светофора на уровне state: user_svetofor_cache[game_name][uid] = 'green|yellow|red|'
+    Дополнительно используем локальный TTL-кэш (если объявлен выше в модуле).
+    """
+    g = (game_name or "").strip().lower()
+    if not g:
+        return ""
+
+    # 0) локальный TTL-кэш (если доступен)
+    try:
+        _local_status_cache = globals().get("_local_status_cache", None)
+        _ttl = int(globals().get("STATUS_CACHE_TTL", 60 * 60 * 4))
+        if isinstance(_local_status_cache, dict):
+            key = f"sv:{uid}:{g}"
+            now = time.time()
+            item = _local_status_cache.get(key)
+            if isinstance(item, tuple) and len(item) == 2:
+                status, ts = item
+                if (now - float(ts)) < _ttl:
+                    return (status or "").strip().lower()
+    except Exception:
+        pass
+
+    # 1) state-кэш
+    cache = getattr(state, "user_svetofor_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(state, "user_svetofor_cache", cache)
+    per_game = cache.setdefault(g, {})
+    if uid in per_game:
+        status = (per_game[uid] or "").strip().lower()
+        # обновим локальный TTL-кэш
+        try:
+            if isinstance(_local_status_cache, dict):
+                _local_status_cache[f"sv:{uid}:{g}"] = (status, time.time())
+        except Exception:
+            pass
+        return status
+
+    # 2) загрузка из services.gsheets
+    try:
+        from services.gsheets import get_user_status_from_svetofor
+        res = get_user_status_from_svetofor(uid, game_name)
+        status = await res if hasattr(res, "__await__") else res
+        status = (status or "").strip().lower()
+        if status not in {"green", "yellow", "red"}:
+            status = ""
+    except Exception:
+        status = ""
+
+    # запись в оба кэша
+    per_game[uid] = status
+    try:
+        if isinstance(_local_status_cache, dict):
+            _local_status_cache[f"sv:{uid}:{g}"] = (status, time.time())
+    except Exception:
+        pass
+    return status
+
+
+async def _ensure_single_role(dist: Dict[str, Any], need_main: int, need_assist: int) -> None:
+    """
+    Инвариант: 1 пользователь = 1 роль.
+    Убираем дубли uid из lead*/assistant*/admin, оставляя первое вхождение.
+    """
+    seen: Set[int] = set()
+    # lead
+    for i in range(1, max(1, need_main) + 1):
+        k = f"lead{i}"
+        u = _parse_uid(dist.get(k))
+        if u and u in seen:
+            dist[k] = None
+        elif u:
+            seen.add(u)
+    # assistant
+    for i in range(1, max(0, need_assist) + 1):
+        k = f"assistant{i}"
+        u = _parse_uid(dist.get(k))
+        if u and u in seen:
+            dist[k] = None
+        elif u:
+            seen.add(u)
+    # admin
+    u = _parse_uid(dist.get("admin"))
+    if u and u in seen:
+        dist["admin"] = None
+
+
+async def _normalize_tag_texts(dist: Dict[str, Any], need_main: int, need_assist: int) -> None:
+    """
+    Создаём отсутствующие ключи слотов под фактическую конфигурацию ролей
+    И НОРМАЛИЗУЕМ тексты тегов к виду 'Имя Ф.<суффикс>|uid' для всех присутствующих uid.
+    """
+    # Создание ключей
+    for i in range(1, max(1, need_main) + 1):
+        dist.setdefault(f"lead{i}", None)
+    for i in range(1, max(0, need_assist) + 1):
+        dist.setdefault(f"assistant{i}", None)
+    dist.setdefault("admin", dist.get("admin", None))
+    # trainee показывается отдельно — не влияет на готовность
+
+    # Нормализация содержимого (если в слоте есть uid)
+    for i in range(1, max(1, need_main) + 1):
+        k = f"lead{i}"
+        u = _parse_uid(dist.get(k))
+        if u:
+            dist[k] = await _fmt(u, "main")
+    for i in range(1, max(0, need_assist) + 1):
+        k = f"assistant{i}"
+        u = _parse_uid(dist.get(k))
+        if u:
+            dist[k] = await _fmt(u, "assist")
+    u_admin = _parse_uid(dist.get("admin"))
+    if u_admin:
+        dist["admin"] = await _fmt(u_admin, "admin")
+    u_tr = _parse_uid(dist.get("trainee"))
+    if u_tr:
+        dist["trainee"] = await _fmt(u_tr, "trainee")
+
+
+# Текстовые блоки и последовательность
+async def _detail_header_lines(deal: Dict[str, Any]) -> List[str]:
+    """
+    Строки заголовка.
+    • Время берём как на кнопках: event_time (если задано) иначе из event_datetime;
+    • Добавлены «🎁 Бонусы» из CRM (bonuses/bonus/extra_bonuses/extra_services).
+    """
+    title = (deal.get("game_name") or deal.get("name") or f"Сделка #{deal.get('id')}").strip()
+    dt = deal.get("event_datetime")
+
+    # дата
+    if isinstance(dt, datetime):
+        date_s = dt.strftime("%d.%m")
+    else:
+        date_s = str(deal.get("event_date") or "—")
+
+    # время: сначала берём поле event_time, затем — из dt
+    et_raw = str(deal.get("event_time") or "").strip()
+    if et_raw:
+        time_s = et_raw
+    elif isinstance(dt, datetime):
+        time_s = dt.strftime("%H:%M")
+    else:
+        time_s = str(deal.get("event_time") or "—")
+
+    pkg = (deal.get("package") or "—").strip()
+    ppl = str(deal.get("players") or deal.get("guests") or "").strip()
+    bonuses = deal.get("bonuses", deal.get("bonus", deal.get("extra_bonuses", deal.get("extra_services"))))
+    bonuses_s = str(bonuses or "").strip()
+
+    head = [
+        f"🎮 *{title}*",
+        f"🗓 {date_s} {time_s} • 📦 {pkg}"
+        + (f" • 👥 {ppl}" if ppl else "")
+        + (f" • 🎁 {bonuses_s}" if bonuses_s else ""),
+    ]
+    return head
+
+
+def _index_current_blocks(msgs: List[types.Message]) -> Dict[str, types.Message]:
+    """
+    Разметка текущих сообщений по типам: header/main/main_alt/assist/assist_alt/admin/admin_alt/trainee/mgr/back.
+    Опирается на уникальные заголовки блоков.
+    """
+    out: Dict[str, types.Message] = {}
+    for i, m in enumerate(msgs):
+        t = (m.text or "")
+        tu = t.upper()
+        if tu.startswith("🎮 *") or tu.startswith("🧩 ") or "• 📦" in t:
+            out.setdefault("header", m)
+        elif tu.startswith("─────") and "ВЕДУЩ" in tu:
+            out["main"] = m
+            if i + 1 < len(msgs) and (msgs[i + 1].text or "").startswith("🔁"):
+                out["main_alt"] = msgs[i + 1]
+        elif tu.startswith("─────") and "ПОМОЩНИК" in tu:
+            out["assist"] = m
+            if i + 1 < len(msgs) and (msgs[i + 1].text or "").startswith("🔁"):
+                out["assist_alt"] = msgs[i + 1]
+        elif tu.startswith("─────") and "АДМИНИСТРАТОР" in tu:
+            out["admin"] = m
+            if i + 1 < len(msgs) and (msgs[i + 1].text or "").startswith("🔁"):
+                out["admin_alt"] = msgs[i + 1]
+        elif tu.startswith("─────") and "СТАЖЁР" in tu:
+            out["trainee"] = m
+        elif t == "🛠 Управление:":
+            out["mgr"] = m
+        elif t == "\u2060":  # zero-width spacer — нужен пылесосу/кнопке «Назад»
+            out["back"] = m
+    return out
+
+
+# SSOT-shim: получить откликнувшихся по сделке из state с нормализацией
+async def _get_respondents(deal_id: int) -> Dict[int, Dict[str, Any]]:
+    """
+    Возвращает uid → { 'status': str, 'is_admin_eligible': bool }.
+    Источники (по приоритету):
+      1) state.poll_respondents / state.respondents_cache
+      2) fallback: сборка из state.responses (ответы на опрос)
+    """
+    def _coerce_map(raw: Any) -> Dict[int, Dict[str, Any]]:
+        out: Dict[int, Dict[str, Any]] = {}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                uid: Optional[int] = None
+                with contextlib.suppress(Exception):
+                    uid = int(k)
+                if uid is None and isinstance(v, dict) and "uid" in v:
+                    with contextlib.suppress(Exception):
+                        uid = int(v["uid"])
+                if not uid:
+                    continue
+                if isinstance(v, dict):
+                    st = str(v.get("status") or v.get("svetofor") or v.get("color") or "").strip().lower()
+                    admin_ok = bool(v.get("is_admin_eligible") or v.get("can_admin") or v.get("admin"))
+                    out[uid] = {"status": st, "is_admin_eligible": admin_ok}
+                else:
+                    st = str(v or "").strip().lower()
+                    out[uid] = {"status": st, "is_admin_eligible": False}
+        return out
+
+    # 1) старые источники
+    src = (getattr(state, "poll_respondents", {}) or {})
+    raw = src.get(str(deal_id)) if isinstance(src, dict) else None
+    if not raw and isinstance(src, dict):
+        raw = src.get(deal_id)
+
+    if not raw:
+        cache = (getattr(state, "respondents_cache", {}) or {})
+        raw = cache.get(str(deal_id)) if isinstance(cache, dict) else None
+        if not raw and isinstance(cache, dict):
+            raw = cache.get(deal_id)
+
+    mapped = _coerce_map(raw)
+    if mapped:
+        return mapped
+
+    # 2) fallback: собрать из state.responses
+    resp_out: Dict[int, Dict[str, Any]] = {}
+    try:
+        for pdata in (getattr(state, "responses", {}) or {}).values():
+            deals_map = (pdata.get("deals") or {})
+            for u in (deals_map.get(int(deal_id), []) or []):
+                uid = int(u.get("user_id", 0) or 0)
+                if not uid:
+                    continue
+                resp_out.setdefault(uid, {"status": "", "is_admin_eligible": False})
+            for adm in (pdata.get("admin_available") or []):
+                uid = int(adm.get("user_id", 0) or 0)
+                if not uid:
+                    continue
+                info = resp_out.setdefault(uid, {"status": "", "is_admin_eligible": False})
+                info["is_admin_eligible"] = True
+    except Exception:
+        resp_out = {}
+
+    # кэшируем
+    if resp_out:
+        with contextlib.suppress(Exception):
+            cache = getattr(state, "respondents_cache", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                setattr(state, "respondents_cache", cache)
+            cache[str(int(deal_id))] = {
+                uid: {
+                    "status": v.get("status", ""),
+                    "is_admin_eligible": bool(v.get("is_admin_eligible")),
+                }
+                for uid, v in resp_out.items()
+            }
+
+    return resp_out
+
+
+async def _build_blocks(*, bot: Bot, uid: int, deal_id: int, force_approved: bool) -> Dict[str, Any]:
+    """
+    Строит все тексты/клавиатуры для деталей без отправки.
+    Возвращает dict с ключами:
+      header_text, main_text, main_alt, assist_text, assist_alt, admin_text, admin_alt,
+      trainee_text, mgr_kb, back_kb, sequence=[(text, kb), ...].
+
+    ВАЖНО для «тихой замены»:
+    • выбранные роли берём строго из dist (видны ручные назначения);
+    • альтернативы считаем по откликнувшимся и «светофору»;
+    • формат слотов поддерживает SSOT-суффиксы — стабильные теги для последующих стадий.
+    """
+    deal = next((d for d in (getattr(state, "current_poll_deals", []) or [])
+                 if int(d.get("id", 0)) == int(deal_id)), None)
+    if not deal:
+        return {"sequence": [("⚠️ Игра не найдена.", None)]}
+
+    g_name = (deal.get("game_name") or deal.get("name") or "").strip()
     cfg = _role_cfg(g_name)
     need_main = int(cfg.get("main_leaders", 1))
     need_assist = int(cfg.get("assistants", 0))
-    need_admin = _need_admin_by_package(pkg_raw)
+    need_admin = _need_admin_by_package(str(deal.get("package") or ""))
 
-    # Кандидаты по откликам
-    respondents: Dict[int, Dict[str, Any]] = {}
-    for pdata in (state.responses or {}).values():
-        # Отклики по сделкам
-        for u in (pdata.get("deals", {}).get(deal_id, []) or []):
-            respondents[int(u["user_id"])] = {**respondents.get(int(u["user_id"]), {}), **u}
-        # Админ-доступность
-        for adm in (pdata.get("admin_available", []) or []):
-            respondents[int(adm["user_id"])] = {**respondents.get(int(adm["user_id"]), {}), **adm}
-
-    # Текущее распределение из кэша
-    dist: Dict[str, str] = getattr(state, "distribution_cache", {}).setdefault(str(deal_id), {})
+    respondents = await _get_respondents(deal_id)  # uid → {status, is_admin_eligible}
+    dist: Dict[str, Any] = (getattr(state, "distribution_cache", {}) or {}).setdefault(str(deal_id), {})
+    await _normalize_tag_texts(dist, need_main, need_assist)
     await _ensure_single_role(dist, need_main, need_assist)
-    await _normalize_tag_texts(dist, need_main, need_assist)  # нормализация текста тегов
 
-    chosen_global: Set[int] = set()  # занятые в любой роли (включая стажёра)
-
-    async def _fits(user_id: int, role: str) -> bool:
-        if role == "admin":
-            return bool(respondents.get(user_id, {}).get("is_admin_eligible"))
-        st = await _status_cached(user_id, g_name)
-        if role == "main":
-            return st == "green"
-        if role == "assist":
-            return st in _OK_STATUSES
-        return False
-
-    async def _render_role(role: str, title: str, icon: str, need: int) -> None:
-        nonlocal dist, chosen_global, msgs
+    async def _compose_role(role: str, title: str, icon: str, need: int) -> Tuple[Optional[str], Optional[InlineKeyboardMarkup]]:
+        """
+        Печать выбранных и альтернатив.
+        ВАЖНО: выбранные (назначенные) берём ТОЛЬКО из dist — без фильтра по respondents,
+        чтобы не скрывать вручную назначенных, кто не отвечал в опросе.
+        Альтернативы формируем по respondents с фильтрацией «светофора».
+        """
         if need <= 0:
-            # подчистим мусор для ролей, которых не требуется
             if role == "admin":
                 dist.pop("admin", None)
             else:
-                prefix = "lead" if role == "main" else "assistant"
-                for i in range(1, 5):  # безопасная граница
-                    dist.pop(f"{prefix}{i}", None)
-            return
-
-        # Фикс дублей/формата: инварианта и нормализация ДО чтения слотов
-        await _ensure_single_role(dist, need_main, need_assist)
-        await _normalize_tag_texts(dist, need_main, need_assist)
+                pref = "lead" if role == "main" else "assistant"
+                for i in range(1, 5):
+                    dist.pop(f"{pref}{i}", None)
+            return None, None
 
         prefix = "lead" if role == "main" else ("assistant" if role == "assist" else "admin")
-
-        def _chosen_from_dist() -> List[Tuple[int, str]]:
-            out: List[Tuple[int, str]] = []
-            if role == "admin":
-                uid0 = _tag_uid(dist.get("admin"))
-                if uid0 and (not respondents or uid0 in respondents):
-                    out.append((uid0, "🛡️"))
-            else:
-                for i in range(1, need + 1):
-                    uid0 = _tag_uid(dist.get(f"{prefix}{i}"))
-                    if uid0 and (not respondents or uid0 in respondents):
-                        out.append((uid0, ""))  # маркеры добавим ниже
-            return out
-
-        chosen: List[Tuple[int, str]] = _chosen_from_dist()
-        if role != "admin":
-            tmp = []
-            for u, _ in chosen:
-                st = await _status_cached(u, g_name)
-                tmp.append((u, "🟢" if (role == "main") else ("🟢" if st == "green" else "🟡")))
-            chosen = tmp
-
-        for u, _ in chosen:
-            chosen_global.add(u)
-
-        # Автодобор
-        for u in respondents.keys():
-            if len(chosen) >= need:
-                break
-            if u in chosen_global:
-                continue
-            if await _fits(u, role):
-                if role == "admin":
-                    chosen.append((u, "🛡️")); chosen_global.add(u)
-                    dist["admin"] = await _fmt(u, "admin")
-                else:
-                    st = await _status_cached(u, g_name)
-                    mark = "🟢" if (role == "main") else ("🟢" if st == "green" else "🟡")
-                    chosen.append((u, mark)); chosen_global.add(u)
-                    # записываем в первый пустой слот
-                    for i in range(1, need + 1):
-                        slot = f"{prefix}{i}"
-                        if not dist.get(slot):
-                            dist[slot] = await _fmt(u, role)
-                            break
-
-        # Синхронизация кэша и выравнивание слотов
+        chosen: List[Tuple[int, str]] = []
         if role == "admin":
-            if need == 1 and chosen and not dist.get("admin"):
-                dist["admin"] = await _fmt(chosen[0][0], "admin")
+            u = _parse_uid(dist.get("admin"))
+            if u:
+                chosen.append((u, "🛡️"))
         else:
-            idx = 1
-            for uid_ch, _m in chosen[:need]:
-                dist[f"{prefix}{idx}"] = await _fmt(uid_ch, role)
-                idx += 1
-            # удалить лишние
-            for i in range(idx, need + 3):  # небольшой верхний зазор
-                dist.pop(f"{prefix}{i}", None)
+            for i in range(1, need + 1):
+                u = _parse_uid(dist.get(f"{prefix}{i}"))
+                if u:
+                    chosen.append((u, ""))
 
-        # Повторная гарантия + нормализация ПОСЛЕ автодобора
-        await _ensure_single_role(dist, need_main, need_assist)
-        await _normalize_tag_texts(dist, need_main, need_assist)
-
-        # Пересчитываем chosen после чистки/нормализации
-        chosen = _chosen_from_dist()
+        # пометки по «светофору» для отображения
         if role != "admin":
-            tmp = []
-            for u, _ in chosen:
+            tmp: List[Tuple[int, str]] = []
+            for u, _m in chosen:
                 st = await _status_cached(u, g_name)
-                tmp.append((u, "🟢" if (role == "main") else ("🟢" if st == "green" else "🟡")))
+                mark = "🟢" if st == "green" else ("🟡" if st == "yellow" else "")
+                tmp.append((u, mark))
             chosen = tmp
 
-        # Вывод блока роли
-        ready = len(chosen) >= need
-
-        def _nm(u: int) -> Optional[str]:
-            try:
-                return getattr(state, "user_short", {}).get(u)
-            except Exception:
-                return None
-
-        lines = [
-            f"─────{icon} *{title.upper()}* ────",
-            f"{'✅' if ready else '❌'} {min(len(chosen), need)}/{need}",
-        ]
+        ready = len([u for u, _ in chosen]) >= need
+        lines = [f"─────{icon} *{title.upper()}* ────", f"{'✅' if ready else '❌'} {min(len(chosen), need)}/{need}"]
         for u, mark in chosen[:max(need, 0)]:
-            human = _nm(u) or (await _short_name(u))
+            human = (getattr(state, "user_short", {}) or {}).get(u) or (await _short_name(u))
             lines.append(f"– {human} {mark}")
+        text = "\n".join(lines)
 
-        msgs.append(await bot.send_message(uid, "\n".join(lines), parse_mode="Markdown"))
+        # альтернативы — только из откликнувшихся, не занятых в выбранных
+        chosen_uids = {u for u, _ in chosen}
 
-        # Альтернативы
-        chosen_role_uids = {u for u, _ in chosen}
-        alts = [u for u in respondents.keys() if (u not in chosen_role_uids) and await _fits(u, role)]
+        async def _fits_for_block(user_id: int) -> bool:
+            if role == "admin":
+                return bool(respondents.get(user_id, {}).get("is_admin_eligible"))
+            st = await _status_cached(user_id, g_name)
+            if role == "main":
+                return st == "green"
+            if role == "assist":
+                return st in _OK_STATUSES
+            return False
+
+        kb = None
+        alts = [u for u in respondents.keys() if (u not in chosen_uids) and (await _fits_for_block(u))]
         if alts:
-            kb = InlineKeyboardBuilder()
+            kbld = InlineKeyboardBuilder()
             for u in alts:
                 if role == "admin":
                     mark = "🛡️"
                 else:
                     st = await _status_cached(u, g_name)
-                    mark = "🟢" if (role == "main") else ("🟢" if st == "green" else "🟡")
+                    mark = "🟢" if st == "green" else ("🟡" if st == "yellow" else "")
                 human = (getattr(state, "user_short", {}) or {}).get(u) or (await _short_name(u))
-                kb.button(
-                    text=f"{human} {mark}",
-                    callback_data=f"swap_{deal_id}_{role}_{u}",
-                )
-            kb.adjust(1)
-            msgs.append(await bot.send_message(uid, "🔁 Альтернатива:", reply_markup=kb.as_markup()))
+                kbld.button(text=f"{human} {mark}", callback_data=f"swap_{deal_id}_{role}_{u}")
+            kbld.adjust(1)
+            kb = kbld.as_markup()
 
-    # Роли
-    await _render_role("main", "Ведущие", "🎤", need_main)
-    await _render_role("assist", "Помощники", "🧑‍🤝‍🧑", need_assist)
+        return text, kb
 
-    # Админ по пакетам
+    # Секции ролей
+    main_text, main_alt = await _compose_role("main", "Ведущие", "🎤", need_main)
+    assist_text, assist_alt = await _compose_role("assist", "Помощники", "🧑‍🤝‍🧑", need_assist)
+    admin_text, admin_alt = (None, None)
     if need_admin:
-        await _render_role("admin", "Администратор", "🛡️", 1)
+        admin_text, admin_alt = await _compose_role("admin", "Администратор", "🛡️", 1)
     else:
         dist.pop("admin", None)
 
-    # Финальная гарантия + нормализация (на всякий)
-    await _ensure_single_role(dist, need_main, need_assist)
-    await _normalize_tag_texts(dist, need_main, need_assist)
-
-    # Стажёр: выбираем КРАСНОГО, который НЕ занят в других ролях
-    trainee_uid: Optional[int] = _tag_uid(dist.get("trainee"))
-    red_pool: List[int] = []
+    # Стажёр (всегда отображаем; не влияет на индикатор комплектности)
+    trainee_text: Optional[str] = None
+    trainee_uid: Optional[int] = _parse_uid(dist.get("trainee"))
     occupied: Set[int] = {
-        *[(_tag_uid(dist.get(f"lead{i}")) or -1) for i in range(1, need_main + 1)],
-        *[(_tag_uid(dist.get(f"assistant{i}")) or -1) for i in range(1, need_assist + 1)],
-        (_tag_uid(dist.get("admin")) or -1),
+        *[(_parse_uid(dist.get(f"lead{i}")) or -1) for i in range(1, need_main + 1)],
+        *[(_parse_uid(dist.get(f"assistant{i}")) or -1) for i in range(1, need_assist + 1)],
+        (_parse_uid(dist.get("admin")) or -1),
     }
+    reds: List[int] = []
     for u in respondents.keys():
         if u in occupied:
             continue
         st = await _status_cached(u, g_name)
         if st == "red":
-            red_pool.append(u)
-    if red_pool:
-        if trainee_uid not in red_pool:
-            trainee_uid = red_pool[0]
+            reds.append(u)
+    if reds:
+        if trainee_uid not in reds:
+            trainee_uid = reds[0]
             dist["trainee"] = await _fmt(trainee_uid, "trainee")
-        human = (getattr(state, "user_short", {}) or {}).get(trainee_uid) or (await _short_name(trainee_uid))  # type: ignore
-        block = [
-            "───── 👷 *СТАЖЁР* ─────",
-            f"– {human} 🔴",
-            "_Стажёр не влияет на индикатор набора._",
-        ]
-        msgs.append(await bot.send_message(uid, "\n".join(block), parse_mode="Markdown"))
+        human = (getattr(state, "user_short", {}) or {}).get(trainee_uid) or (await _short_name(int(trainee_uid)))  # type: ignore[arg-type]
+        trainee_text = "\n".join(["───── 👷 *СТАЖЁР* ─────", f"– {human} 🔴", "_Стажёр не влияет на индикатор набора._"])
     else:
         dist.pop("trainee", None)
+        trainee_text = "───── 👷 *СТАЖЁР* ─────\n_Пока никого._\n_Стажёр не влияет на индикатор набора._"
 
-    # Кнопки управления (без автопереходов)
+    # Кнопки управления
     is_locked = (deal_id in (getattr(state, "locked_distribution", {}) or {})) or (str(deal_id) in (getattr(state, "locked_distribution", {}) or {}))
     is_force_closed = deal_id in (getattr(state, "deal_force_closed", set()) or set())
+    mgr_kb = None
     if (getattr(state, "current_poll_leader", None) == uid) and not is_force_closed:
         kb_mgr = InlineKeyboardBuilder()
         if is_locked or force_approved:
             kb_mgr.button(text="✅ Утверждено", callback_data="noop")
         else:
-            kb_mgr.button(text="✅ Утвердить игру", callback_data=f"poll_approve_{deal_id}")
+            kb_mgr.button(text=f"✅ Утвердить игру", callback_data=f"poll_approve_{deal_id}")
         kb_mgr.button(text="⏹️ Стоп набор", callback_data=f"poll_stop_{deal_id}")
         kb_mgr.adjust(1)
-        msgs.append(await bot.send_message(uid, "🛠 Управление:", reply_markup=kb_mgr.as_markup()))
+        mgr_kb = kb_mgr.as_markup()
 
-    # Назад к списку
-    kb_back = InlineKeyboardMarkup(
+    # Назад
+    back_kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад к списку", callback_data=POLL_BACK)]]
     )
-    msgs.append(await bot.send_message(uid, "\u2060", reply_markup=kb_back))
 
-    # ── ЯДРО УЧЁТА СООБЩЕНИЙ (для пылесоса) ─────────────────────────
-    # detail_blocks: гарантированно существующий dict
-    db = getattr(state, "detail_blocks", None)
-    if not isinstance(db, dict):
-        db = {}
-    state.detail_blocks = db
-    state.detail_blocks[(uid, deal_id)] = msgs
+      # Последовательность для первого показа (alt — всегда рядом с ролью)
+    header_text = "\n".join(await _detail_header_lines(deal))
+    seq: List[Tuple[Optional[str], Optional[InlineKeyboardMarkup]]] = []
+    seq.append((header_text, None))
+    if main_text:
+        seq.append((main_text, None))
+        seq.append(("🔁 Альтернатива:", main_alt))      # ← безусловно
+    if assist_text:
+        seq.append((assist_text, None))
+        seq.append(("🔁 Альтернатива:", assist_alt))    # ← безусловно
+    if admin_text:
+        seq.append((admin_text, None))
+        seq.append(("🔁 Альтернатива:", admin_alt))     # ← безусловно
+    if trainee_text:
+        seq.append((trainee_text, None))
+    if mgr_kb:
+        seq.append(("🛠 Управление:", mgr_kb))
+    # «невидимая» заглушка для корректного удаления хвоста
+    seq.append(("\u2060", back_kb))
 
-    # last_user_messages: вся текущая пачка сообщений деталей
-    lum = getattr(state, "last_user_messages", None)
-    if not isinstance(lum, dict):
-        lum = {}
-    state.last_user_messages = lum
-    state.last_user_messages[uid] = list(msgs)
+
+    return {
+        "header_text": header_text,
+        "main_text": main_text,
+        "main_alt": main_alt,
+        "assist_text": assist_text,
+        "assist_alt": assist_alt,
+        "admin_text": admin_text,
+        "admin_alt": admin_alt,
+        "trainee_text": trainee_text,
+        "mgr_kb": mgr_kb,
+        "back_kb": back_kb,
+        "sequence": seq,
+    }
+
+# История изменений [2.1.6]:
+# • 2025-08-25 — выровнено под SSOT: _fmt с role_suffix, стабильная «тихая замена» (chosen из dist, alts из respondents),
+#                 стажёр всегда виден, совместимость с int/str ключами locked_distribution.
 
 
-# ███ [3] HANDLERS — show / refresh / swap / back
-# ─────────────────────────────────────────────────────────────────────
-from contextlib import suppress
-from typing import Optional, Any, Dict, List, Tuple
-import handlers.polls_lifecycle as plc  # для _check_ready_state/_sync_leader_report/_refresh_detail_views
 
-@router.callback_query(lambda c: c.data and c.data.startswith("show_deal_"))
-async def show_deal_callback_handler(callback: types.CallbackQuery) -> None:
-    """Открыть detail-view конкретной игры из отчёта."""
-    try:
-        did = int(str(callback.data).rsplit("_", 1)[-1])
-    except Exception:
-        with suppress(Exception):
-            await callback.answer("⚠️ Неверный формат кнопки.", show_alert=True)
-        return
-    await _render_detail(uid=callback.from_user.id, deal_id=did, bot=callback.message.bot, force_approved=False)
-    with suppress(Exception):
-        await callback.answer()
+# ────────────────────────────────────────────────────────────────────
+# [2.1.7] Legacy-совместимость (старые вызовы без bot=)
+# ────────────────────────────────────────────────────────────────────
+async def refresh_deal_details_legacy(uid: int, deal_id: int, *_, **__) -> None:
+    """Совместимость со старым вызовом refresh_deal_details(uid, deal_id)."""
+    bot = Bot.get_current()
+    await refresh_deal_details(bot=bot, uid=uid, deal_id=deal_id, force_approved=False)
 
-async def refresh_deal_details(
-    bot: Optional[Bot] = None,
-    deal_id: Optional[int] = None,
-    *,
-    force_approved: bool = False,
-    uid: Optional[int] = None,
-    # совместимость с legacy: refresh_deal_details(uid, deal_id)
-    **kwargs: Any,
-) -> None:
-    """
-    Перерисовка detail-view для конкретной сделки.
 
-    Правила:
-    • Не «автооткрывает» карточку, если она не была открыта.
-    • Если uid не передан, ищем владельца по state.detail_blocks[(uid, deal_id)].
-      Если владельца нет — ТИХО ВЫХОДИМ.
-    • Поддерживает старую позиционную сигнатуру refresh_deal_details(uid, deal_id).
-    """
-    # legacy позиционная сигнатура: (uid, deal_id)
-    if uid is None and deal_id is None:
-        args = kwargs.pop("args", ()) or ()
-        if args:
-            with suppress(Exception):
-                if len(args) >= 1 and isinstance(args[0], int):
-                    uid = args[0]
-                if len(args) >= 2 and isinstance(args[1], int):
-                    deal_id = args[1]
+async def render_detail_legacy(uid: int, deal_id: int, *_, **__) -> None:
+    """Совместимость со старым вызовом render_detail(uid, deal_id)."""
+    bot = Bot.get_current()
+    await render_detail(bot=bot, uid=uid, deal_id=deal_id, force_approved=False)
 
-    # бот
-    bot = bot or Bot.get_current()
 
-    # если uid не передан — попробуем найти владельца уже открытого detail-блока
-    if uid is None and deal_id is not None:
-        try:
-            for (u, d), msgs in (getattr(state, "detail_blocks", {}) or {}).items():
-                if int(d) == int(deal_id) and msgs:
-                    uid = int(u)
-                    break
-        except Exception:
-            uid = None
+# История изменений [2.1]:
+# • 2025-08-25 — выровнено под SSOT: detail_blocks храним как List[int]; поддержан старый формат при чтении;
+#                render_detail после первичного рендера конвертирует реестр и отвязывает от last_user_messages;
+#                refresh_deal_details — патч по индексам, точечные пересоздания, без «массового» delete;
+#                разбито на подпункты 2.1.1–2.1.7; фиксы Pylance/тайпинги; «тихая замена» стабилизирована.
 
-    if not bot or uid is None or deal_id is None:
-        logger.debug(
-            "[poll_details.refresh] skip (no open view): bot=%s uid=%s deal_id=%s",
-            bool(bot), uid, deal_id
-        )
-        return
-
-    await _render_detail(uid=uid, deal_id=deal_id, bot=bot, force_approved=force_approved)
-
+# ███ [2.6] SWAP (альтернативы) — ручное назначение кандидата на роль (с РОКИРОВКОЙ, SSOT-uid)
+# --------------------------------------------------------------------
 @router.callback_query(lambda c: c.data and c.data.startswith("swap_"))
 async def poll_swap_handler(callback: types.CallbackQuery) -> None:
     """
-    SWAP-кнопка из блока «Альтернативы»:
-    • переносит выбранного кандидата в целевую роль;
-    • удаляет его из всех прочих ролей;
-    • пересчитывает «готовность», синхронизирует отчёт и перерисовывает detail-view.
-    Формат data: swap_{deal_id}_{targetRole}_{uid}
-        targetRole ∈ {main, assist, admin}
+    Переназначение из альтернатив с интеллектуальной рокировкой и защитой MAIN:
+    callback.data = 'swap_{deal_id}_{role_target}_{uid}'
+
+    Правила:
+      • MAIN (ведущий) — только 🟢; ASSIST (помощник) — 🟢/🟡; ADMIN — только is_admin_eligible=True.
+      • «Липкий ведущий»: если пользователь уже стоит на MAIN, уводить его в другую роль можно
+        только если есть другой подходящий кандидат на MAIN. Иначе — no-op (alert).
+      • Инвариант «1 uid → 1 роль» сохраняется; вытеснённый садится в прежний слот выбранного,
+        если подходит по «Светофору».
     """
-    data_s = str(callback.data or "")
+    with contextlib.suppress(Exception):
+        await callback.answer()  # быстрый ACK
+
+    # ── 0) Разбор callback-data
     try:
-        _, deal_id_s, role, uid_s = data_s.split("_", 3)
-        deal_id = int(deal_id_s)
-        uid_new = int(uid_s)
+        _, deal_s, role_target, uid_s = (callback.data or "").split("_", 3)
+        deal_id = int(deal_s)
+        uid_alt = int(uid_s)
+        role_target = (role_target or "").strip().lower()  # main|assist|admin|trainee
     except Exception:
-        with suppress(Exception):
-            await callback.answer("⚠️ Ошибка формата кнопки.", show_alert=True)
+        with contextlib.suppress(Exception):
+            await callback.answer("Некорректные данные.", show_alert=True)
         return
 
-    # Текущее распределение
-    dist_map = getattr(state, "distribution_cache", {}) or {}
-    dist: Dict[str, str] = dist_map.setdefault(str(deal_id), {})
-    # Мета по игре
-    details = (getattr(state, "poll_details", {}) or {}).get(deal_id) or {}
-    game_name = details.get("game_name") or details.get("title") or ""
-    cfg = _role_cfg(str(game_name))
-    need_main   = int(cfg.get("main_leaders", 1) or 1)
-    need_assist = int(cfg.get("assistants", 1) or 1)
+    # ── 1) Защита от правок зафиксированного состава
+    locked = (getattr(state, "locked_distribution", {}) or {})
+    if str(deal_id) in locked or deal_id in locked:
+        with contextlib.suppress(Exception):
+            await callback.answer("🔒 Состав уже утверждён.", show_alert=True)
+        return
 
-    # 1) убрать uid_new из ВСЕХ слотов (инварианта 1 uid = 1 роль)
+    # ── 2) Достаём сделку и конфиг ролей
+    deal = next((d for d in (state.current_poll_deals or []) if int(d.get("id") or 0) == deal_id), None)
+    if not deal:
+        with contextlib.suppress(Exception):
+            await callback.answer("Игра не найдена.", show_alert=True)
+        return
+    game_name = str(deal.get("game_name") or deal.get("name") or "Игра")
+    cfg = _role_cfg(game_name)
+    need_main = int(cfg.get("main_leaders", 1))
+    need_assist = int(cfg.get("assistants", 0))
+
+    # ── 3) Текущий кэш распределения
+    dist_all = getattr(state, "distribution_cache", {}) or {}
+    dist: Dict[str, str] = dict(dist_all.get(str(deal_id)) or {})
+
+    # ── 4) Утилиты
+    def uid_of(val: Any) -> Optional[int]:
+        try:
+            u = _parse_uid(val)
+            return int(u) if u is not None else None
+        except Exception:
+            return None
+
+    def _find_user_slot(uid: int) -> Tuple[Optional[str], Optional[str]]:
+        """Возвращает (role_key, slot_key) текущего пользователя в dist."""
+        for k in ("admin", "trainee"):
+            if uid_of(str(dist.get(k) or "")) == uid:
+                return ("admin" if k == "admin" else "trainee"), k
+        for i in range(1, max(need_main, 1) + 5):
+            key = f"lead{i}"
+            if uid_of(str(dist.get(key) or "")) == uid:
+                return "main", key
+        for i in range(1, max(need_assist, 0) + 5):
+            key = f"assistant{i}"
+            if uid_of(str(dist.get(key) or "")) == uid:
+                return "assist", key
+        return None, None
+
+    def _first_free(prefix: str, max_needed: int) -> Optional[str]:
+        if max_needed <= 0:
+            return None
+        for i in range(1, max_needed + 1):
+            key = f"{prefix}{i}"
+            if not str(dist.get(key) or "").strip():
+                return key
+        return None
+
+    def _target_slot_and_displaced(role: str) -> Tuple[str, Optional[int]]:
+        if role == "admin":
+            return "admin", uid_of(str(dist.get("admin") or ""))
+        if role == "trainee":
+            return "trainee", uid_of(str(dist.get("trainee") or ""))
+        if role == "main":
+            free = _first_free("lead", need_main)
+            if free:
+                return free, None
+            last_key = None
+            for i in range(need_main, 0, -1):
+                k = f"lead{i}"
+                if uid_of(str(dist.get(k) or "")) is not None:
+                    last_key = k
+                    break
+            last_key = last_key or "lead1"
+            return last_key, uid_of(str(dist.get(last_key) or ""))
+        if role == "assist":
+            free = _first_free("assistant", need_assist)
+            if free:
+                return free, None
+            last_key = None
+            for i in range(need_assist, 0, -1):
+                k = f"assistant{i}"
+                if uid_of(str(dist.get(k) or "")) is not None:
+                    last_key = k
+                    break
+            last_key = last_key or "assistant1"
+            return last_key, uid_of(str(dist.get(last_key) or ""))
+        return "trainee", uid_of(str(dist.get("trainee") or ""))
+
+    # Пул откликнувшихся (для проверок «Светофора» и admin-eligibility)
+    respondents: Dict[int, Dict[str, Any]] = {}
+    for pdata in (state.responses or {}).values():
+        for u in (pdata.get("deals", {}).get(deal_id, []) or []):
+            respondents[int(u["user_id"])] = {**respondents.get(int(u["user_id"]), {}), **u}
+        for adm in (pdata.get("admin_available", []) or []):
+            respondents[int(adm["user_id"])] = {**respondents.get(int(adm["user_id"]), {}), **adm}
+
+    async def _fits(uid: int, role: str) -> bool:
+        if role == "admin":
+            return bool(respondents.get(uid, {}).get("is_admin_eligible"))
+        st = await _status_cached(uid, game_name)
+        if role == "main":
+            return st == "green"
+        if role == "assist":
+            return st in _OK_STATUSES
+        if role == "trainee":
+            return st == "red"
+        return False
+
+    def _all_assigned_uids() -> Set[int]:
+        out: Set[int] = set()
+        for v in dist.values():
+            u = uid_of(v)
+            if u:
+                out.add(u)
+        return out
+
+    # ── 5) Где стоит выбранный сейчас?
+    role_old, slot_old = _find_user_slot(uid_alt)
+
+    if role_old == role_target:
+        with contextlib.suppress(Exception):
+            await callback.answer("Уже назначен.", show_alert=False)
+        return
+
+    # ── 6) Серверная проверка: выбранный подходит целевой роли?
+    if not await _fits(uid_alt, role_target):
+        with contextlib.suppress(Exception):
+            await callback.answer("⛔ Не подходит для этой роли.", show_alert=True)
+        return
+
+    # ── 7) Целевой слот и потенциально вытесняемый
+    slot_target, displaced_uid = _target_slot_and_displaced(role_target)
+
+    # ── 8) «Липкий ведущий»: защищаем MAIN
+    if role_old == "main" and role_target != "main":
+        has_alt_main = False
+
+        if displaced_uid and await _fits(displaced_uid, "main"):
+            has_alt_main = True
+
+        if not has_alt_main:
+            assigned = _all_assigned_uids()
+            for u in respondents.keys():
+                if u == uid_alt or u in assigned:
+                    continue
+                if await _fits(u, "main"):
+                    has_alt_main = True
+                    break
+
+        if not has_alt_main:
+            with contextlib.suppress(Exception):
+                await callback.answer("⚠️ Нельзя уводить единственного подходящего ведущего — нет другого 🟢.", show_alert=True)
+            return
+
+    # ── 9) Снимаем выбранного из всех мест
     for k, v in list(dist.items()):
-        if isinstance(k, str) and (k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"}):
-            if _tag_uid(v) == uid_new:
-                dist[k] = ""
+        if not isinstance(k, str):
+            continue
+        if not (k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"}):
+            continue
+        if uid_of(str(v)) == uid_alt:
+            dist[k] = ""
 
-    # 2) записать в нужную роль
-    if role == "admin":
-        dist["admin"] = await _fmt(uid_new, "admin")
-    else:
-        prefix = "lead" if role == "main" else "assistant"
-        # найдём первый пустой целевой слот, иначе — первый по порядку
-        target_key = None
-        for idx in range(1, (need_main if prefix == "lead" else need_assist) + 1):
-            k = f"{prefix}{idx}"
-            if not _tag_uid(dist.get(k)):
-                target_key = k
-                break
-        if target_key is None:
-            target_key = f"{prefix}1"
-        dist[target_key] = await _fmt(uid_new, "main" if role == "main" else "assist")
+    # ── 10) Ставим выбранного в целевой слот (formatter: _fmt из файла)
+    dist[slot_target] = await _fmt(uid_alt, role_target)
 
-    # 3) нормализация + гарантия инварианты
+    # ── 11) Рокировка: вытеснённого — в прежний слот выбранного (если подходит)
+    if displaced_uid and role_old in {"main", "assist", "admin", "trainee"}:
+        if await _fits(displaced_uid, role_old):
+            if slot_old:
+                dist[slot_old] = await _fmt(displaced_uid, role_old)
+            else:
+                if role_old == "admin":
+                    dist["admin"] = await _fmt(displaced_uid, "admin")
+                elif role_old == "main":
+                    free = _first_free("lead", need_main)
+                    if free:
+                        dist[free] = await _fmt(displaced_uid, "main")
+                elif role_old == "assist":
+                    free = _first_free("assistant", need_assist)
+                    if free:
+                        dist[free] = await _fmt(displaced_uid, "assist")
+                elif role_old == "trainee":
+                    dist["trainee"] = await _fmt(displaced_uid, "trainee")
+
+    # ── 12) Инварианты и нормализация
     await _ensure_single_role(dist, need_main, need_assist)
     await _normalize_tag_texts(dist, need_main, need_assist)
 
-    # 4) синхронизация UI: сводный отчёт и реактивные detail-view
-    try:
-        await plc._check_ready_state({deal_id})
-    except Exception as e:
-        logger.warning("[swap] ready-state failed: %s", e)
-    try:
-        await plc._sync_leader_report()
-    except Exception as e:
-        logger.warning("[swap] report-sync failed: %s", e)
-    try:
-        await plc._refresh_detail_views({deal_id}, refresh_all=False)
-    except Exception as e:
-        logger.warning("[swap] details-refresh failed: %s", e)
+    # ── 13) Сохранить и «тихо» перерисовать
+    state.distribution_cache[str(deal_id)] = dist
+    await refresh_deal_details(bot=Bot.get_current(), deal_id=deal_id, uid=callback.from_user.id)
+    with contextlib.suppress(Exception):
+        await callback.answer("✅ Обновлено")
 
-    # 5) локальная перерисовка для инициатора
-    try:
-        await refresh_deal_details(bot=callback.message.bot, deal_id=deal_id, uid=callback.from_user.id)
-    except TypeError:
-        with suppress(Exception):
-            await refresh_deal_details(callback.from_user.id, deal_id)  # type: ignore
+# История изменений [2.6]:
+# • 2025-08-26 — Пайланс-фикс: убран _format_slot_label, используем глобальный _fmt; «липкий» MAIN;
+#                 серверные проверки статуса; выравнено под SSOT.
 
-    with suppress(Exception):
-        await callback.answer("✅ Состав обновлён")
-    logger.info("[swap] deal %d → %s uid=%d", deal_id, role, uid_new)
 
-@router.callback_query(lambda c: c.data == POLL_BACK)
-async def poll_back_handler(callback: types.CallbackQuery) -> None:
+
+# ███ [3.a] HANDLER: «Утвердить» (LEGACY GUARD — делегирование в polls_distribution)
+# --------------------------------------------------------------------
+@router.callback_query(lambda c: c.data and c.data.startswith("poll_approve_"))
+async def poll_approve_game_handler(callback: CallbackQuery) -> None:
     """
-    «Назад к списку»:
-    • чистим private-ленточку пользователя;
-    • обновляем сводный отчёт лидеру (если он открыт).
+    Защита от двойной обработки «Утвердить».
+    По умолчанию владельцем обработчика является handlers.polls_distribution.
+    Если в settings не указано APPROVE_HANDLER_OWNER="poll_details",
+    здесь аккуратно выходим; основная логика выполнится в polls_distribution.
+    При включении флага — делегируем выполнение в polls_distribution, чтобы не дублировать код.
     """
-    bot = callback.message.bot if callback.message else None
-    uid = callback.from_user.id
-    if bot:
-        try:
-            await delete_previous_private_messages(bot, uid, keep=[])
-        except TypeError:
-            with suppress(Exception):
-                await delete_previous_private_messages(uid)  # type: ignore
-    with suppress(Exception):
-        await plc._sync_leader_report()
-    with suppress(Exception):
-        await callback.answer("↩️ Возврат к списку")
-# История изменений:
-# • 2025-08-15 — добавлен SWAP-обработчик с инвариантой «1 uid = 1 роль» + синхронизацией отчёта и detail-view;
-#                refresh_deal_details выровнен с новой сигнатурой _render_detail; надёжный «Назад к списку».
+    owner = getattr(settings, "APPROVE_HANDLER_OWNER", "polls_distribution")
+    if owner != "poll_details":
+        with contextlib.suppress(Exception):
+            await callback.answer()
+        logger.info("[poll_details] approve skipped (owner=%s)", owner)
+        return
 
+    try:
+        from handlers.polls_distribution import poll_approve_game_handler as _delegate
+        await _delegate(callback)
+    except Exception as e:
+        logger.exception("[poll_details] approve delegate failed: %s", e)
+        with contextlib.suppress(Exception):
+            await callback.answer("Ошибка обработки утверждения.", show_alert=True)
 
 
 # ███ [99] SELF-TESTS
@@ -799,7 +1889,7 @@ async def _test_invariant() -> None:
     await _ensure_single_role(state.distribution_cache[str(did)], need_main, need_assist)
     dist = state.distribution_cache[str(did)]
     all_uids = [
-        _tag_uid(dist.get(k))
+        _parse_uid(dist.get(k))
         for k in (["lead1", "lead2"] + ["assistant1", "assistant2"] + ["admin", "trainee"])
     ]
     assert all_uids.count(111) <= 1, "Дубли не устранены"
@@ -816,7 +1906,7 @@ async def _test_invariant() -> None:
 
     dist = state.distribution_cache[str(did)]
     all_uids_after = [
-        _tag_uid(dist.get(k))
+        _parse_uid(dist.get(k))
         for k in (["lead1", "lead2"] + ["assistant1", "assistant2"] + ["admin", "trainee"])
     ]
     assert all_uids_after.count(111) == 1, "Инварианта нарушена после swap"
@@ -828,9 +1918,11 @@ async def _test_fmt_status() -> None:
     print(await _fmt(1, "main"))
     print(await _status_cached(1, "Цветочная башня"))
 
+
 async def _test():
     await _test_invariant()
     await _test_fmt_status()
+
 
 if __name__ == "__main__":
     import asyncio
@@ -838,5 +1930,5 @@ if __name__ == "__main__":
     asyncio.run(_test())
 
 # История изменений:
-# • 2025-08-13 — Полная синхронизация с утверждённой логикой циклов; исправлена дублирующая сигнатура refresh;
-#                 жёсткая инварианта ролей; стабильный пылесос; корректная работа «Назад» с обоими API отчёта.
+# • 2025-08-24 — v13.4: починен ручной SWAP, выровнено хранение «Имя Ф.|uid», стабилен пылесос в деталях,
+#                       совместимость с aiogram 3.x и SSOT, добавлены мягкие guard'ы и self-tests.

@@ -31,22 +31,30 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardBut
 
 from core.config import settings
 from core.state import state
-from handlers.my_games import redraw_my_games
 import handlers.polls_lifecycle as plc  # локальный импорт, чтобы избежать циклов
-from services.gsheets import get_user_status_from_svetofor
-import re  
+
 logger = logging.getLogger(__name__)
 router = Router(name="polls_distribution")
 
 # алиас на проверку готовности сделки (из lifecycle)
 _is_deal_ready = plc._is_deal_ready
 
+# SSOT-резолвер уведомительного чата: awaitable-обёртка с безопасной передачей bot
+from core.utils import resolve_notify_chat_id as _ssot_resolve_notify_chat_id
+async def _resolve_notify_chat_id(bot: Any = None) -> Optional[int]:
+    try:
+        # основная сигнатура (c bot)
+        return _ssot_resolve_notify_chat_id(bot)
+    except Exception:
+        try:
+            # совместимость со старыми версиями (без bot)
+            return _ssot_resolve_notify_chat_id()
+        except Exception:
+            return None
+
 
 async def _try_sync_report() -> None:
-    """
-    Совместимый вызов перерисовки отчёта после «Утвердить».
-    Если в текущей версии lifecycle нет sync_report — тихо пропускаем.
-    """
+    """Мягкая перерисовка отчёта после «Утвердить» (если функция есть)."""
     try:
         fn = getattr(plc, "sync_report", None)
         if callable(fn):
@@ -54,7 +62,50 @@ async def _try_sync_report() -> None:
     except Exception as e:
         logger.warning("[polls_dist] sync_report skipped: %s", e)
 
-# История изменений: [0] обновлён 2025-08-13 — Router(name=…), InlineKeyboardButton, _try_sync_report()
+# История изменений: [0] 2025-08-24 — убран прямой импорт services.gsheets; shim резолвера передаёт bot.
+
+# ════════════════════════════════════════════════════════════════════
+# [1.m] ПРИОРИТЕТЫ (AmoCRM): кэш месячных счётчиков по тегам
+# ════════════════════════════════════════════════════════════════════
+from typing import Dict
+
+async def _load_monthly_role_counters(force: bool = False) -> Dict[int, int]:
+    if not force:
+        cached = getattr(state, "monthly_role_counters", None)
+        if isinstance(cached, dict):
+            try:
+                return {int(k): int(v) for k, v in cached.items()}
+            except Exception:
+                pass
+    try:
+        from services.amocrm import get_monthly_role_tag_counters  # type: ignore
+    except Exception:
+        async def get_monthly_role_tag_counters(*_a, **_kw) -> Dict[int, int]:  # type: ignore
+            return {}
+    try:
+        res = get_monthly_role_tag_counters()
+        data = await res if asyncio.iscoroutine(res) else res  # type: ignore
+        if not isinstance(data, dict):
+            data = {}
+    except Exception as exc:
+        logger.debug("[priority] monthly counters load failed: %s", exc)
+        data = {}
+    try:
+        norm = {int(k): int(v) for k, v in (data or {}).items()}
+    except Exception:
+        norm = {}
+    setattr(state, "monthly_role_counters", norm)
+    return norm
+
+async def _get_monthly_counters() -> Dict[int, int]:
+    cached = getattr(state, "monthly_role_counters", None)
+    if isinstance(cached, dict):
+        try:
+            return {int(k): int(v) for k, v in cached.items()}
+        except Exception:
+            pass
+    return await _load_monthly_role_counters(force=False)
+
 
 # ════════════════════════════════════════════════════════════════════
 # [1] УТИЛИТЫ: нормализация, ЕДИНЫЙ КЭШ, commit в state, формат уведомлений
@@ -65,12 +116,14 @@ async def _try_sync_report() -> None:
 • Мягкая миграция из зеркал (poll_details.distribution / poll_distribution) в единый кэш.
 • Инвариант «1 uid → 1 роль» (main > assist > admin) на чтение и запись.
 • Сбор «слотов» под «Мои игры»: lead1/assistant1/admin/trainee «Имя Ф.<суффикс>|uid».
-• Запись утверждённого состава (делает блок [1.k]); здесь — только нормализация/чтение.
+• Запись утверждённого состава делает блок [1.k]; здесь — только нормализация/чтение.
+• НОВОЕ: приоритизация подбора кандидатов по «месячным счётчикам тегов» из AmoCRM.
 """
 
 import asyncio
 import re
 from typing import Any, Dict, List, Set, Tuple, Optional
+from contextlib import suppress
 
 # — мягкий импорт state (во избежание жалоб Pylance и циклических импортов)
 try:  # предпочитаемый путь проекта
@@ -81,113 +134,42 @@ except Exception:
     except Exception:
         state = object()  # type: ignore[assignment]
 
+# SSOT-утилиты
+from core.utils import (
+    parse_uid,          # str "Имя Ф.|123" → 123
+    to_uid_list,        # Any → List[int]
+    normalize_roles,    # dict со слотами/ролями → {'main': [], 'assist': [], 'admin': []}
+    team_bulleted_lines,
+)
+
+# Алиасы для совместимости с остальным кодом модуля
+_parse_uid = parse_uid
+_as_user_list = to_uid_list
+_normalize_roles = normalize_roles
+
 
 def _ensure_state_structs() -> None:
     """
     Гарантирует наличие требуемых структур в state с корректными типами.
     """
     if not hasattr(state, "assigned_index") or not isinstance(getattr(state, "assigned_index", None), dict):
-        state.assigned_index = {}            # type: ignore[attr-defined]  # dict[int, set[int]]
+        state.assigned_index = {}            # type: ignore[attr-defined]
     if not hasattr(state, "locked_distribution") or not isinstance(getattr(state, "locked_distribution", None), dict):
-        state.locked_distribution = {}       # type: ignore[attr-defined]  # dict[int, dict[str,str]]
+        state.locked_distribution = {}       # type: ignore[attr-defined]
     if not hasattr(state, "pending_confirmations") or not isinstance(getattr(state, "pending_confirmations", None), dict):
-        state.pending_confirmations = {}     # type: ignore[attr-defined]  # dict[int, dict]
+        state.pending_confirmations = {}     # type: ignore[attr-defined]
     if not hasattr(state, "distribution_cache") or not isinstance(getattr(state, "distribution_cache", None), dict):
-        state.distribution_cache = {}        # type: ignore[attr-defined]  # dict[str, dict[str,Any]]
+        state.distribution_cache = {}        # type: ignore[attr-defined]
     if not hasattr(state, "poll_details") or not isinstance(getattr(state, "poll_details", None), dict):
-        state.poll_details = {}              # type: ignore[attr-defined]  # dict[int, dict]
+        state.poll_details = {}              # type: ignore[attr-defined]
     if not hasattr(state, "poll_distribution") or not isinstance(getattr(state, "poll_distribution", None), dict):
-        state.poll_distribution = {}         # type: ignore[attr-defined]  # dict[int, dict]
+        state.poll_distribution = {}         # type: ignore[attr-defined]
     if not hasattr(state, "current_poll_deals") or not isinstance(getattr(state, "current_poll_deals", None), list):
         state.current_poll_deals = []        # type: ignore[attr-defined]
     if not hasattr(state, "responses") or not isinstance(getattr(state, "responses", None), dict):
         state.responses = {}                 # type: ignore[attr-defined]
-
-
-def _parse_uid(val: Any) -> Optional[int]:
-    """
-    Корректно извлекает uid из значения: int | 'Имя|uid' | 'uid' | None | коллекции.
-    """
-    if isinstance(val, int):
-        return val
-    if isinstance(val, str):
-        s = val.strip()
-        if "|" in s:
-            s = s.rsplit("|", 1)[-1]
-        try:
-            return int(s)
-        except ValueError:
-            return None
-    return None
-
-
-def _as_user_list(v: Any) -> List[int]:
-    """
-    Преобразует значение в список uid[int], рекурсивно разворачивая контейнеры.
-    """
-    out: List[int] = []
-    if v is None:
-        return out
-    if isinstance(v, int):
-        return [v]
-    if isinstance(v, str):
-        u = _parse_uid(v)
-        return [u] if u is not None else out
-    if isinstance(v, (list, tuple, set)):
-        for x in v:
-            u = _parse_uid(x) if not isinstance(x, (list, tuple, set)) else None
-            if u is not None:
-                out.append(u)
-            elif isinstance(x, (list, tuple, set)):
-                # на случай вложенных структур
-                out.extend(_as_user_list(x))
-    return out
-
-
-def _normalize_roles(raw: Dict[str, Any]) -> Dict[str, List[int]]:
-    """
-    Приводит структуру к {'main':[uid...], 'assist':[uid...], 'admin':[uid...]}.
-    Поддерживаются две схемы:
-      1) Ролевая: main/main_leaders, assist/assistants, admin
-      2) Слотовая: lead1/lead2..., assistant1/assistant2..., admin, trainee
-    """
-    if not isinstance(raw, dict):
-        return {"main": [], "assist": [], "admin": []}
-
-    # ── схема 1: ролевая
-    has_role_keys = any(k in raw for k in ("main", "main_leaders", "assist", "assistants", "admin"))
-    if has_role_keys:
-        main_val = raw.get("main", raw.get("main_leaders"))
-        assist_val = raw.get("assist", raw.get("assistants"))
-        admin_val = raw.get("admin")
-        return {
-            "main": _as_user_list(main_val),
-            "assist": _as_user_list(assist_val),
-            "admin": _as_user_list(admin_val),
-        }
-
-    # ── схема 2: слотовая (ручное редактирование/детали)
-    # безопасная сортировка по суффиксному номеру
-    lead_keys = sorted(
-        [k for k in raw.keys() if isinstance(k, str) and k.startswith("lead")],
-        key=lambda k: int(re.search(r"(\d+)$", k).group(1)) if re.search(r"(\d+)$", k) else 0,
-    )
-    asst_keys = sorted(
-        [k for k in raw.keys() if isinstance(k, str) and k.startswith("assistant")],
-        key=lambda k: int(re.search(r"(\d+)$", k).group(1)) if re.search(r"(\d+)$", k) else 0,
-    )
-
-    mains: List[int] = []
-    for k in lead_keys:
-        mains.extend(_as_user_list(raw.get(k)))
-
-    assists: List[int] = []
-    for k in asst_keys:
-        assists.extend(_as_user_list(raw.get(k)))
-
-    admins: List[int] = _as_user_list(raw.get("admin"))
-
-    return {"main": mains, "assist": assists, "admin": admins}
+    if not hasattr(state, "monthly_role_counters") or not isinstance(getattr(state, "monthly_role_counters", None), dict):
+        state.monthly_role_counters = {}     # type: ignore[attr-defined]
 
 
 def _dedupe_roles(roles: Dict[str, List[int]]) -> Dict[str, List[int]]:
@@ -222,6 +204,50 @@ def _uids_from_roles(roles: Dict[str, List[int]]) -> Set[int]:
     return set(roles.get("main", []) or []) | set(roles.get("assist", []) or []) | set(roles.get("admin", []) or [])
 
 
+def _dedupe_slots(slots: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Дедупликация слотов по инварианту «1 пользователь = 1 роль» с приоритетом:
+    lead* > assistant* > admin. trainee НЕ участвует в счётчике и остаётся как есть.
+    Если пользователь уже занят на более приоритетной роли, более низкоприоритетный слот очищается.
+    """
+    if not isinstance(slots, dict) or not slots:
+        return {}
+
+    def _uid_from_slot_value(v: Any) -> Optional[int]:
+        if isinstance(v, str):
+            return _parse_uid(v)
+        if isinstance(v, (list, tuple)):
+            for item in v:
+                u = _parse_uid(item)
+                if u is not None:
+                    return u
+        if isinstance(v, int):
+            return v
+        return None
+
+    # Приоритетные группы ключей
+    lead_keys = sorted([k for k in slots if isinstance(k, str) and k.startswith("lead")],
+                       key=lambda k: int(re.search(r"(\d+)$", k).group(1)) if re.search(r"(\d+)$", k) else 0)
+    asst_keys = sorted([k for k in slots if isinstance(k, str) and k.startswith("assistant")],
+                       key=lambda k: int(re.search(r"(\d+)$", k).group(1)) if re.search(r"(\d+)$", k) else 0)
+    admin_keys = ["admin"] if "admin" in slots else []
+
+    used: Set[int] = set()
+    out = dict(slots)
+
+    for group in (lead_keys, asst_keys, admin_keys):
+        for key in group:
+            uid = _uid_from_slot_value(out.get(key))
+            if uid is None:
+                continue
+            if uid in used:
+                out[key] = ""
+            else:
+                used.add(uid)
+
+    return out
+
+
 # ────────────────────────────────────────────────────────────────────
 # ЕДИНЫЙ КЭШ: только state.distribution_cache[str(deal_id)]
 # + мягкая миграция из зеркал при первом обращении
@@ -233,21 +259,13 @@ def _slots_from_roles_placeholder(roles: Dict[str, List[int]], *, keep_admin_man
     Имена восстановятся позже нормализаторами (детали/коммит).
     """
     slots: Dict[str, Any] = {}
-    # main -> lead{i}
     for i, uid in enumerate(roles.get("main", []) or [], start=1):
         slots[f"lead{i}"] = f"uid:{uid}|{uid}"
-    # assist -> assistant{i}
     for i, uid in enumerate(roles.get("assist", []) or [], start=1):
         slots[f"assistant{i}"] = f"uid:{uid}|{uid}"
-    # admin -> первый (или все — по флагу)
     admins = roles.get("admin", []) or []
     if admins:
-        if keep_admin_many:
-            # если где-то полезно хранить нескольких — аккуратно отразим
-            # (хотя остальной код использует одного админа)
-            slots["admin"] = f"uid:{admins[0]}|{admins[0]}"
-        else:
-            slots["admin"] = f"uid:{admins[0]}|{admins[0]}"
+        slots["admin"] = f"uid:{admins[0]}|{admins[0]}"
     return slots
 
 
@@ -269,7 +287,6 @@ def _migrate_from_mirrors_to_single_cache(deal_id: int) -> Optional[Dict[str, Li
     details_all = getattr(state, "poll_details", {}) or {}
     legacy_all = getattr(state, "poll_distribution", {}) or {}
 
-    # helpers
     def _roles_from_any(raw: Any) -> Optional[Dict[str, List[int]]]:
         if isinstance(raw, dict) and raw:
             return _dedupe_roles(_normalize_roles(raw))
@@ -283,19 +300,17 @@ def _migrate_from_mirrors_to_single_cache(deal_id: int) -> Optional[Dict[str, Li
                 len(roles.get("admin", []) or []))
 
     def _build_slots_from_roles(roles: Dict[str, List[int]], trainee_val: Any = None) -> Dict[str, Any]:
-        # Слоты без имён (плейсхолдеры); имена подставятся позже на этапе форматирования.
         slots: Dict[str, Any] = {}
         for i, uid in enumerate(roles.get("main", []) or [], start=1):
-            slots[f"lead{i}"] = f"uid|{uid}"
+            slots[f"lead{i}"] = f"uid:{uid}|{uid}"
         for i, uid in enumerate(roles.get("assist", []) or [], start=1):
-            slots[f"assistant{i}"] = f"uid|{uid}"
+            slots[f"assistant{i}"] = f"uid:{uid}|{uid}"
         if roles.get("admin"):
-            slots["admin"] = f"uid|{roles['admin'][0]}"
+            slots["admin"] = f"uid:{roles['admin'][0]}|{roles['admin'][0]}"
         if trainee_val is not None:
             slots["trainee"] = trainee_val
         return slots
 
-    # текущее состояние
     dc_cur = dc_all.get(did_s)
     roles_dc = _roles_from_any(dc_cur)
 
@@ -308,40 +323,30 @@ def _migrate_from_mirrors_to_single_cache(deal_id: int) -> Optional[Dict[str, Li
     trainee_legacy = legacy.get("trainee") if isinstance(legacy, dict) else None
     roles_legacy = _roles_from_any(legacy)
 
-    # выбираем наиболее "полный" источник (детали выигрывают при равной "полноте")
     src_roles: Optional[Dict[str, List[int]]] = None
-    src = "none"
-
     if roles_pd and (_score(roles_pd) > _score(roles_dc) or (roles_dc and roles_pd != roles_dc)):
         src_roles = roles_pd
-        src = "pd"
     elif roles_dc:
         src_roles = roles_dc
-        src = "dc"
     elif roles_legacy:
         src_roles = roles_legacy
-        src = "legacy"
 
     if not src_roles:
         return None
 
-    # формируем единый слотовый вид и синхронизируем зеркала
-    if src == "pd":
+    if roles_pd and src_roles is roles_pd:
         slots = _build_slots_from_roles(src_roles, trainee_val=trainee_pd)
-    elif src == "legacy":
+    elif roles_legacy and src_roles is roles_legacy:
         slots = _build_slots_from_roles(src_roles, trainee_val=trainee_legacy)
-    else:  # "dc" — уже слоты; нормализуем и оставляем как есть
+    else:
         slots = dict(dc_cur) if isinstance(dc_cur, dict) else _build_slots_from_roles(src_roles)
 
-    # дедуп слотов по инварианту «1 пользователь = 1 роль»
     slots = _dedupe_slots(slots)
 
-    # записываем в единый кэш и зеркала
     dc_all[did_s] = dict(slots)
     details_all.setdefault(did, {})["distribution"] = dict(slots)
     legacy_all[did] = dict(slots)
 
-    # возвращаем роли как «истину» после reconcile
     return _dedupe_roles(_normalize_roles(slots))
 
 
@@ -355,21 +360,13 @@ def _extract_distribution_from_cache(deal_id: int) -> Optional[Dict[str, List[in
     did = int(deal_id)
     did_s = str(did)
 
-    # reconcile (миграция/сравнение с «деталями» и legacy)
-    migrated = _migrate_from_mirrors_to_single_cache(did)
-
+    _migrate_from_mirrors_to_single_cache(did)
     dc_all = getattr(state, "distribution_cache", {}) or {}
     dc = dc_all.get(did_s)
 
     if isinstance(dc, dict) and dc:
         return _dedupe_roles(_normalize_roles(dc))
-
-    # если по какой-то причине после миграции пусто — вернём то, что удалось получить на шаге миграции
-    if migrated is not None:
-        return _dedupe_roles(migrated)
-
     return None
-
 
 
 def _need_admin_for_deal(deal_id: int) -> bool:
@@ -391,8 +388,8 @@ def _role_cfg_local(game_name: str) -> Dict[str, int]:
     Пытаемся взять из handlers.polls_lifecycle._role_cfg, иначе даём минимальный фолбэк.
     """
     try:
-        import handlers.polls_lifecycle as plc  # type: ignore
-        cfg = plc._role_cfg(game_name)  # type: ignore[attr-defined]
+        import handlers.polls_lifecycle as _plc  # type: ignore
+        cfg = _plc._role_cfg(game_name)  # type: ignore[attr-defined]
         main_need = int(cfg.get("main_leaders", cfg.get("main", 1)))
         asst_need = int(cfg.get("assistants", cfg.get("assist", 1)))
         return {"main_leaders": max(main_need, 0), "assistants": max(asst_need, 0)}
@@ -403,28 +400,29 @@ def _role_cfg_local(game_name: str) -> Dict[str, int]:
 def _resolve_svetofor_func():
     """
     Находит функцию get_user_status_from_svetофор (async/sync). Возвращает call-able.
+    Приоритет: handlers.poll_details → services.gsheets. Если недоступно — безопасный фолбэк.
     """
     try:
         from handlers.poll_details import get_user_status_from_svetofor  # type: ignore
         return get_user_status_from_svetofor
     except Exception:
-        try:
-            from handlers.polls import get_user_status_from_svetofor  # type: ignore
-            return get_user_status_from_svetofor
-        except Exception:
-            try:
-                from gsheets import get_user_status_from_svetofor  # type: ignore
-                return get_user_status_from_svetofor
-            except Exception:
-                async def _fallback(_uid: int, _game: str) -> str:
-                    return "yellow"
-                return _fallback
+        pass
+    try:
+        from services.gsheets import get_user_status_from_svetofor  # type: ignore
+        return get_user_status_from_svetofor
+    except Exception:
+        async def _fallback(_uid: int, _game: str) -> str:
+            return "yellow"
+        return _fallback
 
 
 async def _derive_team_roles(deal_id: int) -> Dict[str, List[int]]:
     """
     Компонуем состав из ответов + Светофора, если кэши пусты.
-    Гарантируем «1 uid → 1 роль» в процессе набора (used-сет).
+    Инварианты/приоритеты:
+      • 1 uid → 1 роль (used-сет),
+      • RED/пустые статусы не попадают в core-ролях (main/assist),
+      • порядок выбора: Светофор (green < yellow) → месячный счётчик (меньше → выше) → uid.
     """
     _ensure_state_structs()
 
@@ -441,40 +439,82 @@ async def _derive_team_roles(deal_id: int) -> Dict[str, List[int]]:
     team: Dict[str, List[int]] = {"main": [], "assist": [], "admin": []}
     used: Set[int] = set()
 
-    # функция светофора (возможен async)
+    # светофор и месячные счётчики
     svetofor_fn = _resolve_svetofor_func()
+    monthly = await _get_monthly_counters()
 
-    # проходим по ответам опроса
+    # соберём пул откликнувшихся по этой сделке
     responses: Dict[str, Any] = getattr(state, "responses", {}) or {}
+    raw_pool: Set[int] = set()
     for pdata in responses.values():
         deals_map: Dict[Any, Any] = pdata.get("deals") or {}
         users_raw = deals_map.get(deal_id, deals_map.get(str(deal_id), [])) or []
-        if not users_raw:
-            continue
         for u in users_raw:
             try:
                 uid = int(u.get("user_id") or 0)
             except Exception:
                 uid = 0
-            if not uid or uid in used:
+            if uid:
+                raw_pool.add(uid)
+
+    # статусы светофора по пулу
+    async def _sv(uid: int) -> Tuple[int, str]:
+        st = svetofor_fn(uid, game_name)
+        if asyncio.iscoroutine(st):
+            st = await st
+        return uid, str(st or "").lower()
+
+    sv_map: Dict[int, str] = {}
+    if raw_pool:
+        pairs = await asyncio.gather(*[_sv(u) for u in raw_pool], return_exceptions=True)
+        for p in pairs:
+            if isinstance(p, Exception):
                 continue
+            uid, st = p
+            sv_map[int(uid)] = st
 
-            status = svetofor_fn(uid, game_name)
-            if asyncio.iscoroutine(status):
-                status = await status
+    def _sv_rank(s: str) -> int:
+        s = (s or "").lower()
+        if s == "green":
+            return 0
+        if s == "yellow":
+            return 1
+        if s == "red":
+            return 2
+        return 3
 
-            st = str(status or "").lower()
-            if st == "green":
-                if len(team["main"]) < need_main:
-                    team["main"].append(uid); used.add(uid); continue
-                if len(team["assist"]) < need_assist:
-                    team["assist"].append(uid); used.add(uid); continue
-            elif st == "yellow":
-                if len(team["assist"]) < need_assist:
-                    team["assist"].append(uid); used.add(uid); continue
-            # иных цветов (shield/red) тут не ставим автоматически
+        # отсортированные кандидаты по приоритету
+    candidates = sorted(
+        list(raw_pool),
+        key=lambda uid: (_sv_rank(sv_map.get(uid, "")), int(monthly.get(uid, 0)), int(uid)),
+    )
 
-    # админ — сначала из ЕДИНОГО КЭША (если уже выбрали вручную), иначе из ответов "admin_available"
+    # ПРАВИЛЬНЫЕ пулы по «Светофору»:
+    #   • main  — только GREEN
+    #   • assist — GREEN и YELLOW
+    pool_main = [u for u in candidates if _sv_rank(sv_map.get(u, "")) == 0]
+    pool_ass  = [u for u in candidates if _sv_rank(sv_map.get(u, "")) in (0, 1)]
+
+    # набираем main
+    for uid in pool_main:
+        if len(team["main"]) >= need_main:
+            break
+        if uid in used:
+            continue
+        team["main"].append(uid)
+        used.add(uid)
+
+    # набираем assist
+    for uid in pool_ass:
+        if len(team["assist"]) >= need_assist:
+            break
+        if uid in used:
+            continue
+        team["assist"].append(uid)
+        used.add(uid)
+
+
+    # админ — сначала из единого кэша (если вручную уже выбран), иначе из ответов "admin_available" с приоритетами
     dc_all = getattr(state, "distribution_cache", {}) or {}
     cached = dc_all.get(str(deal_id)) or {}
     if isinstance(cached, dict) and cached.get("admin"):
@@ -482,6 +522,7 @@ async def _derive_team_roles(deal_id: int) -> Dict[str, List[int]]:
 
     if not team["admin"]:
         assigned = set(team["main"]) | set(team["assist"])
+        admin_ids: Set[int] = set()
         for pdata in responses.values():
             for adm in (pdata.get("admin_available") or []):
                 try:
@@ -489,54 +530,67 @@ async def _derive_team_roles(deal_id: int) -> Dict[str, List[int]]:
                 except Exception:
                     uid_a = 0
                 if uid_a and uid_a not in assigned:
-                    team["admin"] = [uid_a]
-                    break
-            if team["admin"]:
-                break
+                    admin_ids.add(uid_a)
+        if admin_ids:
+            admin_sorted = sorted(list(admin_ids), key=lambda uid: (_sv_rank(sv_map.get(uid, "")), int(monthly.get(uid, 0)), int(uid)))
+            if admin_sorted:
+                team["admin"] = [admin_sorted[0]]
 
     return _dedupe_roles(team)
 
 
 async def _get_current_team(deal_id: int, invoker_uid: Optional[int] = None) -> Dict[str, List[int]]:
     """
-    Возвращает актуальный состав ролей.
-    ЕДИНЫЙ источник чтения: distribution_cache[str(deal_id)].
-    Если его нет/пуст — мягко мигрируем данные из зеркал; если и там пусто — derive из ответов
-    и (важно) материализуем в distribution_cache (со слотовой схемой с плейсхолдерами).
-    Гарантирован инвариант «1 uid → 1 роль». При нужном пакете добираем админа.
-    """
-    roles = _extract_distribution_from_cache(deal_id)
+    Актуальный состав ролей по сделке.
 
-    # если из единого кэша получить не удалось — derive и материализуем в единый кэш
-    if roles is None or (not roles.get("main") and not roles.get("assist") and not roles.get("admin")):
-        roles = await _derive_team_roles(deal_id)
+    Правила:
+    • Единый источник чтения — state.distribution_cache[str(deal_id)] (перед этим выполняется reconcile).
+    • Если пусто — derive из ответов (_derive_team_roles) и материализуем в distribution_cache
+      в слотовом виде с плейсхолдерами (имена подставятся на этапе форматирования/коммита).
+    • Инвариант «1 uid → 1 роль» соблюдается на каждом шаге.
+    • Если пакет сделки требует администратора — добираем его по приоритету:
+      Светофор (green < yellow < red/—) → месячный счётчик (меньше — выше) → uid.
+    """
+    # 1) прочитать из единого кэша (с мягкой миграцией из зеркал)
+    roles = _extract_distribution_from_cache(int(deal_id))
+
+    # 2) если пусто — derive и материализовать в кэш (слоты с плейсхолдерами)
+    if not roles or not (roles.get("main") or roles.get("assist") or roles.get("admin")):
+        roles = await _derive_team_roles(int(deal_id))
         roles = _dedupe_roles(roles or {"main": [], "assist": [], "admin": []})
 
-        # материализуем в distribution_cache как слоты с плейсхолдерами (имя подтянется позже)
-        try:
-            if any(roles.values()):
+        # материализация только если есть что записывать
+        if any(roles.values()):
+            try:
                 slots = _slots_from_roles_placeholder(roles)
                 did_s = str(int(deal_id))
+                # единый кэш
                 getattr(state, "distribution_cache")[did_s] = dict(slots)  # type: ignore[index]
-                # поддерживаем зеркала как МИРА (не источник правды)
+                # зеркала (историческая совместимость)
                 pd = getattr(state, "poll_details")
                 pd.setdefault(int(deal_id), {})["distribution"] = dict(slots)
                 getattr(state, "poll_distribution")[int(deal_id)] = dict(slots)  # type: ignore[index]
-        except Exception:
-            pass
+            except Exception:
+                # материализация — best-effort, не критично
+                pass
 
+    # 3) финальная дедупликация
     roles = _dedupe_roles(roles or {"main": [], "assist": [], "admin": []})
 
-    # Гарантия админа для требующих пакетов — смотрим ТОЛЬКО в distribution_cache
-    if _need_admin_for_deal(deal_id) and not roles.get("admin"):
+    # 4) при необходимости — подобрать администратора
+    if _need_admin_for_deal(int(deal_id)) and not roles.get("admin"):
+        # 4.1 сначала попробуем взять из единого кэша (если его уже выбирали вручную)
         dc_all = getattr(state, "distribution_cache", {}) or {}
-        raw = dc_all.get(str(deal_id), {})
+        raw = dc_all.get(str(int(deal_id)), {})
         if isinstance(raw, dict) and raw.get("admin"):
             roles["admin"] = _as_user_list(raw["admin"])
 
+        # 4.2 если всё ещё нет — выбрать из «admin_available», исключая уже занятых
         if not roles.get("admin"):
-            assigned = set(roles.get("main", [])) | set(roles.get("assist", []))
+            assigned: Set[int] = set(roles.get("main", [])) | set(roles.get("assist", []))
             responses: Dict[str, Any] = getattr(state, "responses", {}) or {}
+
+            admin_ids: List[int] = []
             for pdata in responses.values():
                 for adm in (pdata.get("admin_available") or []):
                     try:
@@ -544,158 +598,237 @@ async def _get_current_team(deal_id: int, invoker_uid: Optional[int] = None) -> 
                     except Exception:
                         uid = 0
                     if uid and uid not in assigned:
-                        roles["admin"] = [uid]
-                        break
-                if roles.get("admin"):
-                    break
+                        admin_ids.append(uid)
 
-    return _dedupe_roles(roles)
+            if admin_ids:
+                # контекст для приоритизации
+                # название игры — из текущих сделок (без падений при отсутствии)
+                deals = getattr(state, "current_poll_deals", []) or []
+                deal_rec = next((d for d in deals if int(d.get("id") or 0) == int(deal_id)), None)
+                game_name = str((deal_rec or {}).get("game_name") or (deal_rec or {}).get("name") or "")
+
+                # статусы светофора (поддержка sync/async)
+                svetofor_fn = _resolve_svetofor_func()
+
+                async def _sv(uid: int) -> Tuple[int, str]:
+                    st = svetofor_fn(uid, game_name)
+                    if asyncio.iscoroutine(st):
+                        st = await st
+                    return uid, str(st or "").lower()
+
+                sv_map: Dict[int, str] = {}
+                try:
+                    pairs = await asyncio.gather(*[_sv(u) for u in admin_ids], return_exceptions=True)
+                    for p in pairs:
+                        if isinstance(p, Exception):
+                            continue
+                        uid, st = p
+                        sv_map[int(uid)] = st
+                except Exception:
+                    sv_map = {}
+
+                # месячные счётчики (AmoCRM) — безопасный фолбэк на {}
+                monthly = await _get_monthly_counters()
+
+                def _sv_rank(s: str) -> int:
+                    s = (s or "").lower()
+                    if s == "green":
+                        return 0
+                    if s == "yellow":
+                        return 1
+                    if s == "red":
+                        return 2
+                    return 3  # неизвестное/пусто — в конец
+
+                admin_ids = sorted(
+                    set(admin_ids),
+                    key=lambda uid: (_sv_rank(sv_map.get(uid, "")), int(monthly.get(uid, 0)), int(uid)),
+                )
+                if admin_ids:
+                    roles["admin"] = [admin_ids[0]]
+
+    # 5) финальный возврат с гарантиями инвариантов
+    return _dedupe_roles(roles or {"main": [], "assist": [], "admin": []})
+
+# История изменений:
+# • 2025-08-24 — добавлена приоритизация по месячным счётчикам (AmoCRM) в _derive_team_roles/_get_current_team;
+#                инициализация state.monthly_role_counters в _ensure_state_structs; выровнено под SSOT.
+
+# ════════════════════════════════════════════════════════════════════
+# [1.t] Мини-тесты блока
+# ════════════════════════════════════════════════════════════════════
+def _test() -> None:
+    _ensure_state_structs()
+
+    # алиасы на SSOT: парсер/лист/нормализация
+    assert _parse_uid("Иван П.|123") == 123
+    assert _as_user_list(["1", 2, "3"]) == [1, 2, 3]
+    norm = _normalize_roles({"lead1": "А А.|1", "assistant1": "B B.|2", "admin": "C C.|3"})
+    assert set(norm.keys()) == {"main", "assist", "admin"}
+
+    # инвариант I1 (1 человек = 1 роль), приоритет main > assist > admin
+    roles = {"main": [1, 2], "assist": [2, 3], "admin": [3, 4]}
+    ded = _dedupe_roles(roles)
+    assert ded == {"main": [1, 2], "assist": [3], "admin": [4]}
+
+    # дедуп слотов: повторяющийся uid в менее приоритетных слотах должен очиститься
+    slots = {"lead1": "Имя Ф.|10", "assistant1": "Имя Ф.|10", "admin": "Имя Ф.|10", "trainee": "Кто-то|20"}
+    ds = _dedupe_slots(slots)
+    assert ds["lead1"] and ds["assistant1"] == "" and ds["admin"] == ""
+
+# История изменений:
+# • 2025-08-20 — выровнено под SSOT, удалены локальные дубли (_parse_uid/_as_user_list/_normalize_roles),
+#                добавлен адаптер «Светофора» без ошибок Pylance; инварианты и публичные имена сохранены.
+
+# ════════════════════════════════════════════════════════════════════
+# [1.1] КОАЛЕСЦИРОВАННЫЙ РЕДРАВ «МОИ ИГРЫ» — ОТКЛЮЧЕНО
+# ════════════════════════════════════════════════════════════════════
+def _queue_redraw_my_games(uids: Set[int], delay_sec: float = 0.15) -> None:
+    """
+    Раньше планировался один редрав «Мои игры» для пачки uid.
+    Теперь — выключено, чтобы не уводить пользователя из отчёта после «Утвердить».
+    Ссылку на личный кабинет даём только в уведомлении (inline-кнопка).
+    """
+    return
+
+# История изменений: [1.1] 2025-08-20 — редрав отключён; вызовы оставлены как NOP.
+
 
 # ────────────────────────────────────────────────────────────────────
 # [1.x] ИМЕНА: короткое «Имя Ф.» и форматирование списков уведомления
 # ────────────────────────────────────────────────────────────────────
-import asyncio                               # локально — чтобы не зависеть от верхних импортов
-from contextlib import suppress              # локально — чтобы не требовать contextlib выше
-from typing import Any, Dict, List           # локально — чтобы не зависеть от [0] IMPORTS
+from typing import Any, Dict, List
+from contextlib import suppress
+import re
+
+# SSOT: используем единые хелперы, но сохраняем прежние имена-обёртки
+from core.utils import (
+    short_name as _ssot_short_name,
+    team_bulleted_lines as _ssot_team_bulleted_lines,
+)
 
 async def _short_name(uid: int) -> str:
     """
-    Возвращает короткое имя в формате «Имя Ф.» (с точкой).
-    Источники (по приоритету):
-      1) core.db.get_user_info: first_name, last_name_initial | last_name
-      2) state.user_short[uid] — уже готовое «Имя Ф.»
-      3) state.users[uid]: first_name, last_name_initial | last_name
-    Фолбэк — строковый uid.
+    Обёртка над SSOT core.utils.short_name(uid) → строго «Имя Ф.»
+    (между именем и инициалом пробел, после инициала точка).
     """
-    ui: Dict[str, Any] = {}
+    raw = await _ssot_short_name(uid)
+    s = " ".join(str(raw or "").strip().split())
 
-    # 1) core.db.get_user_info (поддержка sync/async)
+    # Уже в нужном виде «Имя Ф.»
+    parts = s.split()
+    if len(parts) == 2 and len(parts[1]) == 2 and parts[1].endswith("."):
+        return s
+
+    # «Имя Ф» (без точки) → добавим точку
+    if len(parts) == 2 and len(parts[1]) == 1:
+        return f"{parts[0]} {parts[1].upper()}."
+
+    # «Имя Фамилия [Отчество]» → «Имя Ф.»
+    if len(parts) >= 2:
+        first = parts[0]
+        last_initial = parts[-1][:1].upper() if parts[-1] else ""
+        if first and last_initial:
+            return f"{first} {last_initial}."
+
+    # Попробуем достать фамилию из индекса пользователей в state
     with suppress(Exception):
-        from core.db import get_user_info  # локальный импорт для совместимости
-        res = get_user_info(uid)
-        ui = await res if asyncio.iscoroutine(res) else (res or {})
-        if not isinstance(ui, dict):
-            ui = {}
+        from core.state import state as _state  # локальный импорт во избежание циклов
+        urec = (_state.users_index or {}).get(int(uid), {})  # type: ignore[attr-defined]
+        fn = str(urec.get("first_name") or urec.get("fname") or "").strip()
+        ln = str(urec.get("last_name") or urec.get("lname") or urec.get("surname") or "").strip()
+        if fn and ln:
+            return f"{fn.split()[0]} {ln[:1].upper()}."
+        if fn:
+            return fn.split()[0]
 
-    # 2) готовое «Имя Ф.» из state.user_short
-    with suppress(Exception):
-        short_ready = (getattr(state, "user_short", {}) or {}).get(uid)
-        if isinstance(short_ready, str) and short_ready.strip():
-            return short_ready.strip()
-
-    # 3) доп. источник: state.users[uid]
-    if not ui:
-        with suppress(Exception):
-            ui = ((getattr(state, "users", {}) or {}).get(uid) or {})  # type: ignore[assignment]
-
-    first = str(ui.get("first_name") or ui.get("name") or "").strip()
-    last_initial_raw = str(ui.get("last_name_initial") or "").strip()
-    last_full = str(ui.get("last_name") or ui.get("surname") or "").strip()
-
-    def _norm_initial(li: str, last: str) -> str:
-        """Нормализует инициал до формата «К.» (или пусто)."""
-        base = (li or "").replace(".", "").strip() or (last[:1] if last else "")
-        return f"{base[0].upper()}." if base else ""
-
-    li = _norm_initial(last_initial_raw, last_full)
-
-    if not (first or li):
-        return str(uid)
-
-    return f"{first} {li}".strip()
+    # Фолбэк: оставляем как есть (лучше «Имя», чем пусто)
+    return parts[0] if parts else "User"
 
 async def _fmt(uid_: int, role_key: str) -> str:
     """
-    Возвращает строку для слотов/тегов: «Имя Ф.суффикс|uid».
+    Формирует «Имя Ф.<суффикс>|uid» для записи в слоты.
     Суффиксы: main→.1, assist→.2, admin→.Адм, trainee→.Стаж
     """
     name = await _short_name(uid_)
-    suffix = { "main": ".1", "assist": ".2", "admin": ".Адм", "trainee": ".Стаж" }.get(role_key, "")
-    # устраняем возможные двойные точки
+    suffix = {
+        "main": ".1",
+        "assist": ".2",
+        "admin": ".Адм",
+        "trainee": ".Стаж",
+    }.get(role_key, "")
     val = (name + suffix).replace("..1", ".1").replace("..2", ".2").replace("..Адм", ".Адм").replace("..Стаж", ".Стаж")
     return f"{val}|{uid_}".strip()
 
 async def _team_bulleted_lines(roles: Dict[str, List[int]], deal_id: int) -> List[str]:
     """
-    Формирует пункты для уведомления:
-      • Имя Ф.1
-      • Имя Ф.2
-      • Имя Ф.Адм
-      • Имя Ф.Стаж (если trainee указан в кэше)
+    Обёртка: строим «слоты» из ролей и отдаём их в SSOT team_bulleted_lines(slots).
+    Ставит суффиксы .1/.2/.Адм/.Стаж по slot-ключам (lead*/assistant*/admin/trainee).
     """
-    lines: List[str] = []
+    slots: Dict[str, Any] = {}
 
-    for uid in roles.get("main", []) or []:
+    # main → lead{i}
+    for i, uid in enumerate(roles.get("main", []) or [], start=1):
+        nm = await _short_name(uid)  # строго «Имя Ф.»
+        slots[f"lead{i}"] = f"{nm}|{uid}"
+
+    # assist → assistant{i}
+    for i, uid in enumerate(roles.get("assist", []) or [], start=1):
         nm = await _short_name(uid)
-        lines.append(f"• {nm}.1".replace("..1", ".1"))
+        slots[f"assistant{i}"] = f"{nm}|{uid}"
 
-    for uid in roles.get("assist", []) or []:
+    # admin (первый, если есть)
+    if roles.get("admin"):
+        uid = roles["admin"][0]
         nm = await _short_name(uid)
-        lines.append(f"• {nm}.2".replace("..2", ".2"))
+        slots["admin"] = f"{nm}|{uid}"
 
-    for uid in roles.get("admin", []) or []:
-        nm = await _short_name(uid)
-        lines.append(f"• {nm}.Адм".replace("..Адм", ".Адм"))
-
-    # стажёр берётся из distribution_cache[str(deal_id)]
+    # trainee подтягиваем из единого кэша (как и прежде)
     with suppress(Exception):
-        raw = (getattr(state, "distribution_cache", {}) or {}).get(str(deal_id), {})
+        from core.state import state as _state  # локальный импорт, чтобы избежать циклов на стадии линтинга
+        raw = (_state.distribution_cache or {}).get(str(deal_id), {})
         if isinstance(raw, dict) and raw.get("trainee"):
-            # используем глобальный _parse_uid, если он есть; иначе пытаемся распарсить локально
-            t_val = raw.get("trainee")
-            t_uid = None
-            try:
-                # предпочитаем глобальную функцию, если она объявлена в модуле
-                t_uid = globals().get("_parse_uid", lambda v: int(str(v).rsplit("|", 1)[-1]))(t_val)  # type: ignore
-            except Exception:
-                with suppress(Exception):
-                    t_uid = int(str(t_val).rsplit("|", 1)[-1])
-            if t_uid:
-                nm = await _short_name(int(t_uid))
-                lines.append(f"• {nm}.Стаж".replace("..Стаж", ".Стаж"))
+            slots["trainee"] = raw.get("trainee")
 
+    # единый формат бульлетов — только через SSOT
+    lines: List[str] = await _ssot_team_bulleted_lines(slots)
     return lines or ["• —"]
 
-# История изменений: 2025-08-14 — блок переписан: локальные импорты asyncio/suppress/typing,
-# стабильная нормализация «Имя Ф.», безопасный парс стажёра без жалоб Pylance.
+# История изменений:
+# 2025-08-20 — выровнено под SSOT; добавлена строгая нормализация до формата «Имя Ф.».
+
 
 
 # ────────────────────────────────────────────────────────────────────
-# [1.k] КНОПКИ/УВЕДОМЛЕНИЯ/КОММИТ СОСТАВА (самодостаточный блок)
+# [1.k] КНОПКИ/УВЕДОМЛЕНИЯ/КОММИТ СОСТАВА (без редравов «Мои игры»)
 # ────────────────────────────────────────────────────────────────────
-from typing import Any, Dict, List, Optional, Set  # локальные импорты типов
+from typing import Any, Dict, List, Optional, Set
 from contextlib import suppress
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 async def _approval_announce_kb() -> "InlineKeyboardMarkup":
-    """Кнопка в уведомлении: deep-link в «🎲 Мои игры»."""
-    # локальные импорты, чтобы не зависеть от верхних
+    """Кнопка в уведомлении: deep-link в «🎲 Мои игры» (тексты без изменений)."""
     from aiogram import Bot
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
     bot = Bot.get_current()
+    uname = ""
     with suppress(Exception):
         me = await bot.get_me()
         uname = (me.username or "").strip()
     if not uname:
-        # фолбэк на настройки/состояние
-        uname = str(getattr(settings, "BOT_USERNAME", "") or getattr(state, "bot_username", "") or "bot")
+        from core.config import settings as _settings
+        from core.state import state as _state
+        uname = str(getattr(_settings, "BOT_USERNAME", "") or getattr(_state, "bot_username", "") or "bot")
     url = f"https://t.me/{uname}?start=my_games"
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎲 Личный кабинет", url=url)]])
 
 def _mark_approved_on_message_kb(callback: "CallbackQuery", deal_id: int) -> Optional["InlineKeyboardMarkup"]:
-    """В текущем сообщении перекрашивает кнопку «Утвердить» → «✅ Утверждено»."""
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
+    """Перекрашивает «Утвердить» → «✅ Утверждено» только в текущем сообщении."""
     try:
         msg = getattr(callback, "message", None)
-        if not msg:
+        if not msg or not isinstance(msg.reply_markup, InlineKeyboardMarkup):
             return None
-        kb = getattr(msg, "reply_markup", None)
-        if not isinstance(kb, InlineKeyboardMarkup):
-            return None
-
         new_rows: List[List[InlineKeyboardButton]] = []
-        for row in kb.inline_keyboard or []:
+        for row in msg.reply_markup.inline_keyboard or []:
             new_row: List[InlineKeyboardButton] = []
             for btn in row or []:
                 cdata = getattr(btn, "callback_data", "") or ""
@@ -706,43 +839,12 @@ def _mark_approved_on_message_kb(callback: "CallbackQuery", deal_id: int) -> Opt
             new_rows.append(new_row)
         return InlineKeyboardMarkup(inline_keyboard=new_rows)
     except Exception:
-        logger.exception("[approve] failed to rebuild keyboard")
+        import logging as _logging
+        _logging.getLogger(__name__).exception("[approve] failed to rebuild keyboard")
         return None
 
-async def _resolve_notify_chat_id(bot: Any) -> Optional[int]:
-    """
-    Возвращает первый доступный чат для уведомлений:
-    POLLS_CHAT_ID → LEADERS_CHAT_ID → state.admin_chat_id → ADMIN_CHAT_ID.
-    Валидируем доступ через get_chat (мягко).
-    """
-    candidates = [
-        getattr(settings, "POLLS_CHAT_ID", None),
-        getattr(settings, "LEADERS_CHAT_ID", None),
-        getattr(state, "admin_chat_id", None),
-        getattr(settings, "ADMIN_CHAT_ID", None),
-    ]
-    for cid in candidates:
-        if not cid:
-            continue
-        with suppress(Exception):
-            cid_int = int(str(cid).strip())
-            # проверяем, что бот видит чат
-            await bot.get_chat(cid_int)
-            return cid_int
-        logger.warning("[polls_dist] notify chat %s not accessible", cid)
-    return None
-
-# ── локальные хелперы дедупликации слотов (инвариант «1 пользователь = 1 роль») ──
 def _slot_uid_from_label(val: Any) -> Optional[int]:
-    """
-    Принимает 'Имя Ф.|123' / int / None → возвращает uid или None.
-    Использует глобальный _parse_uid при наличии (совместимость со стилем модуля).
-    """
-    with suppress(Exception):
-        _p = globals().get("_parse_uid")
-        if callable(_p):
-            u = _p(val)  # type: ignore[call-arg]
-            return int(u) if u is not None else None
+    """Принимает 'Имя Ф.|123' / int / None → возвращает uid или None."""
     if isinstance(val, int):
         return val
     if isinstance(val, str):
@@ -752,116 +854,57 @@ def _slot_uid_from_label(val: Any) -> Optional[int]:
         return int(s) if s.isdigit() else None
     return None
 
-def _dedupe_slots(slots: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Обнуляет повторные вхождения одного и того же uid в разных ролях.
-    Приоритет сохранения: lead1..N → assistant1..N → admin.
-    """
-    import re as _re
-
-    slots = dict(slots or {})
-    used: Set[int] = set()
-
-    def _order_key(k: str) -> int:
-        m = _re.search(r"(\d+)$", k)
-        return int(m.group(1)) if m else 10**9
-
-    lead_keys = sorted([k for k in slots if isinstance(k, str) and k.startswith("lead")], key=_order_key)
-    asst_keys = sorted([k for k in slots if isinstance(k, str) and k.startswith("assistant")], key=_order_key)
-    ordered = lead_keys + asst_keys + (["admin"] if "admin" in slots else [])
-
-    for k in ordered:
-        u = _slot_uid_from_label(slots.get(k))
-        if not u:
-            continue
-        if u in used:
-            slots[k] = None
-        else:
-            used.add(u)
-
-    return slots
-
 async def _commit_locked_distribution_to_state(deal_id: int, roles: Dict[str, List[int]]) -> Dict[str, Any]:
     """
-    Синхронизируем точки правды (ФОРМАТ совместим с «Мои игры»):
-      locked_distribution[deal_id]  ← {'lead1': 'Имя Ф.1|uid', 'assistant1': 'Имя Ф.2|uid',
-                                       'admin': 'Имя Ф.Адм|uid', 'trainee': 'Имя Ф.Стаж|uid'?}
-      pending_confirmations[deal_id]['distribution'] ← тот же dict
-      distribution_cache[str(deal_id)] ← тот же dict
-      poll_details[deal_id]['distribution'] ← тот же dict
-      assigned_index[uid] ← deal_id
-
-    FIX: жёсткая дедупликация слотов (инвариант «1 пользователь = 1 роль»).
+    Фиксируем утверждённый состав:
+      locked_distribution[deal_id]                      ← «Имя Ф.<суффикс>|uid»
+      pending_confirmations[deal_id]['distribution']    ← то же
+      distribution_cache[str(deal_id)] / poll_details   ← то же
+      assigned_index[uid]                               ← deal_id
+    ВАЖНО: никаких редравов/переходов в «Мои игры».
     """
-    _ensure_state_structs()
+    from core.state import state as _state
+    from contextlib import suppress as _suppress
 
-    # безопасный вызов внешнего билдера, если он объявлен выше; иначе — локальный фолбэк
-    to_slot = globals().get("_to_slot_distribution")
-    if callable(to_slot):
-        slots: Dict[str, Any] = await to_slot(deal_id, roles)  # type: ignore[misc]
-    else:
-        # ── локальный фолбэк-билдер слотов ─────────────────────────────
-        slots = {}
-        # основные
-        for i, uid in enumerate(roles.get("main", []) or [], start=1):
-            slots[f"lead{i}"] = await _fmt(uid, "main")
-        # ассистенты
-        for i, uid in enumerate(roles.get("assist", []) or [], start=1):
-            slots[f"assistant{i}"] = await _fmt(uid, "assist")
-        # админ (первый)
-        if roles.get("admin"):
-            slots["admin"] = await _fmt(roles["admin"][0], "admin")
-        # стажёр — из кэша распределения
-        with suppress(Exception):
-            raw = (getattr(state, "distribution_cache", {}) or {}).get(str(deal_id), {})
-            if isinstance(raw, dict) and raw.get("trainee"):
-                t_val = raw.get("trainee")
-                t_uid = None
-                with suppress(Exception):
-                    _p = globals().get("_parse_uid")
-                    if callable(_p):
-                        t_uid = _p(t_val)  # type: ignore[call-arg]
-                if t_uid is None:
-                    with suppress(Exception):
-                        t_uid = int(str(t_val).rsplit("|", 1)[-1])
-                slots["trainee"] = await _fmt(int(t_uid), "trainee") if t_uid else str(t_val)
-        # ───────────────────────────────────────────────────────────────
+    slots: Dict[str, Any] = {}
+    for i, uid in enumerate(roles.get("main", []) or [], start=1):
+        slots[f"lead{i}"] = await _fmt(uid, "main")
+    for i, uid in enumerate(roles.get("assist", []) or [], start=1):
+        slots[f"assistant{i}"] = await _fmt(uid, "assist")
+    if roles.get("admin"):
+        slots["admin"] = await _fmt(roles["admin"][0], "admin")
 
-    # 🔒 Инвариант «1 пользователь = 1 роль» — удаляем дубли по приоритету lead > assistant > admin
+    with _suppress(Exception):
+        raw = (_state.distribution_cache or {}).get(str(deal_id), {})
+        if isinstance(raw, dict) and raw.get("trainee"):
+            t_val = raw.get("trainee")
+            t_uid = _slot_uid_from_label(t_val)
+            slots["trainee"] = await _fmt(int(t_uid), "trainee") if t_uid else str(t_val)
+
+    # инвариант «1 пользователь = 1 роль»
     slots = _dedupe_slots(slots)
 
-    # запись в кэши
-    state.locked_distribution[deal_id] = dict(slots)
-    state.pending_confirmations[deal_id] = {"distribution": dict(slots), "confirmed": set()}
-
-    state.distribution_cache[str(deal_id)] = dict(slots)
-    pd = state.poll_details.setdefault(deal_id, {})
+    # запись во все точки правды
+    _state.locked_distribution[deal_id] = dict(slots)
+    _state.pending_confirmations[deal_id] = {"distribution": dict(slots), "confirmed": set()}
+    _state.distribution_cache[str(deal_id)] = dict(slots)
+    pd = _state.poll_details.setdefault(deal_id, {})
     pd["distribution"] = dict(slots)
 
-    # индекс назначений для «Мои игры»
+    # индекс для быстрых выборок «Мои игры» (без редравов)
     all_uids: Set[int] = set()
-
-    def _parse_uid_safe(v: Any) -> Optional[int]:
-        # упрощённо и надёжно
-        return _slot_uid_from_label(v)
-
     for v in slots.values():
-        u = _parse_uid_safe(v)
+        u = _slot_uid_from_label(v)
         if u:
             all_uids.add(u)
-
     for uid in all_uids:
-        idx = state.assigned_index.setdefault(uid, set())
+        idx = _state.assigned_index.setdefault(uid, set())
         idx.add(deal_id)
 
-    # ➕ НОВОЕ: коалесцированный редрав «Мои игры» сразу для всех участников
-    with suppress(Exception):
-        q = globals().get("_queue_redraw_my_games")
-        if callable(q):
-            q(all_uids)  # type: ignore[arg-type]
-
-    logger.debug("[polls_dist] deal %d locked+committed; slots=%s", deal_id, slots)
     return slots
+
+# История изменений: [1.k] 2025-08-20 — убраны любые вызовы redraw_my_games / create_task; остальная логика без изменений.
+
 
 # ════════════════════════════════════════════════════════════════════
 # [1] INLINE-КЛАВИАТУРА (резерв под действия)
@@ -874,58 +917,23 @@ def distribution_actions_markup() -> InlineKeyboardMarkup:
 
 
 # ════════════════════════════════════════════════════════════════════
-# [1.1] Коалесцирование перерисовок «Мои игры» (фикс гонок «пылесоса»)
-# ════════════════════════════════════════════════════════════════════
-def _queue_redraw_my_games(uids: Set[int], delay_sec: float = 0.15) -> None:
-    """
-    Складываем uid в аккумулятор и планируем ОДНУ задачу,
-    которая через короткую паузу перерисует дашборд для каждого uid ровно один раз.
-    """
-    if not uids:
-        return
-
-    acc: Set[int] = getattr(state, "_redraw_accum", set())
-    acc |= set(uids)
-    setattr(state, "_redraw_accum", acc)
-
-    task: asyncio.Task | None = getattr(state, "_redraw_task", None)
-    if task and not task.done():
-        return
-
-    async def _runner():
-        try:
-            await asyncio.sleep(delay_sec)
-            batch: Set[int] = getattr(state, "_redraw_accum", set())
-            setattr(state, "_redraw_accum", set())
-            for uid in sorted(batch):
-                try:
-                    await redraw_my_games(uid)
-                except Exception as e:
-                    logger.error("[redraw_coalesce] uid=%s failed: %s", uid, e)
-        finally:
-            setattr(state, "_redraw_task", None)
-
-    setattr(state, "_redraw_task", asyncio.create_task(_runner()))
-
-# История изменений: [1.1] добавлен 2025-08-13 — коалесцированный редрав
-
-
-# ════════════════════════════════════════════════════════════════════
-# [2] INLINE-КЛАВИАТУРА (резерв под действия)
+# [2] УТВЕРЖДЕНИЕ СОСТАВА / LOCKED DISTRIBUTION — РЕЗЕРВ (без дубликатов)
 # ════════════════════════════════════════════════════════════════════
 """
-Здесь раньше повторно определялась distribution_actions_markup(), из-за чего
-происходило перекрытие функции и появлялись предупреждения линтера/IDE.
+В этом блоке раньше повторно объявлялась `distribution_actions_markup()`,
+из-за чего происходило перекрытие реализации из секции [1] и появлялись
+варнинги линтера/IDE.
 
-Исправление:
-— Дубликат удалён. Используем единственную реализацию из секции [1].
-— Блок оставлен как «резерв» без кода, чтобы сохранить нумерацию и стиль.
+ФИКС:
+— Убираем любые дубли и обработчики из этого блока.
+— Не объявляем функций/хендлеров, чтобы сохранить единственный источник
+  правды для действий: реализация `distribution_actions_markup()` остаётся в [1],
+  логика утверждения/назначения и уведомлений — в блоках [3], [4], [5].
+— Блок оставлен намеренно как «резерв» для нумерации и будущих расширений.
 """
 
-# намеренно пусто — актуальная функция distribution_actions_markup() объявлена в [1]
-
-# История изменений: 2025-08-12 — удалён дублирующийся def distribution_actions_markup()
-
+# намеренно пусто — всё, что связано с клавиатурами/утверждением,
+# находится в секциях [1], [1.k], [3], [4] и [5].
 
 # ════════════════════════════════════════════════════════════════════
 # [3] HANDLER: Утвердить одну игру (без автопереходов) — FIX header+admin+dedupe (+cache)

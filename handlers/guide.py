@@ -1,14 +1,15 @@
 # handlers/guide.py — «бот-проводник» для группового чата ведущих
 # ────────────────────────────────────────────────────────────────────
 """
-MasterBot v14.7 · 2025-08-08
+MasterBot v14.8 · 2025-08-24
 
-Fix 14.7
-• custom_button_handler теперь работает **только** в группах / супергруппах,
-  поэтому не перехватывает личные сообщения («🎲 Мои игры» и т.п.).
-• Исключение SkipHandler больше не поднимается — если кнопка не совпала,
-  хендлер просто возвращает управление без ошибок.
-• Остальной функционал (пин-меню, SQLite, логика кастом-кнопок) неизменён.
+Fix 14.8
+• Переход на методы экземпляра Bot для пинов/распинов (aiogram 3.x):
+  bot.pin_chat_message(...) / bot.unpin_all_chat_messages(...)
+  вместо прямых вызовов классов методов (PinChatMessage / UnpinAllChatMessages).
+• Поведение без изменений: авто-пин меню в группе, обновление разметки,
+  обработка кастом-кнопок только в группах, SQLite-хранилище.
+• Добавлены типы и защитные проверки для state.group_menu_message_id.
 """
 
 from __future__ import annotations
@@ -19,12 +20,11 @@ import contextlib
 import logging
 import sqlite3
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 from aiogram import Bot, Router
 from aiogram.enums import ChatType
 from aiogram.filters import CommandStart
-from aiogram.methods import PinChatMessage, UnpinAllChatMessages
 from aiogram.types import (
     ChatMemberUpdated,
     InlineKeyboardButton,
@@ -37,8 +37,10 @@ from core.state import state
 logger = logging.getLogger(__name__)
 router = Router()
 
-# ensure storage for pinned menus
-state.group_menu_message_id = getattr(state, "group_menu_message_id", {})
+# ensure storage for pinned menus (chat_id -> message_id)
+if not hasattr(state, "group_menu_message_id") or not isinstance(getattr(state, "group_menu_message_id"), dict):
+    state.group_menu_message_id = {}  # type: ignore[attr-defined]
+group_menu_message_id: Dict[int, int] = state.group_menu_message_id  # alias с типом
 
 # ███ [1] КОНСТАНТЫ
 # --------------------------------------------------------------------
@@ -48,7 +50,7 @@ PROFILE_LINK = "https://t.me/masbot12_bot?start=profile"  # TODO: real link
 # ███ [2] SQLite — кастомные кнопки
 # --------------------------------------------------------------------
 DB_FILE = Path(__file__).resolve().parent / "checklists.db"
-_conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+_conn: sqlite3.Connection = sqlite3.connect(DB_FILE, check_same_thread=False)
 
 
 def init_db() -> None:
@@ -71,7 +73,7 @@ def fetch_custom_buttons(chat_id: int) -> List[Tuple[str, str]]:
         "SELECT button_text, button_url FROM custom_buttons WHERE chat_id = ?",
         (chat_id,),
     )
-    rows = cur.fetchall()
+    rows: List[Tuple[str, str]] = [(str(r[0]), str(r[1])) for r in cur.fetchall()]
     logger.debug("[guide] fetched %d custom buttons for chat %d", len(rows), chat_id)
     return rows
 
@@ -85,17 +87,22 @@ def build_menu_markup() -> InlineKeyboardMarkup:
 
 
 async def ensure_pinned_menu(chat_id: int) -> None:
+    """
+    Гарантирует наличие закреплённого сообщения-меню в групповом чате.
+    • Если уже есть — обновляет разметку.
+    • Иначе — распинивает всё, отправляет новое сообщение, пинает его и запоминает id.
+    """
     bot = Bot.get_current()
-    menu_id = state.group_menu_message_id.get(chat_id)
+    menu_id = group_menu_message_id.get(int(chat_id))
     markup = build_menu_markup()
 
     if menu_id:
         try:
-            await bot.edit_message_reply_markup(chat_id, menu_id, reply_markup=markup)
+            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=menu_id, reply_markup=markup)
             logger.debug("[guide] updated pinned menu %d in chat %d", menu_id, chat_id)
             return
         except Exception as e:
-            logger.warning("[guide] failed to update menu %d: %s", menu_id, e)
+            logger.warning("[guide] failed to update menu %d in chat %d: %s", menu_id, chat_id, e)
 
     sent = await bot.send_message(
         chat_id,
@@ -104,10 +111,18 @@ async def ensure_pinned_menu(chat_id: int) -> None:
         reply_markup=markup,
         disable_web_page_preview=True,
     )
+
     with contextlib.suppress(Exception):
-        await UnpinAllChatMessages(chat_id=chat_id)
-    await PinChatMessage(chat_id=chat_id, message_id=sent.message_id)
-    state.group_menu_message_id[chat_id] = sent.message_id
+        await bot.unpin_all_chat_messages(chat_id=chat_id)
+
+    try:
+        await bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=True)
+    except Exception as e:
+        # не критично: сообщение отправлено, но не закрепилось — просто логируем
+        logger.debug("[guide] pin_chat_message failed for chat_id=%s: %r", chat_id, e)
+
+    group_menu_message_id[int(chat_id)] = int(sent.message_id)
+    state.group_menu_message_id = group_menu_message_id  # синхронизируем обратно в state
     logger.info("[guide] pinned new menu %d in chat %d", sent.message_id, chat_id)
 
 
@@ -121,15 +136,23 @@ def group_keyboard() -> InlineKeyboardMarkup:
 # --------------------------------------------------------------------
 @router.my_chat_member()
 async def on_bot_join(evt: ChatMemberUpdated) -> None:
-    if evt.new_chat_member.status in {"member", "administrator"}:
-        logger.info(
-            "[guide] bot joined chat %d as %s", evt.chat.id, evt.new_chat_member.status
-        )
+    """
+    Когда бот добавлен в группу/назначен админом — создаём/обновляем закреплённое меню.
+    """
+    try:
+        new_status = str(getattr(evt, "new_chat_member", None).status)  # type: ignore[union-attr]
+    except Exception:
+        new_status = ""
+    if new_status in {"member", "administrator"}:
+        logger.info("[guide] bot joined chat %d as %s", evt.chat.id, new_status)
         await ensure_pinned_menu(evt.chat.id)
 
 
 @router.message(CommandStart())
 async def on_group_start(message: Message) -> None:
+    """
+    Обработка /start в группе/супергруппе: гарантируем «закреп».
+    """
     if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         logger.info("[guide] /start in group %d", message.chat.id)
         await ensure_pinned_menu(message.chat.id)
@@ -137,7 +160,7 @@ async def on_group_start(message: Message) -> None:
 
 @router.message(lambda m: m.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP})
 async def custom_button_handler(message: Message) -> None:
-    """Обработка кастом-кнопок *только* в группах.  
+    """Обработка кастом-кнопок *только* в группах.
     В личке — сразу возвращаем управление другим хендлерам.
     """
     txt = (message.text or "").strip()
@@ -164,3 +187,7 @@ async def custom_button_handler(message: Message) -> None:
 # --------------------------------------------------------------------
 init_db()
 logger.info("[guide] module loaded, DB=%s", DB_FILE)
+
+# История изменений:
+# • 2025-08-24 — v14.8: Pin/Unpin переведены на методы Bot (совместимость aiogram 3.x).
+# • 2025-08-08 — v14.7: кастом-кнопки только в группах, без SkipHandler; остальное без изменений.
