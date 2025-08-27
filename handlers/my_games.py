@@ -1920,21 +1920,63 @@ async def on_report_text(message: types.Message) -> None:
     (getattr(state, "pending_report", {}) or {}).pop(uid, None)
     await _soft_redraw_my_games(uid)
 
-# [7.4] HANDLER: локальный UI-хук после подтверждения — меняем кнопку на «Попросить замену»
-@router.callback_query(lambda c: c.data and c.data.startswith(CONFIRM_PREFIX))
-async def _cb_after_confirm_ui_patch(callback: _types.CallbackQuery) -> None:
-    uid = callback.from_user.id
-    parts = str(callback.data or "").rsplit("_", 2)
-    with contextlib.suppress(Exception):
-        deal_id = int(parts[-2]); role = parts[-1]
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Попросить замену", callback_data=f"{SWAP_PREFIX}{deal_id}")]])
-        await callback.message.edit_reply_markup(reply_markup=kb)
-        # отметим локально подтверждение — для мгновенного отражения в дашборде
+# [7.4] POST-CONFIRM UI HOOK (no callback intercept)
+# ────────────────────────────────────────────────────────────────────
+"""
+ВАЖНО:
+Раньше здесь был обработчик на CONFIRM_PREFIX, из-за чего «Мои игры»
+перехватывали подтверждение раньше handlers/confirmations.py, и бизнес-логика
+(теги/уведомления/перевод статуса) не выполнялась.
+
+Теперь локальных обработчиков CONFIRM_PREFIX НЕТ. Подтверждения целиком ведёт
+handlers/confirmations.py (SSOT).
+
+Оставляем только необязательный хелпер, который МОЖНО вызвать из
+handlers/confirmations.py после успешной отметки, чтобы мягко перепокрасить
+кнопку и обновить дашборд. Сам по себе он ничего не перехватывает.
+"""
+
+from aiogram import types as _types
+
+async def mygames_after_confirm_ui_patch(
+    uid: int,
+    deal_id: int,
+    role: str,
+    msg: _types.Message | None = None,
+) -> None:
+    """
+    Мягкий локальный патч UI после подтверждения (по желанию вызывающей стороны):
+      • меняет кнопку на «🔄 Попросить замену»,
+      • отмечает локально confirmed (для мгновенного отображения),
+      • делает мягкий редрав дашборда.
+
+    Ничего не делает с AmoCRM/уведомлениями/статусом — это всё в handlers/confirmations.py.
+    """
+    try:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔄 Попросить замену",
+                                                  callback_data=f"{SWAP_PREFIX}{int(deal_id)}")]]
+        )
+
+        # Если передано конкретное сообщение — правим его;
+        # иначе пробуем найти «второе» сообщение деталей в last_user_messages.
+        if msg and getattr(msg, "message_id", None):
+            await msg.edit_reply_markup(reply_markup=kb)
+        else:
+            msgs = (getattr(state, "last_user_messages", {}) or {}).get(int(uid), [])
+            if len(msgs) >= 2 and getattr(msgs[1], "message_id", None):
+                await msgs[1].edit_reply_markup(reply_markup=kb)
+
+        # Локальная отметка подтверждения (на случай, если CRM-теги прилетят с задержкой)
         pc = (getattr(state, "pending_confirmations", {}) or {}).setdefault(int(deal_id), {"confirmed": {}})
         pc.setdefault("confirmed", {}).setdefault(str(role), set()).add(int(uid))
-        await _soft_redraw_my_games(uid)
-    with contextlib.suppress(Exception):
-        await callback.answer("Готово!")
+
+        # Мягкий редрав списка «Моих игр»
+        if callable(globals().get("_soft_redraw_my_games")):
+            await _soft_redraw_my_games(int(uid))  # type: ignore[misc]
+    except Exception:
+        # UI-патч не критичен, ошибки гасим.
+        pass
 
 # ════════════════════════════════════════════════════════════════════
 # [8] SELF-TEST

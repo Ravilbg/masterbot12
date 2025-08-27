@@ -156,17 +156,17 @@ if TYPE_CHECKING:
 # ════════════════════════════════════════════════════════════════════
 # [0.96] REPORT + VACUUM (edit-in-place, no ui_context; no-resend-on-not-modified)
 # ════════════════════════════════════════════════════════════════════
+from typing import Optional, Set, Tuple, Dict, Any, List  # noqa: F401
 import contextlib
 import logging
-from typing import Optional, Set, Tuple, Dict, Any, List
 
-from aiogram import Bot, types
-from aiogram.types import InlineKeyboardMarkup
-from aiogram.exceptions import TelegramBadRequest
+from aiogram import Bot, types  # noqa: F401
+from aiogram.types import InlineKeyboardMarkup  # noqa: F401
+from aiogram.exceptions import TelegramBadRequest  # noqa: F401
 
-from core.config import settings
-from core.db import get_user_info
-from core.state import state
+from core.config import settings  # noqa: F401
+from core.db import get_user_info  # noqa: F401
+from core.state import state  # noqa: F401
 from core.utils import delete_previous_private_messages, vacuum_private  # ← SSOT
 
 logger = logging.getLogger(__name__)
@@ -196,9 +196,8 @@ async def _edit_or_send_report(uid: int, text: str, kb: InlineKeyboardMarkup) ->
                 bucket = getattr(state, "last_user_messages", {})
                 if isinstance(bucket, dict):
                     lst = list(bucket.get(int(uid), []) or [])
-                    # не дублируем один и тот же id
                     lst = [m for m in lst if getattr(m, "message_id", None) != mid]
-                    class _Msg:  # минимальный объект с message_id, если нет исходного Message
+                    class _Msg:
                         def __init__(self, message_id: int) -> None:
                             self.message_id = message_id
                     lst.append(_Msg(mid))
@@ -210,24 +209,19 @@ async def _edit_or_send_report(uid: int, text: str, kb: InlineKeyboardMarkup) ->
         except TelegramBadRequest as e:
             s = str(e).lower()
             if "message is not modified" in s:
-                # ничего не меняем — это ок
                 return
-            # сообщение потеряно/удалено — удаляем только его и пришлём новое
             with contextlib.suppress(Exception):
                 await bot.delete_message(uid, mid)
             setattr(state, "personal_report_message_id", None)
         except Exception:
-            # Любая иная ошибка редактирования — попробуем прислать новый
             with contextlib.suppress(Exception):
                 setattr(state, "personal_report_message_id", None)
 
-    # Отправляем новый отчёт (без «пылесоса» ЛС)
     sent = await bot.send_message(
         uid, text, parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True
     )
     state.personal_report_message_id = sent.message_id
 
-    # Поддерживаем last_user_messages — не очищая другие сообщения пользователя
     try:
         bucket = getattr(state, "last_user_messages", {})
         if isinstance(bucket, dict):
@@ -239,7 +233,6 @@ async def _edit_or_send_report(uid: int, text: str, kb: InlineKeyboardMarkup) ->
     except Exception:
         pass
 
-    # легкий маркер UI-контекста
     try:
         (getattr(state, "ui_context", {}) or {}).update({uid: "poll_report"})
     except Exception:
@@ -305,7 +298,6 @@ async def _vacuum_old_messages() -> None:
         pass
     try:
         db: Dict[Tuple[int, int], Any] = (getattr(state, "detail_blocks", {}) or {})
-        # detail_blocks хранится под ключом (uid, deal_id)
         uids.update(int(k[0]) for k in db.keys()
                     if isinstance(k, tuple) and len(k) >= 2 and isinstance(k[0], int))
     except Exception:
@@ -327,20 +319,18 @@ async def _vacuum_old_messages() -> None:
         pass
 
     try:
-        from core.menu import get_menu_message_id  # может отсутствовать в некоторых сборках
-    except Exception:
+        from core.menu import get_menu_message_id
+    except Exception:  # pragma: no cover
         get_menu_message_id = lambda _uid: None  # type: ignore
 
     for uid in sorted(uids):
         keep_ids: List[int] = []
 
-        # Меню — всегда храним
         with contextlib.suppress(Exception):
             mid = get_menu_message_id(uid)
             if isinstance(mid, int):
                 keep_ids.append(mid)
 
-        # Все активные detail-блоки этого uid — тоже храним
         try:
             db_map: Dict[Tuple[int, int], Any] = getattr(state, "detail_blocks", {}) or {}
             for (k_uid, _deal), raw in list(db_map.items()):
@@ -362,10 +352,7 @@ async def _vacuum_old_messages() -> None:
             await vacuum_private(uid, keep=keep_ids)
 
 # История изменений:
-# 2025-08-25 • v0.96f — _edit_or_send_report без глобальной чистки ЛС; при resend удаляется только старый отчёт.
-# 2025-08-25 • v0.96f — _vacuum_old_messages сохраняет активные detail_blocks и меню (тихая замена не ломается).
-# 2025-08-18 • v0.96d — vacuum: бережём главное меню + чистим по union(uid) из state (SSOT).
-# 2025-08-18 • v0.96c — «message is not modified» трактуем как OK; синхронизируем last_user_messages.
+# 2025-08-27 • v0.96g — убраны дубли импорта/логгера; сохранена «тихая» логика; SSOT/фиксы Pylance.
 
 
 
@@ -954,28 +941,32 @@ from core.utils import resolve_notify_chat_id
 # 2025-08-18 — выровнено под SSOT: локальный _resolve_notify_chat_id удалён, используем core.utils.resolve_notify_chat_id.
 
 
-# ════════════════════════════════════════════════════════════════════
-# [2.7] SWAP / DISTRIBUTION HELPERS
-# ════════════════════════════════════════════════════════════════════
-# SSOT: короткие имена, печать состава и чтение ролей — из core.utils.
+# ███ [2.7] SWAP / DISTRIBUTION HELPERS
+# --------------------------------------------------------------------
 from core.utils import short_name, team_bulleted_lines, assigned_role_from_state as _assigned_role_from_state
 from services.amocrm import get_amocrm_deals  # для снапшота сделки (fallback)
+from typing import Tuple, Optional, Dict, Any, List, Set
 
 def _slot_label(uid: int, base: Optional[str] = None) -> str:
     """Метка слота: 'Имя Ф.|uid'."""
     return f"{(base or '').strip() or 'user'+str(uid)}|{uid}"
 
 def _remove_uid_from_dist(dist: Dict[str, Any], uid: int) -> None:
-    """Инвариант «1 пользователь = 1 роль» — убираем uid из всех lead*/assistant*/admin."""
+    """Инвариант «1 пользователь = 1 роль» — убираем uid из всех lead*/assistant*/admin/trainee."""
     for k, v in list(dist.items()):
         if not isinstance(k, str):
             continue
         if k.startswith("lead") or k.startswith("assistant") or k == "admin":
             if isinstance(v, str) and v.rsplit("|", 1)[-1].isdigit() and int(v.rsplit("|", 1)[-1]) == uid:
                 dist[k] = None
+        if k == "trainee":
+            # trainee хранится как список строк меток
+            if isinstance(v, list):
+                dist[k] = [t for t in v if not (isinstance(t, str) and t.rsplit("|", 1)[-1].isdigit()
+                                                and int(t.rsplit("|", 1)[-1]) == uid)]
 
 def _ensure_role_slots(dist: Dict[str, Any], game_name: str, package: str) -> Tuple[int, int, int]:
-    """Создаёт недостающие ключи lead{i}/assistant{i}/admin согласно конфигурации."""
+    """Создаёт недостающие ключи lead{i}/assistant{i}/admin согласно конфигурации. Стажёры — список."""
     need = _role_cfg(game_name)
     need_main = int(need.get("main_leaders", 1))
     need_assist = int(need.get("assistants", 0))
@@ -985,29 +976,32 @@ def _ensure_role_slots(dist: Dict[str, Any], game_name: str, package: str) -> Tu
     for i in range(1, max(0, need_assist) + 1):
         dist.setdefault(f"assistant{i}", None)
     dist.setdefault("admin", None if need_admin else None)
+    # стажёры — всегда список (не влияют на готовность)
+    dist.setdefault("trainee", [])
+    if not isinstance(dist["trainee"], list):
+        dist["trainee"] = []  # приведение типов
     return need_main, need_assist, need_admin
 
 def _first_empty_slot(dist: Dict[str, Any], prefix: str, count: int) -> Optional[str]:
-    """Возвращает имя первого пустого слота с данным префиксом (lead/assistant)."""
+    """Возвращает имя первого пустого слота с данным префиксом (lead/assistant). Если нет свободных — None."""
     for i in range(1, count + 1):
         key = f"{prefix}{i}"
         if dist.get(key) in (None, "", 0):
             return key
-    return f"{prefix}1" if count >= 1 else None
+    return None  # раньше возвращали prefix1 → это могло перезаписывать занятый слот
 
 async def _insert_candidate_into_distribution(deal_id: int, role: str, uid: int, status: str) -> Dict[str, Any]:
     """
     Точечно встраивает кандидата в distribution_cache[str(deal_id)]:
-    • green/yellow → целевая роль;
-    • red → слот trainee (не учитывается в готовности).
+    • green/yellow → целевая роль, но только в ПУСТОЙ слот;
+    • red → добавляем в trainee (список меток), готовность не увеличивает;
+    • НИКОГДА не перезаписывает занятые core-слоты (no-op, если свободных нет).
     Инвариант: 1 пользователь = 1 роль.
     Возвращает актуализированный dist.
     """
-    # найдём сделку
     deal = next((d for d in (state.current_poll_deals or []) if int(d.get("id", 0)) == int(deal_id)), {}) or {}
     game_name = str(deal.get("game_name") or deal.get("name") or "")
     package = str(deal.get("package") or "")
-    # получить/подготовить dist
     if not getattr(state, "distribution_cache", None):
         state.distribution_cache = {}
     dist: Dict[str, Any] = dict((state.distribution_cache or {}).get(str(deal_id)) or {})
@@ -1016,25 +1010,35 @@ async def _insert_candidate_into_distribution(deal_id: int, role: str, uid: int,
     # удалить кандидата из всех ролей (если вдруг уже был)
     _remove_uid_from_dist(dist, uid)
 
-    # метка SSOT: «Имя Ф.|uid»
     label = _slot_label(uid, await short_name(uid))
 
     if status == "red" and role in {"main", "assist"}:
-        # «красный» — в стажёры, готовность не увеличивает
-        dist["trainee"] = label
+        # «красный» — добавляем в стажёры, без дублей
+        t = dist.get("trainee")
+        if isinstance(t, list):
+            if label not in t:
+                t.append(label)
+            dist["trainee"] = t
+        else:
+            dist["trainee"] = [label]
     else:
         if role == "main":
-            key = _first_empty_slot(dist, "lead", need_main) or "lead1"
-            dist[key] = label
+            key = _first_empty_slot(dist, "lead", need_main)
+            if key:
+                dist[key] = label  # только если есть свободное место
         elif role == "assist":
-            key = _first_empty_slot(dist, "assistant", need_assist) or "assistant1"
-            dist[key] = label
+            key = _first_empty_slot(dist, "assistant", need_assist)
+            if key:
+                dist[key] = label
         elif role == "admin":
-            dist["admin"] = label
+            # админ — один слот, но НЕ переписываем, если уже занят
+            if dist.get("admin") in (None, "", 0):
+                dist["admin"] = label
         else:
-            # защитный фолбэк — как помощник
-            key = _first_empty_slot(dist, "assistant", max(1, need_assist)) or "assistant1"
-            dist[key] = label
+            # защитный фолбэк — пытаемся как помощник, но без перезаписи занятых
+            key = _first_empty_slot(dist, "assistant", max(1, need_assist))
+            if key:
+                dist[key] = label
 
     state.distribution_cache[str(deal_id)] = dist
     return dist
@@ -1051,7 +1055,6 @@ async def _find_deal_snapshot(deal_id: int) -> Dict[str, Any]:
                 return d
         except Exception:
             continue
-    # запасной путь — запросить список актуальных сделок и найти там
     try:
         deals = await get_amocrm_deals()
         for d in deals or []:
@@ -1062,9 +1065,8 @@ async def _find_deal_snapshot(deal_id: int) -> Dict[str, Any]:
     return {}
 
 # История изменений:
-# 2025-08-18 — выровнено под SSOT: short_name/team_bulleted_lines/assigned_role_from_state из core.utils;
-#               добавлен обратно _find_deal_snapshot (фиксы Pylance).
-
+# 2025-08-27 — trainee как список (мульти-стажёры); _first_empty_slot больше не возвращает принудительный prefix1;
+#              _insert_candidate... не перезаписывает занятые core-слоты (no-op), строгое соблюдение инвариантов SSOT.
 
 # ════════════════════════════════════════════════════════════════════
 # [3] СОЗДАНИЕ ОПРОСА

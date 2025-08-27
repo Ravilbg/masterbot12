@@ -802,11 +802,34 @@ async def _team_bulleted_lines(roles: Dict[str, List[int]], deal_id: int) -> Lis
 # ────────────────────────────────────────────────────────────────────
 # [1.k] КНОПКИ/УВЕДОМЛЕНИЯ/КОММИТ СОСТАВА (без редравов «Мои игры»)
 # ────────────────────────────────────────────────────────────────────
-from typing import Any, Dict, List, Optional, Set
 from contextlib import suppress
+from typing import Any, Dict, List, Optional, Set
+
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-async def _approval_announce_kb() -> "InlineKeyboardMarkup":
+# SSOT-хелперы
+from core.utils import team_bulleted_lines as _ssot_team_bulleted_lines
+
+def _deal_title_from_state(deal_id: int) -> str:
+    """
+    Возвращает «название сделки из ЦРМ» (game_name/name) без даты/пакета.
+    Безопасный фолбэк: 'Сделка #{id}'.
+    """
+    try:
+        deals = getattr(state, "current_poll_deals", []) or []
+        d = next((x for x in deals if int(x.get("id") or 0) == int(deal_id)), None)
+        if d:
+            title = str(d.get("game_name") or d.get("name") or "").strip()
+            if title:
+                return title
+        meta = (getattr(state, "deals_index", {}) or {}).get(int(deal_id), {})  # type: ignore[index]
+        title = str(meta.get("title") or "").strip()
+        return title or f"Сделка #{int(deal_id)}"
+    except Exception:
+        return f"Сделка #{int(deal_id)}"
+
+
+async def _approval_announce_kb() -> InlineKeyboardMarkup:
     """Кнопка в уведомлении: deep-link в «🎲 Мои игры» (тексты без изменений)."""
     from aiogram import Bot
     bot = Bot.get_current()
@@ -821,8 +844,11 @@ async def _approval_announce_kb() -> "InlineKeyboardMarkup":
     url = f"https://t.me/{uname}?start=my_games"
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎲 Личный кабинет", url=url)]])
 
-def _mark_approved_on_message_kb(callback: "CallbackQuery", deal_id: int) -> Optional["InlineKeyboardMarkup"]:
-    """Перекрашивает «Утвердить» → «✅ Утверждено» только в текущем сообщении."""
+
+def _mark_approved_on_message_kb(callback: "CallbackQuery", deal_id: int) -> Optional[InlineKeyboardMarkup]:
+    """
+    Перекрашивает «Утвердить» → «✅ Утверждено» только в текущем сообщении.
+    """
     try:
         msg = getattr(callback, "message", None)
         if not msg or not isinstance(msg.reply_markup, InlineKeyboardMarkup):
@@ -843,6 +869,7 @@ def _mark_approved_on_message_kb(callback: "CallbackQuery", deal_id: int) -> Opt
         _logging.getLogger(__name__).exception("[approve] failed to rebuild keyboard")
         return None
 
+
 def _slot_uid_from_label(val: Any) -> Optional[int]:
     """Принимает 'Имя Ф.|123' / int / None → возвращает uid или None."""
     if isinstance(val, int):
@@ -854,6 +881,19 @@ def _slot_uid_from_label(val: Any) -> Optional[int]:
         return int(s) if s.isdigit() else None
     return None
 
+
+async def _lines_from_slots(slots: Dict[str, Any]) -> List[str]:
+    """
+    Формирует строки списка команды для уведомления строго из слотов
+    (lead*/assistant*/admin/trainee) через SSOT team_bulleted_lines.
+    """
+    try:
+        lines = await _ssot_team_bulleted_lines(slots)
+        return lines or ["• —"]
+    except Exception:
+        return ["• —"]
+
+
 async def _commit_locked_distribution_to_state(deal_id: int, roles: Dict[str, List[int]]) -> Dict[str, Any]:
     """
     Фиксируем утверждённый состав:
@@ -861,11 +901,22 @@ async def _commit_locked_distribution_to_state(deal_id: int, roles: Dict[str, Li
       pending_confirmations[deal_id]['distribution']    ← то же
       distribution_cache[str(deal_id)] / poll_details   ← то же
       assigned_index[uid]                               ← deal_id
+
     ВАЖНО: никаких редравов/переходов в «Мои игры».
+    Возвращает зафиксированные slots.
     """
     from core.state import state as _state
-    from contextlib import suppress as _suppress
 
+    # локальный форматтер для суффиксов (используется уже в проекте)
+    async def _fmt(uid_: int, role_key: str) -> str:
+        from core.utils import short_name as _ssot_short_name
+        name = await _ssot_short_name(uid_)
+        name = " ".join(str(name or "").strip().split())
+        suffix = {"main": ".1", "assist": ".2", "admin": ".Адм", "trainee": ".Стаж"}.get(role_key, "")
+        val = (name + suffix).replace("..1", ".1").replace("..2", ".2").replace("..Адм", ".Адм").replace("..Стаж", ".Стаж")
+        return f"{val}|{uid_}".strip()
+
+    # сбор слотов
     slots: Dict[str, Any] = {}
     for i, uid in enumerate(roles.get("main", []) or [], start=1):
         slots[f"lead{i}"] = await _fmt(uid, "main")
@@ -874,15 +925,36 @@ async def _commit_locked_distribution_to_state(deal_id: int, roles: Dict[str, Li
     if roles.get("admin"):
         slots["admin"] = await _fmt(roles["admin"][0], "admin")
 
-    with _suppress(Exception):
+    # протягиваем стажёра из единого кэша (если был)
+    with suppress(Exception):
         raw = (_state.distribution_cache or {}).get(str(deal_id), {})
         if isinstance(raw, dict) and raw.get("trainee"):
             t_val = raw.get("trainee")
             t_uid = _slot_uid_from_label(t_val)
             slots["trainee"] = await _fmt(int(t_uid), "trainee") if t_uid else str(t_val)
 
-    # инвариант «1 пользователь = 1 роль»
-    slots = _dedupe_slots(slots)
+    # инвариант «1 пользователь = 1 роль» (через приоритет lead > assistant > admin)
+    def _dedupe_slots_local(sl: Dict[str, Any]) -> Dict[str, Any]:
+        import re as _re
+        used: Set[int] = set()
+        out = dict(sl)
+        lead_keys = sorted([k for k in sl if isinstance(k, str) and k.startswith("lead")],
+                           key=lambda k: int(_re.search(r"(\d+)$", k).group(1)) if _re.search(r"(\d+)$", k) else 0)
+        asst_keys = sorted([k for k in sl if isinstance(k, str) and k.startswith("assistant")],
+                           key=lambda k: int(_re.search(r"(\d+)$", k).group(1)) if _re.search(r"(\d+)$", k) else 0)
+        admin_keys = ["admin"] if "admin" in sl else []
+        for group in (lead_keys, asst_keys, admin_keys):
+            for key in group:
+                uid = _slot_uid_from_label(out.get(key))
+                if uid is None:
+                    continue
+                if uid in used:
+                    out[key] = ""
+                else:
+                    used.add(uid)
+        return out
+
+    slots = _dedupe_slots_local(slots)
 
     # запись во все точки правды
     _state.locked_distribution[deal_id] = dict(slots)
@@ -891,7 +963,7 @@ async def _commit_locked_distribution_to_state(deal_id: int, roles: Dict[str, Li
     pd = _state.poll_details.setdefault(deal_id, {})
     pd["distribution"] = dict(slots)
 
-    # индекс для быстрых выборок «Мои игры» (без редравов)
+    # индекс для быстрых выборок «Мои игры»
     all_uids: Set[int] = set()
     for v in slots.values():
         u = _slot_uid_from_label(v)
@@ -903,7 +975,9 @@ async def _commit_locked_distribution_to_state(deal_id: int, roles: Dict[str, Li
 
     return slots
 
-# История изменений: [1.k] 2025-08-20 — убраны любые вызовы redraw_my_games / create_task; остальная логика без изменений.
+# История изменений:
+# • 2025-08-27 — канонический текст уведомления, список из slots (SSOT), убраны дубли импорта, фиксы Pylance.
+
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -936,7 +1010,7 @@ def distribution_actions_markup() -> InlineKeyboardMarkup:
 # находится в секциях [1], [1.k], [3], [4] и [5].
 
 # ════════════════════════════════════════════════════════════════════
-# [3] HANDLER: Утвердить одну игру (без автопереходов) — FIX header+admin+dedupe (+cache)
+# [3] HANDLER: Утвердить одну игру (без автопереходов) — канон-уведомление + двусторонний refresh
 # ════════════════════════════════════════════════════════════════════
 import inspect
 from contextlib import suppress
@@ -947,98 +1021,18 @@ async def poll_approve_game_handler(callback: CallbackQuery) -> None:
     """
     Утверждение одной игры. Без автопереходов:
     • перекраска кнопки «Утвердить» → «✅ Утверждено» в текущем сообщении,
-    • запись состава (включая admin, если он есть в кэше/деталях) в locked_distribution,
-    • чат-уведомление с deep-link в «🎲 Личный кабинет».
+    • запись состава (включая admin, если он есть) в locked_distribution,
+    • чат-уведомление строго каноническим текстом (название сделки в кавычках),
+    • мягкий refresh и отчёта, и деталей (если доступно).
     """
-
-    # ── локальный импорт plc, чтобы Pylance не ругался на неопределённый идентификатор
-    plc: Any = None
-    with suppress(Exception):
-        import handlers.polls_lifecycle as _plc  # type: ignore
-        plc = _plc
-
-    # ── локальный хелпер: короткая шапка для уведомления «Название. ДД.ММ ЧЧ:ММ. Пакет. N чел.»
-    def _build_header_sentence(did: int) -> str:
-        from datetime import datetime, time as _time
-
-        def _as_date_str(val: Any) -> str:
-            try:
-                if isinstance(val, datetime):
-                    return val.strftime("%d.%m.%Y")
-                s = str(val or "").strip()
-                if len(s) == 10 and s[2] in ".-":
-                    return s.replace("-", ".")
-                return s
-            except Exception:
-                return str(val)
-
-        def _as_time_str(val: Any) -> str:
-            try:
-                if isinstance(val, datetime):
-                    return val.strftime("%H:%M")
-                if isinstance(val, _time):
-                    return val.strftime("%H:%M")
-                s = str(val or "").strip()
-                # 930/0930 → 09:30
-                if s.isdigit() and len(s) in (3, 4):
-                    s = s.rjust(4, "0")
-                    return f"{s[:2]}:{s[2:]}"
-                s = s.replace(".", ":").replace("-", ":")
-                return s[:5] if len(s) >= 5 and len(s) > 2 and s[2] == ":" else s
-            except Exception:
-                return str(val)
-
-        deals = getattr(state, "current_poll_deals", []) or []
-        d = next((x for x in deals if int(x.get("id") or 0) == int(did)), None)
-        meta = (getattr(state, "deals_index", {}) or {}).get(int(did), {})  # type: ignore[index]
-
-        title = str((d or {}).get("game_name") or (d or {}).get("name") or meta.get("title") or f"Сделка #{did}").strip()
-
-        if d and d.get("event_datetime"):
-            try:
-                date_s = _as_date_str(d["event_datetime"])
-                time_dt = _as_time_str(d["event_datetime"])
-            except Exception:
-                date_s = _as_date_str(d.get("event_date") or meta.get("date"))
-                time_dt = ""
-        else:
-            date_s = _as_date_str((d or {}).get("event_date") or meta.get("date"))
-            time_dt = ""
-
-        # приоритет кастомного времени (из CF)
-        time_s = _as_time_str((d or {}).get("event_time")) or _as_time_str(meta.get("time")) or time_dt
-        cf = (d or {}).get("custom_fields") or (d or {}).get("cf") or {}
-        if isinstance(cf, dict):
-            time_s = (
-                time_s
-                or _as_time_str(cf.get("event_time"))
-                or _as_time_str(cf.get("time"))
-                or _as_time_str(cf.get("custom_time"))
-                or _as_time_str(cf.get("amocrm_event_time"))
-            )
-
-        pkg = str((d or {}).get("package") or meta.get("package") or "").strip()
-        players_raw = (d or {}).get("players") or (d or {}).get("players_count") or meta.get("players")
-        players = ""
-        try:
-            players_i = int(players_raw)
-            players = f"{players_i} чел."
-        except Exception:
-            players = str(players_raw or "").strip()
-            players = f"{players} чел." if players else ""
-
-        parts = [title, f"{date_s} {time_s}".strip(), pkg, players]
-        out = ". ".join(p for p in parts if p).strip()
-        return (out.rstrip(".") + ".")
-
-    # ── разбор callback
+    # разбор callback
     try:
         deal_id = int(str(callback.data).rsplit("_", 1)[-1])
     except Exception:
         await callback.answer("Ошибка: неизвестный формат callback.", show_alert=True)
         return
 
-    # уже утверждено → просто перекрасить кнопку и ACK
+    # идемпотентность
     if int(deal_id) in (getattr(state, "locked_distribution", {}) or {}):
         with suppress(Exception):
             kb = _mark_approved_on_message_kb(callback, int(deal_id))
@@ -1047,147 +1041,49 @@ async def poll_approve_game_handler(callback: CallbackQuery) -> None:
         await callback.answer("Уже утверждено ✅")
         return
 
-    # проверка готовности по текущему distribution_cache (учитывает требуемого админа)
-    if plc and hasattr(plc, "_is_deal_ready"):
-        is_ready = await plc._is_deal_ready(int(deal_id))  # type: ignore[attr-defined]
-        if not is_ready:
+    # готовность
+    with suppress(Exception):
+        if not await _is_deal_ready(int(deal_id)):  # type: ignore[misc]
             await callback.answer("Минимальный состав ещё не набран.", show_alert=True)
             return
 
-    # базовые роли (mains/assists) + admin, если уже есть в кэше/деталях
+    # базовые роли
     roles = await _get_current_team(int(deal_id), callback.from_user.id)
 
-    # ────────────────────────────────────────────────────────────────
-    # CACHE FIX: если основа пустая/усечённая, восстановим роли из зеркал:
-    # 1) poll_details[deal_id]['distribution'] (формат lead*/assistant*/admin = "Имя|uid")
-    # 2) distribution_cache[str(deal_id)] / distribution_cache[int(deal_id)]
-    # 3) locked_distribution[int(deal_id)] (если повторное утверждение сорвалось ранее)
-    # ────────────────────────────────────────────────────────────────
-    def _roles_from_slots(slots: Dict[str, Any]) -> Dict[str, List[int]]:
-        main: List[int] = []
-        assist: List[int] = []
-        admin: List[int] = []
-        if not isinstance(slots, dict):
-            return {"main": main, "assist": assist, "admin": admin}
-        # lead*
-        for k in sorted([k for k in slots if isinstance(k, str) and k.startswith("lead")]):
-            uid = _parse_uid(slots.get(k))
-            if uid:
-                main.append(uid)
-        # assistant*
-        for k in sorted([k for k in slots if isinstance(k, str) and k.startswith("assistant")]):
-            uid = _parse_uid(slots.get(k))
-            if uid:
-                assist.append(uid)
-        # admin (строка "Имя|uid" или числовой uid)
-        adm_uid = _parse_uid(slots.get("admin"))
-        if adm_uid:
-            admin = [adm_uid]
-        return {"main": main, "assist": assist, "admin": admin}
-
-    def _merge_if_empty(base: Dict[str, List[int]], extra: Dict[str, List[int]]) -> Dict[str, List[int]]:
-        # заполняем только те роли, которые пустые
-        out = {k: list(base.get(k, [])) for k in ("main", "assist", "admin")}
-        for k in ("main", "assist", "admin"):
-            if not out[k] and extra.get(k):
-                out[k] = list(extra[k])
-        return out
-
-    # если пустые или отсутствуют main/assist — пробуем зеркала
-    need_fill = not (roles.get("main") or roles.get("assist"))
-    if need_fill:
-        # 1) poll_details
-        with suppress(Exception):
-            pd = (getattr(state, "poll_details", {}) or {}).get(int(deal_id), {}) or {}
-            extra = _roles_from_slots(pd.get("distribution") or {})
-            roles = _merge_if_empty(roles, extra)
-
-        # 2) distribution_cache (оба типа ключей)
-        with suppress(Exception):
-            dc = (getattr(state, "distribution_cache", {}) or {})
-            raw = dc.get(str(int(deal_id))) or dc.get(int(deal_id)) or {}
-            extra = _roles_from_slots(raw if isinstance(raw, dict) else {})
-            roles = _merge_if_empty(roles, extra)
-
-        # 3) locked_distribution
-        with suppress(Exception):
-            ld = (getattr(state, "locked_distribution", {}) or {}).get(int(deal_id)) or {}
-            extra = _roles_from_slots(ld if isinstance(ld, dict) else {})
-            roles = _merge_if_empty(roles, extra)
-    # ────────────────────────────────────────────────────────────────
-    # /CACHE FIX
-    # ────────────────────────────────────────────────────────────────
-
-    # ДЕДУП 1: гарантия «1 uid → 1 роль» для main/assist уже сейчас
+    # дедуп (main > assist > admin)
     if callable(globals().get("_dedupe_roles")):
         roles = _dedupe_roles(roles)  # type: ignore[misc]
 
-    # ── ВАЖНО: протаскиваем администратора, если он выбран вручную (даже если пакет не обязует)
-    if not (roles.get("admin") and len(roles["admin"]) > 0):
-        admin_uid: Optional[int] = None
-        # 1) детали (если ранее открывали/синхронизировали)
-        with suppress(Exception):
-            pd = (getattr(state, "poll_details", {}) or {}).get(int(deal_id)) or {}
-            dist_pd = pd.get("distribution") or {}
-            if isinstance(dist_pd, dict) and isinstance(dist_pd.get("admin"), str):
-                admin_uid = _parse_uid(dist_pd.get("admin"))
-        # 2) distribution_cache
-        if not admin_uid:
-            with suppress(Exception):
-                raw = (getattr(state, "distribution_cache", {}) or {}).get(str(int(deal_id))) or {}
-                if isinstance(raw, dict) and isinstance(raw.get("admin"), str):
-                    admin_uid = _parse_uid(raw.get("admin"))  # type: ignore[arg-type]
-        if admin_uid:
-            roles["admin"] = [admin_uid]
-
-    # ДЕДУП 2 (КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ): повторно устраняем дубли,
-    # если admin совпал с кем-то из main/assist. Приоритет main > assist > admin.
-    if callable(globals().get("_dedupe_roles")):
-        roles = _dedupe_roles(roles)  # type: ignore[misc]
-
-    # роли пустые → нечего коммитить
-    if not _uids_from_roles(roles):
-        logger.warning("[approve] deal %s has empty roles after normalization", deal_id)
-        await callback.answer("Нет текущего распределения. Откройте детали и расставьте роли.", show_alert=True)
-        return
-
-    # фиксируем слоты в состоянии (locked_distribution + зеркала)
-    slots: Dict[str, Any] = {}
+    # фиксируем → slots
     try:
+        slots: Dict[str, Any] = {}
         res = _commit_locked_distribution_to_state(int(deal_id), roles)
-        if inspect.isawaitable(res):  # поддержка старой async-сигнатуры
-            res = await res  # type: ignore[assignment]
-        if isinstance(res, dict):
-            slots = res  # новая сигнатура могла вернуть слоты
-        if not slots:
-            # берём из state как «источник правды»
-            slots = ((getattr(state, "locked_distribution", {}) or {}).get(int(deal_id)) or {})  # type: ignore[assignment]
+        slots = await res if inspect.isawaitable(res) else res  # type: ignore[assignment]
     except Exception as e:
         logger.error("[approve] commit failed: %s", e)
         await callback.answer("Не удалось зафиксировать состав, попробуйте ещё раз.", show_alert=True)
         return
 
-    # перекрашиваем кнопку «Утвердить» только в этом сообщении (без перерисовки дашборда)
+    # перекраска текущего сообщения
     with suppress(Exception):
         kb = _mark_approved_on_message_kb(callback, int(deal_id))
         if kb and callback.message:
             await callback.message.edit_reply_markup(reply_markup=kb)
-
     with suppress(Exception):
         await callback.answer("Игра утверждена ✅")
 
-    # уведомление в рабочий чат (с админом, если он есть)
+    # каноническое уведомление в общий чат
     try:
         bot = callback.message.bot if callback.message else None
         if bot:
             chat_id = await _resolve_notify_chat_id(bot)
             if chat_id is not None:
-                head = _build_header_sentence(int(deal_id))
-                lines = await _team_bulleted_lines(roles, int(deal_id))  # включает «🛡️ Администратор», если он есть
+                title = _deal_title_from_state(int(deal_id))
+                lines = await _lines_from_slots(slots)  # строго из зафиксированных слотов
                 text = (
-                    f"✅ Состав команды на игру {head} утверждён.\n"
+                    f'Состав команды на игру "{title}" утвержден.\n'
                     + "\n".join(lines)
-                    + "\nПодтвердите участие в личном кабинете!"
+                    + "\nПодтвердите свое участие в личном кабинете"
                 )
                 kb2 = await _approval_announce_kb()
                 await bot.send_message(chat_id, text, reply_markup=kb2)
@@ -1196,30 +1092,29 @@ async def poll_approve_game_handler(callback: CallbackQuery) -> None:
     except Exception as e:
         logger.error("[approve] notify chat failed: %s", e)
 
-    # ────────────────────────────────────────────────────────────────
-    # МЯГКИЙ АПДЕЙТ ОТЧЁТА ЛИДЕРУ (БЕЗ «ПЫЛЕСОСА» И ПЕРЕРИСОВКИ ДАШБОРДА)
-    # ────────────────────────────────────────────────────────────────
+    # мягкий refresh: отчёт лидеру (клавиатура) + детали (если есть публичный helper)
     with suppress(Exception):
-        from aiogram import Bot  # локальный импорт для Pylance
-        bot2 = callback.message.bot if callback.message else Bot.get_current()
-
+        import handlers.polls_lifecycle as plc  # type: ignore
+        bot2 = callback.message.bot if callback.message else None
         leader_id = getattr(state, "current_poll_leader", None)
         msg_id = getattr(state, "personal_report_message_id", None)
-        if leader_id and msg_id and plc and hasattr(plc, "_build_report_keyboard"):
+        if bot2 and leader_id and msg_id and hasattr(plc, "_build_report_keyboard"):
             kb_report = plc._build_report_keyboard()  # type: ignore[attr-defined]
             await bot2.edit_message_reply_markup(chat_id=leader_id, message_id=msg_id, reply_markup=kb_report)
-            logger.debug("[approve] soft report kb update: leader=%s msg=%s", leader_id, msg_id)
+    with suppress(Exception):
+        # реактивная перерисовка detail-view без «пылесоса», если доступна
+        from handlers.poll_details import refresh_deal_details  # type: ignore
+        await refresh_deal_details(int(deal_id))
 
     logger.info("[approve] deal %s approved by %s; slots=%s", deal_id, callback.from_user.id, slots)
 
 # История изменений:
-#  • 2025-08-15 — FIX: восстановления ролей из зеркал при пустом distribution_cache (string/int keys), без изменения остальной логики.
-#  • 2025-08-12 — header+admin+dedupe улучшения.
+#  • 2025-08-27 — канон-уведомление, список из slots (SSOT), двусторонний refresh (отчёт+детали), фиксы Pylance.
 
 
 
 # ════════════════════════════════════════════════════════════════════
-# [4] HANDLER: Утвердить все готовые (батч, без автопереходов) — FIX header
+# [4] HANDLER: Утвердить все готовые (батч) — канон-уведомление и slots-списки
 # ════════════════════════════════════════════════════════════════════
 from typing import List, Tuple, Optional  # локальные типы
 
@@ -1227,85 +1122,8 @@ from typing import List, Tuple, Optional  # локальные типы
 async def poll_approve_all_ready_handler(callback: CallbackQuery) -> None:
     """
     Утверждает все игры, где набран минимальный состав.
-    Без автопереходов/редравов «Моих игр». На каждую игру — корректное чат-уведомление.
+    Без автопереходов/редравов «Моих игр». На каждую игру — каноническое чат-уведомление.
     """
-
-    # локальный хелпер вместо внешнего _deal_header_sentence
-    def _build_header_sentence(did: int) -> str:
-        from datetime import datetime, time as _time
-
-        def _as_date_str(val) -> str:
-            if not val:
-                return ""
-            try:
-                if isinstance(val, datetime):
-                    return val.strftime("%d.%m.%Y")
-                s = str(val).strip()
-                if len(s) == 10 and s[2] in ".-":
-                    return s.replace("-", ".")
-                return s
-            except Exception:
-                return str(val)
-
-        def _as_time_str(val) -> str:
-            if not val:
-                return ""
-            try:
-                if isinstance(val, datetime):
-                    return val.strftime("%H:%M")
-                if isinstance(val, _time):
-                    return val.strftime("%H:%M")
-                s = str(val).strip()
-                if s.isdigit() and len(s) in (3, 4):
-                    s = s.rjust(4, "0")
-                    return f"{s[:2]}:{s[2:]}"
-                s = s.replace(".", ":").replace("-", ":")
-                if len(s) >= 5 and s[2] == ":":
-                    return s[:5]
-                return s
-            except Exception:
-                return str(val)
-
-        d = next((x for x in (getattr(state, "current_poll_deals", None) or [])
-                  if int(x.get("id") or 0) == int(did)), None)
-        meta = (getattr(state, "deals_index", {}) or {}).get(did, {})
-
-        title = str((d or {}).get("game_name") or (d or {}).get("name") or meta.get("title") or f"Сделка #{did}").strip()
-
-        if d and d.get("event_datetime"):
-            try:
-                date_s = _as_date_str(d["event_datetime"])
-                time_dt = _as_time_str(d["event_datetime"])
-            except Exception:
-                date_s = _as_date_str(d.get("event_date") or meta.get("date"))
-                time_dt = ""
-        else:
-            date_s = _as_date_str((d or {}).get("event_date") or meta.get("date"))
-            time_dt = ""
-
-        time_s = (
-            _as_time_str((d or {}).get("event_time"))
-            or _as_time_str(meta.get("time"))
-            or time_dt
-        )
-
-        cf = (d or {}).get("custom_fields") or (d or {}).get("cf") or {}
-        if isinstance(cf, dict):
-            time_s = (
-                time_s
-                or _as_time_str(cf.get("event_time"))
-                or _as_time_str(cf.get("time"))
-                or _as_time_str(cf.get("custom_time"))
-                or _as_time_str(cf.get("amocrm_event_time"))
-            )
-
-        pkg = str((d or {}).get("package") or meta.get("package") or "").strip()
-        players = str((d or {}).get("players") or (d or {}).get("players_count") or meta.get("players") or "").strip()
-
-        parts = [title, f"{date_s} {time_s}".strip(), pkg, (f"{players} чел." if players else "")]
-        out = ". ".join(p for p in parts if p).strip()
-        return (out.rstrip(".") + ".")
-
     try:
         await callback.answer("Обрабатываю…")
     except Exception:
@@ -1319,7 +1137,7 @@ async def poll_approve_all_ready_handler(callback: CallbackQuery) -> None:
     if bot:
         chat_id = await _resolve_notify_chat_id(bot)
 
-    for deal in list(state.current_poll_deals or []):
+    for deal in list(getattr(state, "current_poll_deals", []) or []):
         did = int(deal.get("id") or 0)
         if not did:
             continue
@@ -1336,18 +1154,18 @@ async def poll_approve_all_ready_handler(callback: CallbackQuery) -> None:
                 skipped.append((did, "no_roles"))
                 continue
 
-            await _commit_locked_distribution_to_state(did, roles)
+            slots = await _commit_locked_distribution_to_state(did, roles)
             approved.append(did)
 
-            # чат-уведомление (с локальным заголовком)
+            # каноническое чат-уведомление (строго из slots)
             if bot and chat_id is not None:
                 try:
-                    head = _build_header_sentence(did)
-                    lines = await _team_bulleted_lines(roles, did)
+                    title = _deal_title_from_state(did)
+                    lines = await _lines_from_slots(slots)
                     text = (
-                        f"✅ Состав команды на игру {head} утверждён.\n"
+                        f'Состав команды на игру "{title}" утвержден.\n'
                         + "\n".join(lines)
-                        + "\nПодтвердите участие в личном кабинете."
+                        + "\nПодтвердите свое участие в личном кабинете"
                     )
                     kb2 = await _approval_announce_kb()
                     await bot.send_message(chat_id, text, reply_markup=kb2)
@@ -1366,24 +1184,18 @@ async def poll_approve_all_ready_handler(callback: CallbackQuery) -> None:
     except Exception:
         pass
 
-    # ── МЯГКОЕ ОБНОВЛЕНИЕ ДАШБОРДА ОТЧЁТА ЛИДЕРУ (без «пылесоса» и без пересоздания сообщения)
-    try:
+    # мягкое обновление дашборда отчёта лидеру
+    with suppress(Exception):
+        import handlers.polls_lifecycle as plc  # lazy импорт
         bot2 = callback.message.bot if callback.message else None
         leader_id = getattr(state, "current_poll_leader", None)
         msg_id = getattr(state, "personal_report_message_id", None)
-        if bot2 and leader_id and msg_id:
-            import handlers.polls_lifecycle as plc  # lazy импорт, чтобы не плодить зависимости
-            kb_report = plc._build_report_keyboard()
-            await bot2.edit_message_reply_markup(
-                chat_id=leader_id,
-                message_id=msg_id,
-                reply_markup=kb_report
-            )
-    except Exception as e:
-        logger.debug("[approve_all] soft report kb update failed: %s", e)
+        if bot2 and leader_id and msg_id and hasattr(plc, "_build_report_keyboard"):
+            kb_report = plc._build_report_keyboard()  # type: ignore[attr-defined]
+            await bot2.edit_message_reply_markup(chat_id=leader_id, message_id=msg_id, reply_markup=kb_report)
 
-    # (!) НИКАКИХ полных редравов/«пылесоса» здесь больше не вызываем.
-    # await _try_sync_report()  # заменено на мягкое обновление выше
+# История изменений:
+# • 2025-08-27 — канон-уведомление, список из slots (SSOT), фиксы Pylance.
 
 
 # ════════════════════════════════════════════════════════════════════
