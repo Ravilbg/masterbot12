@@ -1872,6 +1872,140 @@ async def poll_swap_handler(callback: types.CallbackQuery) -> None:
 #                 блокирует перенос без замены прежней роли; совместим с aiogram 3.x; фиксы Pylance.
 
 
+# ███ [2.7] NAVIGATION: «Назад к списку» — vacuum как в дашборде + очистка реестров
+# --------------------------------------------------------------------
+
+import contextlib
+import logging
+from typing import Any, Dict, List, Tuple
+
+from aiogram import types, Bot
+from aiogram.exceptions import TelegramBadRequest
+
+from core.state import state
+from core.utils import vacuum_private  # SSOT
+
+logger = logging.getLogger(__name__)
+
+def _reg_key(uid: int, deal_id: int) -> Tuple[int, int]:
+    return (int(uid), int(deal_id))
+
+def _collect_keep_ids(uid: int) -> List[int]:
+    """Собираем те же keep-id, что при входе в дашборд: главное меню + «Мои игры»."""
+    keep: List[int] = []
+
+    # главное меню
+    try:
+        from core.menu import get_menu_message_id  # lazy import
+    except Exception:  # pragma: no cover
+        get_menu_message_id = lambda _uid: None  # type: ignore[assignment]
+    with contextlib.suppress(Exception):
+        mid = get_menu_message_id(uid)
+        if isinstance(mid, int):
+            keep.append(mid)
+
+    # «Мои игры» (если проект хранит их id в state.games_by_user)
+    try:
+        games_bucket: Any = getattr(state, "games_by_user", {})
+        if isinstance(games_bucket, dict) and uid in games_bucket:
+            val = games_bucket.get(uid)
+            if isinstance(val, list):
+                for m in val:
+                    with contextlib.suppress(Exception):
+                        keep.append(int(m))
+            elif isinstance(val, int):
+                keep.append(int(val))
+    except Exception:
+        pass
+
+    return keep
+
+async def _vacuum_details_like_dashboard(uid: int) -> None:
+    """
+    Делает РОВНО тот же пылесос, что и при переходе в дашборд:
+    • сохраняем главное меню и «Мои игры» (keep);
+    • убираем все прочие сообщения (включая «улетевшие» детали).
+    Плюс чистим наши реестры detail_blocks/detail_index для uid.
+    """
+    bot = Bot.get_current()
+
+    # собрать и удалить все detail-сообщения (чтобы не остались висеть)
+    to_delete: List[int] = []
+    try:
+        db: Dict[Tuple[int, int], List[int]] = getattr(state, "detail_blocks", {}) or {}
+        keys_to_pop: List[Tuple[int, int]] = []
+        for (k_uid, _deal), mids in list(db.items()):
+            if int(k_uid) != int(uid):
+                continue
+            keys_to_pop.append((k_uid, _deal))
+            if isinstance(mids, list):
+                for m in mids:
+                    with contextlib.suppress(Exception):
+                        to_delete.append(int(m))
+            elif isinstance(mids, int):
+                to_delete.append(int(m))
+        for mid in to_delete:
+            with contextlib.suppress(TelegramBadRequest, Exception):
+                await bot.delete_message(chat_id=uid, message_id=mid)
+        for k in keys_to_pop:
+            getattr(state, "detail_blocks", {}).pop(k, None)
+        # чистим индексы деталей
+        try:
+            idx: Dict[Tuple[int, int], Dict[str, int]] = getattr(state, "detail_index", {}) or {}
+            for (k_uid, _deal) in list(idx.keys()):
+                if int(k_uid) == int(uid):
+                    idx.pop((k_uid, _deal), None)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # удалить их ещё и из last_user_messages, чтобы фоновые пылесосы не держали «хвосты»
+    try:
+        lst = getattr(state, "last_user_messages", None)
+        if isinstance(lst, dict):
+            cur = lst.get(int(uid))
+            if isinstance(cur, list) and cur:
+                to_delete_set = set(to_delete)
+                filtered: List[Any] = []
+                for item in cur:
+                    mid = getattr(item, "message_id", None)
+                    if not isinstance(mid, int):
+                        with contextlib.suppress(Exception):
+                            mid = int(item)
+                    if isinstance(mid, int) and mid in to_delete_set:
+                        continue
+                    filtered.append(item)
+                lst[int(uid)] = filtered
+    except Exception:
+        pass
+
+    # и, наконец, — тот самый «дашбордный» пылесос SSOT
+    keep = _collect_keep_ids(uid)
+    with contextlib.suppress(Exception):
+        await vacuum_private(uid, keep=keep, ignore_sticky=True)  # ← как в дашборде
+        logger.debug("[details:back] dashboard-like vacuum keep=%s uid=%s", keep, uid)
+
+# поддерживаем твой текущий callback-ключ «Назад»
+@router.callback_query(lambda c: (c.data or "") == POLL_BACK)  # type: ignore[name-defined]
+async def _on_back_to_list(callback: types.CallbackQuery) -> None:
+    uid = callback.from_user.id
+    with contextlib.suppress(Exception):
+        await callback.answer()
+
+    # 1) запускаем ровно тот же пылесос, что при входе в дашборд
+    await _vacuum_details_like_dashboard(uid)
+
+    # 2) показываем единый отчёт (он отредактируется «на месте», без дублей)
+    try:
+        from handlers.polls_lifecycle import _send_leader_report  # lazy import
+        await _send_leader_report(uid)
+    except Exception:
+        logger.debug("[details:back] report not available for uid=%s", uid)
+
+# История изменений [2.7]:
+# • 2025-08-28 — «Назад» вызывает тот же SSOT-вакуум, что и кнопки дашборда; дополнительно чистим detail_* реестры.
+
 
 
 # ███ [3.a] HANDLER: «Утвердить» (LEGACY GUARD — делегирование в polls_distribution)
