@@ -142,7 +142,7 @@ def _deal_title_from_state(deal_id: int) -> str:
 
 def _mark_confirmed_on_message_kb(callback: CallbackQuery, deal_id: int, role: str) -> InlineKeyboardMarkup | None:
     """
-    ТИХАЯ замена кнопки «Подтвердить» → «Замена» в текущем сообщении.
+    ТИХАЯ замена кнопки «Подтвердить» → «🔁 Замена» в текущем сообщении.
     Поддерживает два формата исходных кнопок:
       • confirm_role_{deal_id}_{role}
       • mygames_confirm_{deal_id}
@@ -163,7 +163,7 @@ def _mark_confirmed_on_message_kb(callback: CallbackQuery, deal_id: int, role: s
             for btn in row:
                 cd = (getattr(btn, "callback_data", "") or "")
                 if cd == target_cd_role or cd == target_cd_mg or (cd.startswith("confirm_") and str(deal_id) in cd):
-                    new_row.append(InlineKeyboardButton(text="Замена", callback_data=replace_cd))
+                    new_row.append(InlineKeyboardButton(text="🔁 Замена", callback_data=replace_cd))
                 else:
                     new_row.append(btn)
             new_rows.append(new_row)
@@ -450,8 +450,38 @@ def _is_bron(sid: Optional[str], name_lower: str) -> bool:
     return name_lower == "бронь"
 
 
-# ════════════════════════════════════════════════════════════════════
-# ███ [4] CALLBACK: CONFIRM ROLE — идемпотентность + единый источник правды
+# ███ [4.0] CALLBACK: CONFIRM ROLE — универсальный вход из деталей и других мест
+# --------------------------------------------------------------------
+@router.callback_query(lambda c: c.data and c.data.startswith(CONFIRM_PREFIX))
+async def confirm_role_handler(callback: CallbackQuery) -> None:
+    """
+    Поддерживает оба формата:
+      • confirm_role_{deal_id}_{role}
+      • confirm_role_{deal_id}
+    Во втором случае роль определяется по зафиксированному составу.
+    """
+    data = str(callback.data or "")
+    tail = data[len(CONFIRM_PREFIX):]
+
+    parts = tail.split("_")
+    try:
+        deal_id = int(parts[0])
+    except Exception:
+        await _safe_answer(callback, "⚠️ Ошибочные данные кнопки.", show_alert=True)
+        return
+
+    role = parts[1] if len(parts) > 1 and parts[1] else None
+    if role is None:
+        uid = int(callback.from_user.id)
+        role = await _role_of_user_in_locked(uid, deal_id)
+
+    if role not in {"main", "assist", "admin", "trainee"}:
+        await _safe_answer(callback, "⛔ Роль не найдена или не назначена на вас.", show_alert=True)
+        return
+
+    await _perform_confirm(callback, deal_id, role)
+
+# ███ [4.1] CORE HELPERS — идемпотентность + единый источник правды
 # --------------------------------------------------------------------
 async def _role_of_user_in_locked(uid: int, deal_id: int) -> Optional[str]:
     """main/assist/admin/trainee/None — по зафиксированному составу (поддержка слотов без «|uid»)."""
@@ -474,8 +504,8 @@ async def _maybe_move_to_success(deal_id: int) -> None:
     Переводит сделку в «Завершение сделки» ТОЛЬКО если:
       • все требуемые роли подтвердили участие (CRM→LOCAL);
       • текущий статус сделки — «Бронь».
-    Для «Предварительной заявки» и любого другого статуса — НЕ переводим.
-    Всегда отправляем групповое уведомление «вся команда подтвердила...» отдельно.
+    Для «Предварительной заявки» и любого другого статуса — статус НЕ меняем.
+    Уведомление «вся команда подтвердила» всегда отправляет handlers.my_games.announce_if_all_confirmed.
     """
     try:
         moved_set: Set[int] = state.__dict__.setdefault("_moved_success", set())  # type: ignore[assignment]
@@ -507,24 +537,19 @@ async def _maybe_move_to_success(deal_id: int) -> None:
             all_ok = ok
 
         if not all_ok:
-            missing = (expected_required - crm_tags) if crm_tags else expected_required
-            logger.debug("[confirm] deal %s tags missing: %s", deal_id, ", ".join(sorted(missing)))
             return
 
+        # дольём недостающие теги в CRM, если подтверждали только локально
         if not crm_tags:
             to_add = expected_required - crm_tags
             for tag in sorted(to_add):
                 with contextlib.suppress(Exception):
                     await _amo_add_tag(deal_id, tag)
 
+        # текущее состояние статуса
         sid, name = await _read_status_info(deal_id)
-        if _is_prelim(sid, name):
-            can_move = False
-        elif _is_bron(sid, name):
-            can_move = True
-        else:
-            can_move = False
 
+        # ЕДИНЫЙ анонс — всегда через my_games (без дублей здесь)
         try:
             from handlers.my_games import announce_if_all_confirmed  # type: ignore
         except Exception:
@@ -533,30 +558,33 @@ async def _maybe_move_to_success(deal_id: int) -> None:
             if callable(announce_if_all_confirmed):
                 await announce_if_all_confirmed(int(deal_id))
 
-        if not can_move or not SUCCESSFUL_STATUS_ID:
-            if not SUCCESSFUL_STATUS_ID:
-                logger.warning("[confirm] SUCCESS status id not configured; lead=%s", deal_id)
+        # На «Предварительной заявке» статус НЕ меняем
+        if _is_prelim(sid, name):
             return
 
-        with contextlib.suppress(Exception):
-            await update_deal_status(int(deal_id), str(SUCCESSFUL_STATUS_ID))
-            try:
-                for d in (getattr(state, "current_poll_deals", []) or []):
-                    if int(d.get("id") or 0) == int(deal_id):
-                        d["status_id"] = int(SUCCESSFUL_STATUS_ID)
-                        d["status_name"] = "Завершение сделки"
-            except Exception:
-                pass
-            try:
-                for _uid, arr in (getattr(state, "games_by_user", {}) or {}).items():
-                    for d in (arr or []):
+        # «Бронь» → «Завершение сделки»
+        if _is_bron(sid, name) and SUCCESSFUL_STATUS_ID:
+            with contextlib.suppress(Exception):
+                await update_deal_status(int(deal_id), str(SUCCESSFUL_STATUS_ID))
+                try:
+                    for d in (getattr(state, "current_poll_deals", []) or []):
                         if int(d.get("id") or 0) == int(deal_id):
                             d["status_id"] = int(SUCCESSFUL_STATUS_ID)
                             d["status_name"] = "Завершение сделки"
-            except Exception:
-                pass
-            logger.info("[confirm] deal %d moved to SUCCESS (%s)", deal_id, SUCCESSFUL_STATUS_ID)
-            moved_set.add(int(deal_id))
+                except Exception:
+                    pass
+                try:
+                    for _uid, arr in (getattr(state, "games_by_user", {}) or {}).items():
+                        for d in (arr or []):
+                            if int(d.get("id") or 0) == int(deal_id):
+                                d["status_id"] = int(SUCCESSFUL_STATUS_ID)
+                                d["status_name"] = "Завершение сделки"
+                except Exception:
+                    pass
+                logger.info("[confirm] deal %d moved to SUCCESS (%s)", deal_id, SUCCESSFUL_STATUS_ID)
+                moved_set.add(int(deal_id))
+        elif _is_bron(sid, name) and not SUCCESSFUL_STATUS_ID:
+            logger.warning("[confirm] SUCCESS status id not configured; lead=%s", deal_id)
 
     except Exception as e:
         logger.warning("[confirm] _maybe_move_to_success failed: %s", e)
@@ -616,7 +644,7 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
             try:
                 from handlers.my_games import mygames_after_confirm_ui_patch as _mg_after  # type: ignore
                 if callable(_mg_after):
-                    await _mg_after(uid, deal_id, role, message=getattr(callback, "message", None))
+                    await _mg_after(uid, deal_id, role, msg=getattr(callback, "message", None))
                     applied_ui = True
             except Exception:
                 pass
@@ -629,6 +657,7 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
             if kb:
                 await callback.message.edit_reply_markup(reply_markup=kb)
 
+    # уведомление в общий чат
     try:
         bot = callback.message.bot if callback.message else None
         if bot:
@@ -663,39 +692,8 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
         await _safe_answer(callback, "Готово ✅")
 
 
-# История изменений [4]:
-# 2025-08-18 — добавлен _maybe_move_to_success; resolve_notify_chat_id — sync (SSOT).
-# 2025-08-19 — при проставлении тега берём подпись из locked_distribution (строго «Имя Ф.Суф»).
-# 2025-08-19 — _maybe_move_to_success: переводить только из «Бронь»; антидубли перевода.
-# 2025-08-24 — предотвращён автопереход в детали при подтверждении из «Мои игры».
 
-
-# ███ [4.0] CALLBACK: CONFIRM BUTTON «confirm_role_{deal}_{role}»
-@router.callback_query(lambda c: c.data and c.data.startswith(CONFIRM_PREFIX))
-async def confirm_role_handler(callback: CallbackQuery) -> None:
-    """
-    Коллбэк из карточек/деталей: confirm_role_{deal_id}_{role}
-    • Не делаем навигаций — только локальная перекраска кнопки и пайплайн подтверждения.
-    """
-    data = str(callback.data or "")
-    try:
-        parts = data.split("_")
-        deal_part = parts[-2]
-        role = parts[-1]
-        deal_id = int(deal_part)
-    except Exception:
-        await _safe_answer(callback, "⚠️ Ошибочная кнопка.", show_alert=True)
-        return
-
-    role = _role_alias(role)
-    if role not in {"main", "assist", "admin", "trainee"}:
-        await _safe_answer(callback, "⚠️ Роль не распознана.", show_alert=True)
-        return
-
-    await _perform_confirm(callback, deal_id, role)  # стажёр поддерживается (ставим тег «.Стаж»)
-
-
-# ███ [4.1] CALLBACK: CONFIRM FROM «Мои игры»
+# ███ [4.2] CALLBACK: CONFIRM FROM «Мои игры»
 # --------------------------------------------------------------------
 @router.callback_query(lambda c: c.data and c.data.startswith("mygames_confirm_"))
 async def confirm_from_mygames_handler(callback: CallbackQuery) -> None:
@@ -739,6 +737,7 @@ async def confirm_from_mygames_handler(callback: CallbackQuery) -> None:
         pass
 
     await _perform_confirm(callback, deal_id, role)
+
 
 
 # ███ [99] SELF-TEST (минимальный)
