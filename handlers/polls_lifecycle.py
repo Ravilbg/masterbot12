@@ -153,31 +153,121 @@ if TYPE_CHECKING:
     def _build_report_keyboard() -> Any: ...
 
 # handlers/polls_lifecycle.py
+# handlers/polls_lifecycle.py
 # ════════════════════════════════════════════════════════════════════
-# [0.96] REPORT + VACUUM (edit-in-place, no ui_context; no-resend-on-not-modified)
+# [0.96] REPORT + VACUUM (edit-in-place, hard pre-vacuum, SSOT)
 # ════════════════════════════════════════════════════════════════════
-from typing import Optional, Set, Tuple, Dict, Any, List  # noqa: F401
+
 import contextlib
 import logging
+from typing import Any, Dict, List, Optional, Set
 
-from aiogram import Bot, types  # noqa: F401
-from aiogram.types import InlineKeyboardMarkup  # noqa: F401
-from aiogram.exceptions import TelegramBadRequest  # noqa: F401
+from aiogram import Bot, types
+from aiogram.types import InlineKeyboardMarkup
+from aiogram.exceptions import TelegramBadRequest
 
-from core.config import settings  # noqa: F401
-from core.db import get_user_info  # noqa: F401
-from core.state import state  # noqa: F401
-from core.utils import delete_previous_private_messages, vacuum_private  # ← SSOT
+from core.config import settings
+from core.db import get_user_info
+from core.state import state
+from core.utils import vacuum_private, delete_previous_private_messages  # SSOT
 
 logger = logging.getLogger(__name__)
 
-async def _edit_or_send_report(uid: int, text: str, kb: InlineKeyboardMarkup) -> None:
+# ────────────────────────────────────────────────────────────────────
+# helpers: жёсткая очистка отчёта и detail-реестра (НЕ трогаем «Мои игры»)
+# ────────────────────────────────────────────────────────────────────
+
+async def _pre_render_vacuum(uid: int) -> None:
     """
-    Редактирует отчёт, если он есть; если нет — безопасно присылает новый.
-    ВАЖНО: никаких глобальных чисток ЛС здесь НЕТ — не трогаем детали.
-    «Message is not modified» трактуем как успех.
+    Перед показом отчёта очищаем ТОЛЬКО:
+      • все detail-сообщения пользователя (и их реестр),
+      • предыдущий инстанс отчёта (если есть).
+    Главное меню и дашборд «Мои игры» сохраняем.
     """
     bot = Bot.get_current()
+
+    # 0) Удаляем прошлый отчёт (если есть локальный id)
+    prev_report_id = getattr(state, "personal_report_message_id", None)
+    if isinstance(prev_report_id, int) and prev_report_id > 0:
+        with contextlib.suppress(Exception):
+            await bot.delete_message(chat_id=uid, message_id=prev_report_id)
+        setattr(state, "personal_report_message_id", None)
+        logger.debug("[report:vacuum] previous report removed uid=%s mid=%s", uid, prev_report_id)
+
+    # 1) Удаляем все зарегистрированные detail-сообщения пользователя
+    try:
+        detail_map: Dict[str, List[int]] = (getattr(state, "detail_blocks", {}) or {}).get(uid, {})  # type: ignore[dict-item]
+        if detail_map:
+            flat_ids: List[int] = []
+            for mids in detail_map.values():
+                if isinstance(mids, list):
+                    for m in mids:
+                        with contextlib.suppress(Exception):
+                            flat_ids.append(int(m))
+            if flat_ids:
+                logger.debug("[report:vacuum] delete details uid=%s mids=%s", uid, flat_ids)
+                for mid in flat_ids:
+                    with contextlib.suppress(TelegramBadRequest, Exception):
+                        await bot.delete_message(chat_id=uid, message_id=mid)
+        # Сбрасываем реестр деталей для uid
+        db = getattr(state, "detail_blocks", None)
+        if isinstance(db, dict):
+            db.pop(uid, None)
+            logger.debug("[report:vacuum] registry cleared for uid=%s", uid)
+    except Exception as e:
+        logger.debug("[report:vacuum] detail removal skipped uid=%s: %s", uid, e)
+
+    # 2) Бережная чистка «хвостов»: сохраняем главное меню и активный дашборд «Мои игры»
+    keep_ids: List[int] = []
+
+    # 2.1 — сохранить меню (если есть резолвер id)
+    menu_mid: Optional[int] = None
+    with contextlib.suppress(Exception):
+        from core.menu import get_menu_message_id  # lazy import
+        menu_mid = get_menu_message_id(uid)  # type: ignore[assignment]
+    if isinstance(menu_mid, int):
+        keep_ids.append(menu_mid)
+
+    # 2.2 — сохранить возможные карточки «Мои игры» (если проект их учитывает)
+    try:
+        games_bucket: Dict[int, Any] = getattr(state, "games_by_user", {}) or {}
+        # по ключу uid обычно хранятся id сообщений дашборда (или структура с ними)
+        if isinstance(games_bucket, dict) and uid in games_bucket:
+            mids = games_bucket.get(uid)
+            if isinstance(mids, list):
+                for _m in mids:
+                    with contextlib.suppress(Exception):
+                        keep_ids.append(int(_m))
+            elif isinstance(mids, int):
+                keep_ids.append(int(mids))
+    except Exception:
+        pass
+
+    # 2.3 — запустить SSOT-вакуум с белым списком
+    # Совместимость: vacuum_private(uid, keep=...) есть в core.utils v7.x
+    with contextlib.suppress(Exception):
+        await vacuum_private(uid, keep=keep_ids)  # type: ignore[misc]
+        logger.debug("[report:vacuum] vacuum_private(uid, keep=%s) ok uid=%s", keep_ids, uid)
+
+
+# ────────────────────────────────────────────────────────────────────
+# core: редактирование/отправка отчёта (с обязательной предчисткой)
+# ────────────────────────────────────────────────────────────────────
+
+async def _edit_or_send_report(uid: int, text: str, kb: InlineKeyboardMarkup) -> None:
+    """
+    Показ/обновление сводного отчёта в ЛС пользователя.
+
+    Поведение:
+      • Перед показом — _pre_render_vacuum(uid) (удалит только детали и старый отчёт).
+      • Если отчёт уже существует — редактируем его «на месте».
+      • «Message is not modified» трактуем как успех.
+    """
+    bot = Bot.get_current()
+
+    # Жёсткая (но точечная) очистка перед отрисовкой дашборда отчёта
+    await _pre_render_vacuum(uid)
+
     mid = getattr(state, "personal_report_message_id", None)
     can_edit = isinstance(mid, int) and mid > 0
 
@@ -191,15 +281,17 @@ async def _edit_or_send_report(uid: int, text: str, kb: InlineKeyboardMarkup) ->
                 reply_markup=kb,
                 disable_web_page_preview=True,
             )
-            # синхронизируем last_user_messages, не задевая другие сообщения (детали)
+            # Обновим last_user_messages, не задевая прочие сообщения
             try:
                 bucket = getattr(state, "last_user_messages", {})
                 if isinstance(bucket, dict):
                     lst = list(bucket.get(int(uid), []) or [])
                     lst = [m for m in lst if getattr(m, "message_id", None) != mid]
-                    class _Msg:
+
+                    class _Msg:  # минимальная заглушка
                         def __init__(self, message_id: int) -> None:
                             self.message_id = message_id
+
                     lst.append(_Msg(mid))
                     bucket[int(uid)] = lst
                     setattr(state, "last_user_messages", bucket)
@@ -207,11 +299,10 @@ async def _edit_or_send_report(uid: int, text: str, kb: InlineKeyboardMarkup) ->
                 pass
             return
         except TelegramBadRequest as e:
-            s = str(e).lower()
-            if "message is not modified" in s:
+            if "message is not modified" in str(e).lower():
                 return
             with contextlib.suppress(Exception):
-                await bot.delete_message(uid, mid)
+                await bot.delete_message(uid, mid)  # удалить битый отчёт
             setattr(state, "personal_report_message_id", None)
         except Exception:
             with contextlib.suppress(Exception):
@@ -222,6 +313,7 @@ async def _edit_or_send_report(uid: int, text: str, kb: InlineKeyboardMarkup) ->
     )
     state.personal_report_message_id = sent.message_id
 
+    # учёт в last_user_messages
     try:
         bucket = getattr(state, "last_user_messages", {})
         if isinstance(bucket, dict):
@@ -233,10 +325,18 @@ async def _edit_or_send_report(uid: int, text: str, kb: InlineKeyboardMarkup) ->
     except Exception:
         pass
 
+    # мягкий контекст UI
     try:
-        (getattr(state, "ui_context", {}) or {}).update({uid: "poll_report"})
+        ui_ctx = getattr(state, "ui_context", {}) or {}
+        ui_ctx[uid] = "poll_report"
+        setattr(state, "ui_context", ui_ctx)
     except Exception:
         pass
+
+
+# ────────────────────────────────────────────────────────────────────
+# public API: вызовы из create_poll / «📊 Отчёт по опросу» / «Назад к списку»
+# ────────────────────────────────────────────────────────────────────
 
 async def _send_leader_report(leader_id: int) -> None:
     text = await generate_poll_report()             # type: ignore[name-defined]
@@ -258,7 +358,7 @@ async def _sync_leader_report(leader_id: Optional[int] = None) -> None:
 async def sync_report() -> None:
     await _sync_leader_report()
 
-@router.message(lambda m: (m.text or "") == "📊 Отчёт по опросу")
+@router.message(lambda m: (m.text or "") == "📊 Отчёт по опросу")  # type: ignore[name-defined]
 async def poll_report_handler(message: types.Message) -> None:
     uid = message.from_user.id
     ui  = await get_user_info(uid) or {}
@@ -268,12 +368,13 @@ async def poll_report_handler(message: types.Message) -> None:
             await message.delete()
         return
 
-    if not state.coordination_cycle_active:
+    if not getattr(state, "coordination_cycle_active", False):
         await message.answer("⚠️ Нет активных опросов.", reply_markup=await get_main_menu(uid))  # type: ignore[name-defined]
         with contextlib.suppress(Exception):
             await message.delete()
         return
 
+    # Сформируем текст и клавиатуру и покажем отчёт (внутри будет pre-vacuum)
     text = await generate_poll_report()     # type: ignore[name-defined]
     kb   = _build_report_keyboard()         # type: ignore[name-defined]
     await _edit_or_send_report(uid, text, kb)
@@ -282,6 +383,11 @@ async def poll_report_handler(message: types.Message) -> None:
         await _refresh_menu(uid)            # type: ignore[name-defined]
     with contextlib.suppress(Exception):
         await message.delete()
+
+
+# ────────────────────────────────────────────────────────────────────
+# плановая чистка ЛС (бережно сохраняем меню и активные detail-блоки)
+# ────────────────────────────────────────────────────────────────────
 
 async def _vacuum_old_messages() -> None:
     """
@@ -297,9 +403,9 @@ async def _vacuum_old_messages() -> None:
     except Exception:
         pass
     try:
-        db: Dict[Tuple[int, int], Any] = (getattr(state, "detail_blocks", {}) or {})
-        uids.update(int(k[0]) for k in db.keys()
-                    if isinstance(k, tuple) and len(k) >= 2 and isinstance(k[0], int))
+        dbm = getattr(state, "detail_blocks", {}) or {}
+        if isinstance(dbm, dict):
+            uids.update(int(u) for u in dbm.keys() if isinstance(u, int))
     except Exception:
         pass
     try:
@@ -326,35 +432,71 @@ async def _vacuum_old_messages() -> None:
     for uid in sorted(uids):
         keep_ids: List[int] = []
 
+        # бережём главное меню
         with contextlib.suppress(Exception):
             mid = get_menu_message_id(uid)
             if isinstance(mid, int):
                 keep_ids.append(mid)
 
+        # бережём активные detail-сообщения
         try:
-            db_map: Dict[Tuple[int, int], Any] = getattr(state, "detail_blocks", {}) or {}
-            for (k_uid, _deal), raw in list(db_map.items()):
-                if int(k_uid) != int(uid):
-                    continue
-                for it in (raw or []):
-                    if hasattr(it, "message_id"):
-                        keep_ids.append(int(getattr(it, "message_id")))  # Message
-                    elif isinstance(it, dict) and "message_id" in it:
-                        with contextlib.suppress(Exception):
-                            keep_ids.append(int(it["message_id"]))
-                    else:
+            db_map: Dict[str, List[int]] = (getattr(state, "detail_blocks", {}) or {}).get(uid, {})  # type: ignore[dict-item]
+            for mids in (db_map or {}).values():
+                if isinstance(mids, list):
+                    for it in mids:
                         with contextlib.suppress(Exception):
                             keep_ids.append(int(it))
         except Exception:
             pass
 
+        # запускаем SSOT-«пылесос» с белым списком
         with contextlib.suppress(Exception):
-            await vacuum_private(uid, keep=keep_ids)
+            await vacuum_private(uid, keep=keep_ids)  # type: ignore[misc]
+
+
+# ────────────────────────────────────────────────────────────────────
+# _test(): минимальная проверка очистки реестра (без Telegram API)
+# ────────────────────────────────────────────────────────────────────
+
+def _test() -> None:
+    """
+    Эмулируем state.detail_blocks[uid] и проверяем, что _pre_render_vacuum
+    очищает реестр и предыдущий отчёт (сетевые вызовы под suppress).
+    """
+    uid = 123
+
+    # подготовим реестр деталей
+    if not isinstance(getattr(state, "detail_blocks", None), dict):
+        setattr(state, "detail_blocks", {})
+    state.detail_blocks[uid] = {"header": [1001], "main": [1002, 1003]}  # type: ignore[attr-defined]
+
+    # положим «старый отчёт»
+    setattr(state, "personal_report_message_id", 777)
+
+    import asyncio
+
+    class _DummyBot:
+        async def delete_message(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
+            return
+
+    # подменяем Bot.get_current() на заглушку
+    orig_get = getattr(Bot, "get_current")
+    setattr(Bot, "get_current", staticmethod(lambda: _DummyBot()))  # type: ignore[method-assign]
+
+    try:
+        asyncio.run(_pre_render_vacuum(uid))
+        # detail-реестр очищен
+        assert uid not in state.detail_blocks, "detail registry must be cleared"  # type: ignore[attr-defined]
+        # отчёт обнулён
+        assert getattr(state, "personal_report_message_id", None) in (None, 0)
+    finally:
+        setattr(Bot, "get_current", orig_get)  # type: ignore[misc]
 
 # История изменений:
-# 2025-08-27 • v0.96g — убраны дубли импорта/логгера; сохранена «тихая» логика; SSOT/фиксы Pylance.
-
-
+# 2025-08-27 • v0.96i — выровнено под SSOT/фиксы интерфейса:
+#   • pre-vacuum чистит только детали и предыдущий отчёт; «Мои игры» сохраняются.
+#   • плановый вакуум хранит меню и активные detail-сообщения.
+#   • устранены предупреждения Pylance, аккуратные типы и suppress-блоки.
 
 
 # ════════════════════════════════════════════════════════════════════

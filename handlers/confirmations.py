@@ -141,20 +141,29 @@ def _deal_title_from_state(deal_id: int) -> str:
 
 
 def _mark_confirmed_on_message_kb(callback: CallbackQuery, deal_id: int, role: str) -> InlineKeyboardMarkup | None:
-    """Локально меняем кнопку «Подтвердить» на «✅ Подтверждено» в текущем сообщении."""
+    """
+    ТИХАЯ замена кнопки «Подтвердить» → «Замена» в текущем сообщении.
+    Поддерживает два формата исходных кнопок:
+      • confirm_role_{deal_id}_{role}
+      • mygames_confirm_{deal_id}
+    Новый callback: replace_{deal_id}_{role}
+    """
     try:
         msg = getattr(callback, "message", None)
         kb = getattr(msg, "reply_markup", None)
         if not isinstance(kb, InlineKeyboardMarkup):
             return None
         new_rows: List[List[InlineKeyboardButton]] = []
-        target_cd = f"{CONFIRM_PREFIX}{deal_id}_{role}"
+        target_cd_role = f"{CONFIRM_PREFIX}{deal_id}_{role}"
+        target_cd_mg   = f"mygames_confirm_{deal_id}"
+        replace_cd     = f"replace_{deal_id}_{role}"
+
         for row in (kb.inline_keyboard or []):
             new_row: List[InlineKeyboardButton] = []
             for btn in row:
                 cd = (getattr(btn, "callback_data", "") or "")
-                if cd == target_cd:
-                    new_row.append(InlineKeyboardButton(text="✅ Подтверждено", callback_data="noop"))
+                if cd == target_cd_role or cd == target_cd_mg or (cd.startswith("confirm_") and str(deal_id) in cd):
+                    new_row.append(InlineKeyboardButton(text="Замена", callback_data=replace_cd))
                 else:
                     new_row.append(btn)
             new_rows.append(new_row)
@@ -162,6 +171,7 @@ def _mark_confirmed_on_message_kb(callback: CallbackQuery, deal_id: int, role: s
     except Exception:
         logger.exception("[confirm] failed to rebuild keyboard")
     return None
+
 
 # [1.5] SLOT MEMBERSHIP & SLOT KEY HELPERS — поддержка слотов БЕЗ «|uid»
 NBSP = "\u00A0"; FE0F = "\uFE0F"; ZWNBSP = "\uFEFF"
@@ -247,7 +257,6 @@ async def _amo_add_tag(lead_id: int, tag: str, *, slot_key: Optional[str] = None
     except Exception:
         logger.exception("[confirm] add tag failed lead=%s tag=%s slot=%s", lead_id, tag, slot_key)
         return False
-
 
 
 # ███ [2.1] HUMAN LABELS (ИМЯ ДЛЯ ТЕГА) — ИЗ locked_distribution
@@ -460,7 +469,6 @@ async def _role_of_user_in_locked(uid: int, deal_id: int) -> Optional[str]:
     return None
 
 
-
 async def _maybe_move_to_success(deal_id: int) -> None:
     """
     Переводит сделку в «Завершение сделки» ТОЛЬКО если:
@@ -470,12 +478,10 @@ async def _maybe_move_to_success(deal_id: int) -> None:
     Всегда отправляем групповое уведомление «вся команда подтвердила...» отдельно.
     """
     try:
-        # Антидубли на процесс: один перевод за сессию
         moved_set: Set[int] = state.__dict__.setdefault("_moved_success", set())  # type: ignore[assignment]
         if int(deal_id) in moved_set:
             return
 
-        # 0) Проверка комплектности ожидаемых тегов
         expected_map: Dict[str, Set[str]] = _expected_tag_map(deal_id)
         expected_required: Set[str] = set()
         for k in ("main", "assist", "admin"):
@@ -505,14 +511,12 @@ async def _maybe_move_to_success(deal_id: int) -> None:
             logger.debug("[confirm] deal %s tags missing: %s", deal_id, ", ".join(sorted(missing)))
             return
 
-        # best-effort: если каких-то тегов нет в CRM — добавим (не критично)
         if not crm_tags:
             to_add = expected_required - crm_tags
             for tag in sorted(to_add):
                 with contextlib.suppress(Exception):
                     await _amo_add_tag(deal_id, tag)
 
-        # 1) Читаем статус сделки (CRM→state), решение строгое
         sid, name = await _read_status_info(deal_id)
         if _is_prelim(sid, name):
             can_move = False
@@ -521,7 +525,6 @@ async def _maybe_move_to_success(deal_id: int) -> None:
         else:
             can_move = False
 
-        # уведомление «вся команда подтвердила»
         try:
             from handlers.my_games import announce_if_all_confirmed  # type: ignore
         except Exception:
@@ -535,10 +538,8 @@ async def _maybe_move_to_success(deal_id: int) -> None:
                 logger.warning("[confirm] SUCCESS status id not configured; lead=%s", deal_id)
             return
 
-        # 2) Перевод в «Завершение сделки»
         with contextlib.suppress(Exception):
             await update_deal_status(int(deal_id), str(SUCCESSFUL_STATUS_ID))
-            # Локальный кэш: актуализируем статусы в открытках
             try:
                 for d in (getattr(state, "current_poll_deals", []) or []):
                     if int(d.get("id") or 0) == int(deal_id):
@@ -568,7 +569,6 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
         await _safe_answer(callback, "⛔ Вы не назначены на эту роль.", show_alert=True)
         return
 
-    # init locals
     state.__dict__.setdefault("pending_confirmations", {})
     state.__dict__.setdefault("confirmed", {})
 
@@ -578,7 +578,6 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
     human_expected = expected.get(role, set())
     already = (crm_tags and any(tag in crm_tags for tag in human_expected)) or (uid in local.get(role, set()))
     if already:
-        # UI фолбэк (если «Мои игры» — ниже мы всё равно вызовем общий UI-патч)
         kb = _mark_confirmed_on_message_kb(callback, deal_id, role)
         with contextlib.suppress(Exception):
             if kb:
@@ -586,26 +585,30 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
         await _safe_answer(callback, "Уже подтверждено ✅")
         return
 
-    # тег: строго из locked_distribution (подпись до |uid)
     human = await short_name(uid)
     tag_text = _label_for_user_from_locked(deal_id, uid, role)
     if not tag_text:
         suffix = _suffix_for_role(role)
         tag_text = f"{human}{suffix}" if human.endswith(".") else f"{human}.{suffix}"
 
-    # NEW: ключ точного слота для update_amocrm_tags
     slot_key = await _slot_key_for_user(deal_id, uid)
     with contextlib.suppress(Exception):
         await _amo_add_tag(deal_id, tag_text, slot_key=slot_key)
 
-    # локальная отметка
     pc = state.pending_confirmations.setdefault(deal_id, {})
     if not isinstance(pc.get("confirmed"), dict):
         pc["confirmed"] = {}
     (pc["confirmed"].setdefault(role, set())).add(uid)  # type: ignore[index]
     state.confirmed.setdefault(deal_id, set()).add(uid)
 
-    # NEW: UI после подтверждения — если пользователь сейчас в «Моих играх», отдаём патч туда
+    try:
+        if refresh_deal_details:
+            opened = getattr(state, "detail_blocks", {}).get(uid, {})
+            if opened and deal_id in opened:
+                await refresh_deal_details(bot=callback.message.bot, uid=uid, deal_id=deal_id)  # type: ignore[arg-type]
+    except Exception:
+        logger.debug("[confirm] details refresh skipped")
+
     applied_ui = False
     try:
         ui_ctx = (getattr(state, "ui_context", {}) or {}).get(uid)
@@ -620,14 +623,12 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
     except Exception:
         pass
 
-    # Фолбэк — просто перекрасить кнопку «✅ Подтверждено», если «Моих игр» рядом нет
     if not applied_ui:
         kb = _mark_confirmed_on_message_kb(callback, deal_id, role)
         with contextlib.suppress(Exception):
             if kb:
                 await callback.message.edit_reply_markup(reply_markup=kb)
 
-    # Уведомление о личном подтверждении
     try:
         bot = callback.message.bot if callback.message else None
         if bot:
@@ -655,7 +656,6 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
     except Exception:
         logger.exception("[confirm] notify failed")
 
-    # Проверка комплектности + возможный перевод статуса (строго из «Бронь»)
     with contextlib.suppress(Exception):
         await _maybe_move_to_success(deal_id)
 
@@ -663,13 +663,11 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
         await _safe_answer(callback, "Готово ✅")
 
 
-
 # История изменений [4]:
 # 2025-08-18 — добавлен _maybe_move_to_success; resolve_notify_chat_id — sync (SSOT).
 # 2025-08-19 — при проставлении тега берём подпись из locked_distribution (строго «Имя Ф.Суф»).
 # 2025-08-19 — _maybe_move_to_success: переводить только из «Бронь»; антидубли перевода.
-# 2025-08-24 — отключён редрав деталей при подтверждении (во избежание «прыжка» из «Мои игры»).
-
+# 2025-08-24 — предотвращён автопереход в детали при подтверждении из «Мои игры».
 
 
 # ███ [4.0] CALLBACK: CONFIRM BUTTON «confirm_role_{deal}_{role}»
@@ -690,7 +688,7 @@ async def confirm_role_handler(callback: CallbackQuery) -> None:
         return
 
     role = _role_alias(role)
-    if role not in {"main","assist","admin","trainee"}:
+    if role not in {"main", "assist", "admin", "trainee"}:
         await _safe_answer(callback, "⚠️ Роль не распознана.", show_alert=True)
         return
 
@@ -717,7 +715,6 @@ async def confirm_from_mygames_handler(callback: CallbackQuery) -> None:
     uid = int(callback.from_user.id)
     assigned = _assigned_uids_from_locked(deal_id)
 
-    # Приоритет: admin → main → assist → trainee.
     role: Optional[str] = None
     if uid in assigned.get("admin", set()):
         role = "admin"
@@ -732,7 +729,6 @@ async def confirm_from_mygames_handler(callback: CallbackQuery) -> None:
         await _safe_answer(callback, "Роль не найдена или не назначена на вас.", show_alert=True)
         return
 
-    # Помечаем UI-контекст пользователя — это поможет и другим модулям, если нужно.
     try:
         ui = getattr(state, "ui_context", None)
         if not isinstance(ui, dict):
@@ -743,8 +739,6 @@ async def confirm_from_mygames_handler(callback: CallbackQuery) -> None:
         pass
 
     await _perform_confirm(callback, deal_id, role)
-
-# История изменений [4.1]: 2025-08-18 — базовая логика; 2025-08-24 — пометка ui_context для «Мои игры».
 
 
 # ███ [99] SELF-TEST (минимальный)
@@ -761,7 +755,7 @@ async def _test() -> None:
 
     # assigned_uids: смешанный формат (списки + слоты)
     state.locked_distribution = {
-        1: {"main": [ "Иван И.1|101" ], "assistant1": "Петр П.2|202", "admin": "Света С.Адм|303"},
+        1: {"main": ["Иван И.1|101"], "assistant1": "Петр П.2|202", "admin": "Света С.Адм|303"},
     }
     a = _assigned_uids_from_locked(1)
     assert a["main"] == {101} and a["assist"] == {202} and a["admin"] == {303}
