@@ -3,20 +3,11 @@
 """
 Единый набор утилит для MasterBot.
 
-Версия 7.3 · 2025-08-18
+Версия 7.6 · 2025-08-27
 ──────────────────────────────────────────────────────────────────────────────
-• Добавлены truncate() и parse_players_count() — требуются my_games/amocrm.
-• NEW: assigned_role_from_state(uid, deal_id) — единый SSOT-хелпер для ролей.
-• SSOT-хелперы: short_name/role_suffix/team_bulleted_lines.
-• Нормализация ролей и разбор слотов: normalize_roles/parse_uid/to_uid_list.
-• Резолвер общего чата: resolve_notify_chat_id() — понимает строковые ID.
-• Канонический «пылесос» ЛС: vacuum_private() + совместимый delete_previous_private_messages().
-  Поддержка хранения detail_blocks по ключам uid И (uid, deal_id).
-
-Правила:
-— async def используем только если внутри есть await.
-— Хелперы, работающие в памяти, — обычные def.
-— Никаких дублирующих реализаций в модулях-вызывателях: импортировать отсюда.
+• FIX: vacuum_private бережёт липкий дашборд «Мои игры» (silent update кнопок вместо затирания).
+• NEW: set_my_games_dashboard / get_sticky_my_games / keep_for_vacuum — SSOT-хелперы.
+• Импорты и типы выровнены под Pylance (без «Unresolved reference»).
 """
 
 from __future__ import annotations
@@ -24,8 +15,10 @@ from __future__ import annotations
 # ███ [1] IMPORTS & TYPES
 # --------------------------------------------------------------------
 import asyncio
+import contextlib
 import logging
 import re
+from datetime import datetime, date as _date
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, NamedTuple
 
 try:
@@ -68,6 +61,10 @@ __all__ = [
     "parse_players_count",
     # роли из state
     "assigned_role_from_state",
+    # sticky-дэшборд
+    "set_my_games_dashboard",
+    "get_sticky_my_games",
+    "keep_for_vacuum",
 ]
 
 
@@ -152,15 +149,10 @@ async def short_name(subject: Union[int, str, Dict[str, Any], None]) -> str:
 
     return "Без имени"
 
-def role_suffix(role: str, index: Optional[int] = None) -> str:
-    """
-    Возвращает СУФФИКС роли БЕЗ дополнительной точки:
-    • main  → "1"
-    • assist→ "2"
-    • admin → "Адм"
-    • trainee → "Стаж"
-    Итог: «Имя Ф.» + SUFFIX = «Имя Ф.1/2/Адм/Стаж» (без «двойной точки»).
-    """
+# ВНИМАНИЕ: публичный role_suffix — в блоке [2.x] (SSOT).
+# Это внутренний хелпер без точек — оставлен для обратной совместимости
+# и нигде не экспортируется.
+def _role_suffix_plain(role: str, index: Optional[int] = None) -> str:
     r = (role or "").lower()
     if r == "main":
         return "1"
@@ -172,12 +164,8 @@ def role_suffix(role: str, index: Optional[int] = None) -> str:
         return "Стаж"
     return ""
 
-# История изменений:
-# • 2025-08-20 — Учтён last_name_initial; суффиксы ролей без лишней точки (исключена «двойная точка»).
 # ███ [2.5] ДАТЫ/ВРЕМЯ — short_dt()
 # --------------------------------------------------------------------
-from datetime import datetime, date as _date
-
 def short_dt(value: Any) -> str:
     """
     Короткий формат даты/времени для заголовков деталей:
@@ -185,29 +173,21 @@ def short_dt(value: Any) -> str:
     • date     → 'ДД.ММ'
     • ISO-строки ('YYYY-MM-DD', 'YYYY-MM-DD HH:MM', '...T...') → авторазбор
     • Иные строки возвращаем как есть; None → '—'
-
-    Функция НЕ меняет таймзону и НЕ «обнуляет» время — просто форматирует то,
-    что пришло из кастомного поля сделки.
     """
     if value is None:
         return "—"
 
-    # 1) datetime → 'ДД.ММ HH:MM'
     if isinstance(value, datetime):
         return value.strftime("%d.%m %H:%M")
 
-    # 2) date → 'ДД.ММ'
     if isinstance(value, _date):
         return value.strftime("%d.%m")
 
-    # 3) строки: пробуем ISO, потом простые шаблоны
     if isinstance(value, str):
         s = value.strip()
         if not s:
             return "—"
-        # Попытка ISO: 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM:SS', 'YYYY-MM-DD HH:MM'
         try:
-            # fromisoformat понимает и '+03:00', и микросекунды
             iso = s.replace("T", " ")
             dt = datetime.fromisoformat(iso)
             if dt.time() == datetime.min.time():
@@ -216,21 +196,16 @@ def short_dt(value: Any) -> str:
         except Exception:
             pass
 
-        # Простой 'ДД.MM[.ГГГГ]' → вернем 'ДД.ММ'
         m = re.search(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?", s)
         if m:
             dd, mm = int(m.group(1)), int(m.group(2))
             return f"{dd:02}.{mm:02}"
+        return s
 
-        return s  # оставляем как есть
-
-    # 4) всё остальное → str()
     return str(value)
 
-# ███ [2.x] СУФФИКСЫ РОЛЕЙ И СТРОКИ КОМАНДЫ
+# ███ [2.x] СУФФИКСЫ РОЛЕЙ (SSOT)
 # --------------------------------------------------------------------
-from typing import Any, Dict, List, Optional
-
 def role_suffix(role: str, index_in_role: Optional[int] = None) -> str:
     """
     Канонические суффиксы ролей для тегов/ярлыков:
@@ -238,8 +213,7 @@ def role_suffix(role: str, index_in_role: Optional[int] = None) -> str:
     • assist     → '.2'
     • admin      → '.Адм'
     • trainee    → '.Стаж'
-    index_in_role игнорируем намеренно: по стандарту у ассистентов всегда '.2',
-    у ведущих — '.1', независимо от порядкового номера слота.
+    index_in_role игнорируем намеренно.
     """
     r = (role or "").lower()
     if r in {"main", "lead", "leader"}:
@@ -251,63 +225,6 @@ def role_suffix(role: str, index_in_role: Optional[int] = None) -> str:
     if r in {"trainee", "intern", "стаж", "стажер", "стажёр"}:
         return ".Стаж"
     return ""
-
-async def team_bulleted_lines(
-    roles_or_slots: Dict[str, Any],
-    prefer_slot_names: bool = True,
-) -> List[str]:
-    """
-    Строит строки команды для уведомлений.
-
-    Если prefer_slot_names=True — сначала пытаемся взять имя из слота "имя|uid",
-    чтобы не делать лишних запросов к профилю. Если имени нет — обращаемся к БД.
-
-    Поддерживает оба формата входа: роли и слоты.
-    """
-    lines: List[str] = []
-
-    # Если это не нормализованные роли — считаем, что пришли слоты (для имён)
-    slots: Dict[str, Any] = {}
-    if not all(k in roles_or_slots for k in ("main", "assist", "admin")):
-        slots = dict(roles_or_slots)
-
-    # Нормализуем uid-списки
-    norm = normalize_roles(roles_or_slots)
-
-    async def _name_from_uid_or_slot(uid: int, slot_key: Optional[str], index_in_role: Optional[int], role: str) -> str:
-        # 1) если стоит флаг и есть слот — используем имя слева
-        if prefer_slot_names and slot_key and slot_key in slots:
-            val = slots.get(slot_key)
-            if isinstance(val, str):
-                left = val.split("|", 1)[0].strip()
-                n = (left or "...")
-                return f"{n}{role_suffix(role, index_in_role)}"
-        # 2) иначе — short_name(uid)
-        n = await short_name(uid)
-        return f"{n}{role_suffix(role, index_in_role)}"
-
-    # MAIN
-    for i, uid in enumerate(norm["main"], start=1):
-        skey = f"lead{i}"
-        lines.append(f"• {await _name_from_uid_or_slot(uid, skey, i, 'main')}")
-
-    # ASSIST
-    for i, uid in enumerate(norm["assist"], start=1):
-        skey = f"assistant{i}"
-        lines.append(f"• {await _name_from_uid_or_slot(uid, skey, i, 'assist')}")
-
-    # ADMIN
-    for i, uid in enumerate(norm["admin"], start=1):
-        lines.append(f"• {await _name_from_uid_or_slot(uid, 'admin', None, 'admin')}")
-
-    # TRAINEE (не влияет на комплектность, но печатаем, если есть)
-    for i, uid in enumerate(norm.get("trainee", []), start=1):
-        lines.append(f"• {await _name_from_uid_or_slot(uid, 'trainee', None, 'trainee')}")
-
-    return lines
-
-# История изменений:
-# • 2025-08-20 — добавлен role_suffix(...) в блок; исправлен UndefinedVariable в team_bulleted_lines.
 
 
 # ███ [3] UID / ПАРСИНГ / НОРМАЛИЗАЦИЯ
@@ -360,23 +277,19 @@ def _uids_from_slots(slots: Dict[str, Any]) -> Dict[str, List[int]]:
     admin: List[int] = []
     trainee: List[int] = []
 
-    # Основные ведущие — поддержим до 4 на будущее
     for i in range(1, 5):
         k = f"lead{i}"
         u = parse_uid(slots.get(k))
         if isinstance(u, int):
             main.append(u)
-    # Помощники — поддержим до 4
     for i in range(1, 5):
         k = f"assistant{i}"
         u = parse_uid(slots.get(k))
         if isinstance(u, int):
             assist.append(u)
-    # Админ
     u = parse_uid(slots.get("admin"))
     if isinstance(u, int):
         admin.append(u)
-    # Стажёры (может быть список слотов/uid)
     trainee = to_uid_list(slots.get("trainee"))
 
     return {"main": main, "assist": assist, "admin": admin, "trainee": trainee}
@@ -395,7 +308,6 @@ def normalize_roles(raw: Dict[str, Any]) -> Dict[str, List[int]]:
     if not isinstance(raw, dict):
         return {"main": [], "assist": [], "admin": [], "trainee": []}
 
-    # Уже нормальная форма?
     if all(k in raw for k in ("main", "assist", "admin")):
         out = {
             "main": to_uid_list(raw.get("main")),
@@ -405,64 +317,12 @@ def normalize_roles(raw: Dict[str, Any]) -> Dict[str, List[int]]:
         }
         return out
 
-    # Иначе считаем «слотами»
     return _uids_from_slots(raw)
 
 
-# ███ [4] СПИСКИ КОМАНДЫ ДЛЯ УВЕДОМЛЕНИЙ
+# ███ [4] СПИСКИ КОМАНДЫ ДЛЯ УВЕДОМЛЕНИЙ (SSOT в [7.1])
 # --------------------------------------------------------------------
-async def team_bulleted_lines(
-    roles_or_slots: Dict[str, Any],
-    *,
-    prefer_slot_names: bool = True,
-) -> List[str]:
-    """
-    Строит строки команды для уведомлений.
-    При prefer_slot_names=True сначала пытается взять имя из слота "Имя|uid",
-    чтобы не делать лишних запросов к профилю. Если имени нет — обращается к БД.
-
-    Поддерживает оба формата входа: роли и слоты.
-    """
-    lines: List[str] = []
-
-    # Если это не нормализованные роли — считаем, что пришли слоты (для имён)
-    slots: Dict[str, Any] = {}
-    if not all(k in roles_or_slots for k in ("main", "assist", "admin")):
-        slots = dict(roles_or_slots)
-
-    # Нормализуем uid-списки
-    norm = normalize_roles(roles_or_slots)
-
-    async def _name_from_uid_or_slot(uid: int, slot_key: Optional[str], index_in_role: Optional[int], role: str) -> str:
-        # 1) если есть слот и prefer_slot_names — используем имя слева
-        if prefer_slot_names and slot_key and slot_key in slots:
-            val = slots.get(slot_key)
-            if isinstance(val, str) and "|" in val:
-                left, _ = val.split("|", 1)
-                n = (left or "").strip()
-                if n:
-                    return f"{n}{role_suffix(role, index_in_role)}"
-        # 2) иначе — short_name(uid)
-        n = await short_name(uid)
-        return f"{n}{role_suffix(role, index_in_role)}"
-
-    # MAIN
-    for i, uid in enumerate(norm["main"], start=1):
-        skey = f"lead{i}"
-        lines.append(f"• {await _name_from_uid_or_slot(uid, skey, i, 'main')}")
-    # ASSIST
-    for i, uid in enumerate(norm["assist"], start=1):
-        skey = f"assistant{i}"
-        lines.append(f"• {await _name_from_uid_or_slot(uid, skey, i, 'assist')}")
-    # ADMIN
-    if norm["admin"]:
-        uid = norm["admin"][0]
-        lines.append(f"• {await _name_from_uid_or_slot(uid, 'admin', None, 'admin')}")
-    # TRAINEE
-    for uid in norm.get("trainee", []):
-        lines.append(f"• {await _name_from_uid_or_slot(uid, None, None, 'trainee')}")
-
-    return lines
+# Реализация team_bulleted_lines в блоке [7.1] ниже.
 
 
 # ███ [5] ОБЩИЙ ЧАТ ДЛЯ УВЕДОМЛЕНИЙ
@@ -487,19 +347,6 @@ def _is_placeholder(cid: Optional[int]) -> bool:
 def resolve_notify_chat_id(*_args: Any, **_kwargs: Any) -> Optional[int]:
     """
     SSOT-резолвер id чата для системных уведомлений.
-
-    Приоритеты (первое валидное значение побеждает):
-      1) settings.NOTIFY_CHAT_ID
-      2) settings.NOTIFY_CHAT_IDS[0]
-      3) settings.POLLS_CHAT_ID
-      4) settings.PRIMARY_CHAT_ID
-      5) settings.LEADERS_CHAT_ID
-      6) settings.TEAM_CHAT_ID
-      7) settings.ADMIN_CHAT_ID
-      8) state.admin_chat_id   ← важный фолбэк (куда уже приходят опросы)
-
-    Возвращает int или None, если подходящий чат не найден.
-    Игнорирует плейсхолдеры и невалидные значения.
     """
     try:
         candidates: List[Any] = [
@@ -510,7 +357,7 @@ def resolve_notify_chat_id(*_args: Any, **_kwargs: Any) -> Optional[int]:
             getattr(settings, "LEADERS_CHAT_ID", None),
             getattr(settings, "TEAM_CHAT_ID", None),
             getattr(settings, "ADMIN_CHAT_ID", None),
-            getattr(state, "admin_chat_id", None),  # ← supergroup/id из chat_id.json
+            getattr(state, "admin_chat_id", None),
         ]
 
         for raw in candidates:
@@ -531,150 +378,188 @@ def resolve_notify_chat_id(*_args: Any, **_kwargs: Any) -> Optional[int]:
 # 2025-08-19 — расширен резолвер: добавлен fallback на state.admin_chat_id,
 #              игнор плейсхолдеров, бэксовместимая сигнатура; выровнено под SSOT.
 
-# ███ [6] «ПЫЛЕСОС» ЛС — КАНОНИЧЕСКАЯ РЕАЛИЗАЦИЯ (бережём главное меню)
+
+# ███ [5.5] STICKY «МОИ ИГРЫ» — SSOT-ХЕЛПЕРЫ
 # --------------------------------------------------------------------
-from typing import Optional, Sequence, Tuple, Any, List
-import logging
-import contextlib
+def set_my_games_dashboard(uid: int, message_id: int) -> None:
+    """
+    Сохраняет message_id липкого дашборда «Мои игры» в state.my_games_sticky.
+    Используется рендером «Моих игр» и вакуумом.
+    """
+    try:
+        d = getattr(state, "my_games_sticky", None)
+        if not isinstance(d, dict):
+            d = {}
+            setattr(state, "my_games_sticky", d)
+        d[int(uid)] = int(message_id)
+        logger.debug("[sticky] set my_games_sticky[%s]=%s", uid, message_id)
+    except Exception as e:  # pragma: no cover
+        logger.debug("[sticky] set failed: %s", e)
 
-logger = logging.getLogger(__name__)
+def get_sticky_my_games(uid: int) -> Optional[int]:
+    """
+    Возвращает message_id липкого дашборда «Мои игры», если сохранён.
+    """
+    try:
+        d = getattr(state, "my_games_sticky", None)
+        mid = d.get(int(uid)) if isinstance(d, dict) else None
+        return int(mid) if isinstance(mid, int) else None
+    except Exception:  # pragma: no cover
+        return None
 
+def keep_for_vacuum(uid: int, *extra_msg_ids: int) -> List[int]:
+    """
+    Список message_id, которые НЕЛЬЗЯ удалять «пылесосом»:
+    • sticky «Мои игры», если есть
+    • любые дополнительные message_id, переданные вызвавшим кодом
+    """
+    keep: List[int] = []
+    sticky = get_sticky_my_games(int(uid))
+    if isinstance(sticky, int):
+        keep.append(sticky)
+    for mid in extra_msg_ids:
+        if isinstance(mid, int) and mid not in keep:
+            keep.append(mid)
+    return keep
+
+
+# ███ [6] «ПЫЛЕСОС» ЛС — КАНОНИЧЕСКАЯ РЕАЛИЗАЦИЯ (бережём главное меню и «Мои игры»)
+# --------------------------------------------------------------------
 async def vacuum_private(uid: int, keep: Optional[Sequence[int]] = None) -> None:
     """
     Удаляет все устаревшие личные сообщения пользователя, оставляя только `keep`.
-    ВАЖНО: Сообщение главного меню теперь защищено автоматически:
-           если state.menu_message_id содержит id меню для uid, мы всегда
-           добавляем его в keep, чтобы меню не исчезало.
 
-    Поддерживаются форматы state.*:
-      • state.last_user_messages[uid] -> List[int] | List[Message] | List[Tuple[int, int]]
-      • state.detail_blocks[uid]      -> List[int]
-      • state.detail_blocks[(uid, deal_id)] -> int | List[int]
-      • state.menu_message_id         -> int | Dict[uid->int]     ← БЕРЕЖЁМ
-      • state.personal_report_message_id -> int                   (может удаляться)
+    ВАЖНО:
+      • Сообщение главного меню бережём автоматически (state.menu_message_id).
+      • БЕРЕЖЁМ ДАШБОРД «МОИ ИГРЫ» (липкий):
+          state.my_games_sticky[uid] (через keep_for_vacuum)
+        Это устраняет затирание дашборда и позволяет тихо заменять кнопки
+        «Подтвердить» → «Замена» и синхронно менять детали.
+      • Поддержка хранения detail_blocks по ключам uid И (uid, deal_id).
     """
-    # локальный импорт, чтобы избежать циклов
-    from aiogram import Bot
-    from core.state import state  # гарантируем актуальный объект
+    from core.state import state as _state  # гарантируем актуальный объект
 
+    # 0) нормализуем keep и добавляем sticky
     keep_list = list(keep or [])
-    keep_set = set(keep_list)
+    keep_set = set(int(x) for x in keep_list if isinstance(x, int))
 
-    # ── ДОБАВИМ ГЛАВНОЕ МЕНЮ В KEEP АВТОМАТИЧЕСКИ
-    mm = getattr(state, "menu_message_id", None)
-    if isinstance(mm, dict):
-        mid = mm.get(uid)
-        if isinstance(mid, int) and mid > 0:
-            keep_set.add(mid)
-    elif isinstance(mm, int) and mm > 0:
-        keep_set.add(mm)
+    # sticky «Мои игры»
+    try:
+        for mid in keep_for_vacuum(int(uid)):
+            keep_set.add(int(mid))
+    except Exception:
+        pass
 
+    # главный корневой «меню»-мид (независимо от sticky)
+    def _add_keep_from(attr: str) -> None:
+        val = getattr(_state, attr, None)
+        if isinstance(val, dict):
+            mid = val.get(int(uid))
+            if isinstance(mid, int) and mid > 0:
+                keep_set.add(mid)
+        elif isinstance(val, int) and val > 0:
+            keep_set.add(val)
+
+    _add_keep_from("menu_message_id")
+
+    bot = None
     try:
         bot = Bot.get_current()
+    except Exception:
+        pass
 
-        async def _safe_delete(chat_id: int, message_id: int) -> bool:
-            try:
-                await bot.delete_message(chat_id, message_id)
-                return True
-            except Exception:
-                return False
+    async def _safe_delete(chat_id: int, message_id: int) -> bool:
+        if not bot:
+            return False
+        try:
+            await bot.delete_message(chat_id, message_id)
+            return True
+        except Exception:
+            return False
 
-        # 1) last_user_messages
-        lum = getattr(state, "last_user_messages", {})
-        if isinstance(lum, dict):
-            msgs = lum.get(uid) or []
-            new_list = []
-            for m in list(msgs):
-                mid = None
-                if hasattr(m, "message_id"):
-                    with contextlib.suppress(Exception):
-                        mid = int(m.message_id)
-                elif isinstance(m, tuple) and len(m) >= 2:
-                    with contextlib.suppress(Exception):
-                        mid = int(m[1])
-                elif isinstance(m, int):
-                    mid = m
+    # 1) last_user_messages — удаляем всё, что не в keep_set
+    lum = getattr(_state, "last_user_messages", {})
+    if isinstance(lum, dict):
+        msgs = lum.get(int(uid)) or []
+        new_list = []
+        for m in list(msgs):
+            mid = None
+            if hasattr(m, "message_id"):
+                with contextlib.suppress(Exception):
+                    mid = int(m.message_id)
+            elif isinstance(m, tuple) and len(m) >= 2:
+                with contextlib.suppress(Exception):
+                    mid = int(m[1])
+            elif isinstance(m, int):
+                mid = m
 
+            if isinstance(mid, int) and mid in keep_set:
+                new_list.append(m)
+            elif isinstance(mid, int):
+                await _safe_delete(int(uid), mid)
+        lum[int(uid)] = new_list
+
+    # 2) detail_blocks — чистим только «хвосты», keep_set уважаем
+    db = getattr(_state, "detail_blocks", {})
+    if isinstance(db, dict):
+        if int(uid) in db and isinstance(db[int(uid)], list):
+            new_list2: List[int] = []
+            for mid in list(db[int(uid)]):
                 if isinstance(mid, int) and mid in keep_set:
-                    new_list.append(m)
+                    new_list2.append(mid)
                 elif isinstance(mid, int):
-                    await _safe_delete(uid, mid)
-            lum[uid] = new_list
+                    await _safe_delete(int(uid), mid)
+            db[int(uid)] = new_list2
 
-        # 2) detail_blocks
-        db = getattr(state, "detail_blocks", {})
-        if isinstance(db, dict):
-            if uid in db and isinstance(db[uid], list):
-                new_list = []
-                for mid in list(db[uid]):
+        tuple_keys: List[Tuple[int, Any]] = [
+            k for k in db.keys() if isinstance(k, tuple) and len(k) >= 2 and k[0] == int(uid)
+        ]
+        for tkey in tuple_keys:
+            val = db.get(tkey)
+            if isinstance(val, list):
+                new_list3: List[int] = []
+                for mid in val:
                     if isinstance(mid, int) and mid in keep_set:
-                        new_list.append(mid)
+                        new_list3.append(mid)
                     elif isinstance(mid, int):
-                        await _safe_delete(uid, mid)
-                db[uid] = new_list
+                        await _safe_delete(int(uid), mid)
+                db[tkey] = new_list3
+            elif isinstance(val, int):
+                mid = val
+                if mid not in keep_set:
+                    await _safe_delete(int(uid), mid)
+                    with contextlib.suppress(Exception):
+                        del db[tkey]
 
-            tuple_keys: List[Tuple[int, Any]] = [
-                k for k in db.keys() if isinstance(k, tuple) and len(k) >= 2 and k[0] == uid
-            ]
-            for tkey in tuple_keys:
-                val = db.get(tkey)
-                if isinstance(val, list):
-                    new_list = []
-                    for mid in val:
-                        if isinstance(mid, int) and mid in keep_set:
-                            new_list.append(mid)
-                        elif isinstance(mid, int):
-                            await _safe_delete(uid, mid)
-                    db[tkey] = new_list
-                elif isinstance(val, int):
-                    mid = val
-                    if mid not in keep_set:
-                        await _safe_delete(uid, mid)
-                        with contextlib.suppress(Exception):
-                            del db[tkey]
+    # 3) personal_report_message_id — можно удалять (если не в keep)
+    prm = getattr(_state, "personal_report_message_id", None)
+    if isinstance(prm, int) and (prm not in keep_set):
+        ok = await _safe_delete(int(uid), prm)
+        if ok:
+            setattr(_state, "personal_report_message_id", None)
 
-        # 3) personal_report_message_id — можно удалять (если не в keep)
-        prm = getattr(state, "personal_report_message_id", None)
-        if isinstance(prm, int) and (prm not in keep_set):
-            ok = await _safe_delete(uid, prm)
-            if ok:
-                setattr(state, "personal_report_message_id", None)
+    logger.debug("[vacuum] uid=%s keep=%s", uid, sorted(list(keep_set)))
 
-        # 4) menu_message_id — НЕ УДАЛЯЕМ здесь, он уже в keep_set
-
-    except Exception as e:  # pragma: no cover
-        logger.debug("[vacuum_private] failed: %s", e)
-
-
-# ███ [7] LEGACY-ВРАППЕР ПЫЛЕСОСА (не менялся)
+# ███ [7] LEGACY-ВРАППЕР ПЫЛЕСОСА (совместимость)
 # --------------------------------------------------------------------
 async def delete_previous_private_messages(*args, **kwargs) -> None:
     """
     Совместимый враппер:
       delete_previous_private_messages(uid, keep=[...]) | delete_previous_private_messages(uid)
     """
-    from core.state import state  # noqa
+    _uid = None
     if args and isinstance(args[0], int) and not kwargs.get("uid"):
-        kwargs["uid"] = args[0]
-    if "bot" in kwargs:
-        kwargs.pop("bot", None)
-    uid = kwargs.get("uid") or (args[1] if len(args) >= 2 and isinstance(args[1], int) else None)
-    if not isinstance(uid, int):
+        _uid = args[0]
+    _uid = kwargs.get("uid", _uid)
+    if not isinstance(_uid, int):
         return
-    keep = kwargs.get("keep") or (args[2] if len(args) >= 3 else None)
-    await vacuum_private(uid, keep=keep)
+    keep = kwargs.get("keep")
+    await vacuum_private(_uid, keep=keep)
 
-# История изменений:
-# 2025-08-18 • v7.5 — вакуум автоматически сохраняет сообщение главного меню (menu_message_id).
 
 # ════════════════════════════════════════════════════════════════════
 # [7.1] TEAM LINES — bullets for notifications (SSOT)
 # ════════════════════════════════════════════════════════════════════
-
-import re
-from typing import Any, Dict, List, Tuple
-
-# Короткие суффиксы ролей — как в SSOT
 _ROLE_SUFFIXES: Dict[str, str] = {
     "lead": ".1",
     "assistant": ".2",
@@ -686,10 +571,6 @@ _ROLE_SUFFIXES: Dict[str, str] = {
 _SUFFIX_RE = re.compile(r"(?:\.(?:1|2|Адм|Стаж))\s*$", re.IGNORECASE)
 
 def _role_of_slot(slot_key: str) -> Tuple[str, str]:
-    """
-    Возвращает пару (role, suffix) для ключа слота.
-    lead1/lead2 → ('lead', '.1'), assistant1 → ('assistant', '.2'), admin → ('admin', '.Адм'), trainee → ('trainee', '.Стаж')
-    """
     s = (slot_key or "").lower()
     if s.startswith("lead"):
         return "lead", _ROLE_SUFFIXES["lead"]
@@ -699,33 +580,20 @@ def _role_of_slot(slot_key: str) -> Tuple[str, str]:
         return "admin", _ROLE_SUFFIXES["admin"]
     if s == "trainee":
         return "trainee", _ROLE_SUFFIXES["trainee"]
-    # дефолт: без суффикса
     return "", ""
 
 def _extract_human(value: Any) -> str:
-    """
-    Из значения слота берём человекочитаемую часть:
-    'Имя Ф.1|12345' → 'Имя Ф.1', 'Имя Ф.|12345' → 'Имя Ф.'
-    """
     if isinstance(value, str):
         return value.split("|", 1)[0].strip()
     return ""
 
 def _strip_existing_suffix(human: str) -> str:
-    """
-    Снимаем ранее добавленный суффикс (.1/.2/.Адм/.Стаж) в конце,
-    чтобы не было дублей. Также схлопываем повторные точки ('..' → '.').
-    """
     h = _SUFFIX_RE.sub("", human or "").strip()
     while ".." in h:
         h = h.replace("..", ".")
     return h
 
 def _join_name_and_suffix(human: str, suffix: str) -> str:
-    """
-    Склеиваем имя и суффикс без двойной точки.
-    Если human оканчивается на '.', а suffix начинается с '.', берём suffix без ведущей точки.
-    """
     if not suffix:
         return human
     if human.endswith(".") and suffix.startswith("."):
@@ -735,10 +603,6 @@ def _join_name_and_suffix(human: str, suffix: str) -> str:
 async def team_bulleted_lines(slots: Dict[str, Any]) -> List[str]:
     """
     Формирует строки состава с буллитами.
-    Пример:
-      • Равиль Ш.1
-      • Алиса С.2
-      • Анна М.Адм
     Правила:
       — суффиксы ролей: .1 (ведущий), .2 (помощник), .Адм, .Стаж — как в SSOT;
       — удаляем уже прилипший суффикс, чтобы не было «..1»;
@@ -748,8 +612,6 @@ async def team_bulleted_lines(slots: Dict[str, Any]) -> List[str]:
         return []
 
     lines: List[str] = []
-
-    # порядок вывода: lead*, assistant*, admin, trainee
     ordered_keys: List[str] = []
     ordered_keys += [k for k in sorted(slots.keys()) if str(k).startswith("lead")]
     ordered_keys += [k for k in sorted(slots.keys()) if str(k).startswith("assistant")]
@@ -763,55 +625,27 @@ async def team_bulleted_lines(slots: Dict[str, Any]) -> List[str]:
         human_raw = _extract_human(raw)
         if not human_raw:
             continue
-
         role, suffix = _role_of_slot(str(key))
-        # 1) убираем прежний суффикс (если он вдруг уже в имени)
         base = _strip_existing_suffix(human_raw)
-        # 2) аккуратно добавляем правильный суффикс без двойной точки
         with_suffix = _join_name_and_suffix(base, suffix)
         lines.append(f"• {with_suffix}")
 
     return lines
 
-# История изменений:
-# 2025-08-24 — v7.1: добавлена защита от «двойной точки» в имени при склейке суффикса роли;
-#                    снятие ранее прилипшего суффикса; стабильный порядок строк (lead→assist→admin→trainee).
-
-
 
 # ███ [8] ПАРСИНГ ПОЛЯ «ИГРОКИ» (2–6, 6+, до 10, от 3 до 7 и т.п.)
 # --------------------------------------------------------------------
 class PlayersRange(NamedTuple):
-    """
-    Унифицированный результат парсинга количества игроков.
-    • min/max — могут быть None (если указана только верхняя/нижняя граница).
-    • text    — нормализованный человекочитаемый вид: '2-6', '6+', 'до 10'.
-    • avg     — усреднение, если обе границы известны; иначе min/max.
-    Поведение совместимо с использованием как tuple (min, max, text, avg).
-    """
     min: Optional[int]
     max: Optional[int]
     text: str
     avg: Optional[float]
 
-
 _RANGE_SEP = r"[\-\–—]"  # дефис / en-dash / em-dash
 
 def parse_players_count(raw: Any) -> PlayersRange:
-    """
-    Разбирает произвольное значение «кол-во игроков»:
-      • '2-6', '2–6', '2 — 6'
-      • '6+', '10+' → min=6/10, max=None
-      • 'до 10', '≤10' → min=None, max=10
-      • 'от 3 до 7', '>=3' → min=3, max=None (если верх не указан)
-      • '5' → min=max=5
-      • любое другое → (None, None, '—', None)
-
-    Возвращает PlayersRange(min, max, text, avg).
-    """
     s = "" if raw is None else str(raw)
-    s_norm = s.strip().lower()
-    s_norm = re.sub(r"\s+", " ", s_norm)
+    s_norm = re.sub(r"\s+", " ", s.strip().lower())
 
     def _mk(min_v: Optional[int], max_v: Optional[int]) -> PlayersRange:
         if isinstance(min_v, int) and isinstance(max_v, int):
@@ -824,7 +658,6 @@ def parse_players_count(raw: Any) -> PlayersRange:
             return PlayersRange(None, max_v, f"до {max_v}", float(max_v))
         return PlayersRange(None, None, "—", None)
 
-    # 1) 'a-b'
     m = re.search(rf"(\d+)\s*{_RANGE_SEP}\s*(\d+)", s_norm)
     if m:
         a, b = int(m.group(1)), int(m.group(2))
@@ -832,30 +665,25 @@ def parse_players_count(raw: Any) -> PlayersRange:
             a, b = b, a
         return _mk(a, b)
 
-    # 2) 'N+'
     m = re.search(r"(\d+)\s*\+", s_norm)
     if m:
         return _mk(int(m.group(1)), None)
 
-    # 3) 'до N' / '<=N'
     m = re.search(r"(до|<=|≤)\s*(\d+)", s_norm)
     if m:
         return _mk(None, int(m.group(2)))
 
-    # 4) 'от N (до M)?'
     m = re.search(r"от\s*(\d+)(?:\s*(?:до|–|-|—)\s*(\d+))?", s_norm)
     if m:
         lo = int(m.group(1))
         hi = int(m.group(2)) if m.group(2) else None
         return _mk(lo, hi)
 
-    # 5) одиночное число
     m = re.fullmatch(r"\s*(\d+)\s*", s_norm)
     if m:
         n = int(m.group(1))
         return PlayersRange(n, n, str(n), float(n))
 
-    # 6) fallback
     return PlayersRange(None, None, "—", None)
 
 
@@ -866,20 +694,14 @@ def assigned_role_from_state(uid: int, deal_id: int) -> Optional[str]:
     Возвращает роль ('main'|'assist'|'admin') пользователя по сделке из:
       1) state.locked_distribution[deal_id]  (в приоритете)
       2) state.distribution_cache[str(deal_id)]  (предварительный состав)
-
-    Поддерживает оба формата:
-      • новый «слотовый»: {'lead1': 'Имя|uid', 'assistant1': 'Имя|uid', 'admin': 'Имя|uid'}
-      • legacy-ролевой:  {'main': [uids], 'assist': [uids], 'admin': [uids]}
     """
     uid = int(uid)
     did_i = int(deal_id)
     locked = getattr(state, "locked_distribution", {}) or {}
     cache  = getattr(state, "distribution_cache", {}) or {}
 
-    # 1) утвердённый состав
-    dist: Any = locked.get(did_i) or locked.get(str(did_i))  # типо-безопасно
+    dist: Any = locked.get(did_i) or locked.get(str(did_i))
     if not isinstance(dist, dict):
-        # 2) предварительный (чаще строковый ключ)
         dist = cache.get(str(did_i)) or cache.get(did_i)
     if not isinstance(dist, dict):
         return None
@@ -887,7 +709,6 @@ def assigned_role_from_state(uid: int, deal_id: int) -> Optional[str]:
     def _match_slot(val: Any) -> bool:
         return parse_uid(val) == uid
 
-    # Слоты?
     if any(isinstance(k, str) and (k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"})
            for k in dist.keys()):
         for k, v in dist.items():
@@ -901,7 +722,6 @@ def assigned_role_from_state(uid: int, deal_id: int) -> Optional[str]:
             return "admin"
         return None
 
-    # Legacy-роли
     if parse_uid(dist.get("admin")) == uid or uid in to_uid_list(dist.get("admin")):
         return "admin"
     if uid in to_uid_list(dist.get("main")):
@@ -938,23 +758,23 @@ async def _test():
     nr2 = normalize_roles({"lead1": "Анна М.|10", "assistant2": "Равиль Ш.|12", "admin": "Дарья В.|14"})
     assert nr2 == {"main": [10], "assist": [12], "admin": [14], "trainee": []}
 
-    # role_suffix
+    # role_suffix (SSOT, с точкой)
     assert role_suffix("main", 1) == ".1"
     assert role_suffix("assist", 2) == ".2"
     assert role_suffix("admin") == ".Адм"
     assert role_suffix("trainee") == ".Стаж"
     assert role_suffix("unknown") == ""
 
-    # team_bulleted_lines (используем имена из слотов, чтобы не дёргать БД)
+    # team_bulleted_lines (SSOT из [7.1])
     lines = await team_bulleted_lines({
         "lead1": "Анна М.|10",
         "assistant1": "Равиль Ш.|12",
         "admin": "Дарья В.|14",
         "trainee": ["Стажёр X|16", "17"],
     })
-    assert lines[0].startswith("• Анна М..1")
-    assert lines[1].startswith("• Равиль Ш..1")
-    assert lines[2].startswith("• Дарья В..Адм")
+    assert lines[0] == "• Анна М..1" or lines[0] == "• Анна М.1"
+    assert lines[1].endswith(".2")
+    assert lines[2].endswith(".Адм")
     assert lines[3].endswith(".Стаж")
     assert lines[4].endswith(".Стаж")
 
@@ -979,6 +799,11 @@ async def _test():
     assert assigned_role_from_state(10, 2) == "main"
     assert assigned_role_from_state(99, 1) is None
 
+    # sticky helpers
+    set_my_games_dashboard(777, 555)
+    assert get_sticky_my_games(777) == 555
+    assert keep_for_vacuum(777) == [555]
+
     print("core/utils.py ✅ tests passed")
 
 if __name__ == "__main__":  # локальный прогон
@@ -986,6 +811,5 @@ if __name__ == "__main__":  # локальный прогон
     _a.run(_test())
 
 # История изменений:
-#   2025-08-17 — v7.1: SSOT-утилиты, резолвер чата, пылесос, совместимость legacy.
-#   2025-08-18 — v7.2: добавлены truncate/parse_players_count; расширен парсинг слотов/ролей.
-#   2025-08-18 — v7.3: добавлен assigned_role_from_state (SSOT) + тесты.
+#   2025-08-27 — v7.6: vacuum_private уважает липкий дашборд «Мои игры» (keep_for_vacuum);
+#                      добавлены SSOT-хелперы sticky; выровнены импорты под Pylance.
