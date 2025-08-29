@@ -47,6 +47,10 @@ except Exception:
         POLL_DURATION_HOURS=24,
         GAME_ROLE_MAPPING={},
         NEW_GAMES_STATUS_IDS=[],
+        BRON_STATUS_ID=None,
+        PRE_APPLICATION_STATUS_ID=None,
+        SUCCESSFUL_STATUS_ID=None,
+        POLL_WINDOW_DAYS=10,
         ACCESS={"poll": ["admin", "leader"]},
     )
 
@@ -84,10 +88,14 @@ except Exception:
             self.locked_distribution: Dict[int, Any] = {}
             # 👇 добавлено — текущий UI-контекст на пользователя
             self.ui_context: Dict[int, str] = {}
+            # 👇 буфер «новые игры» для кнопки «Новая игра» в активном цикле
+            self.pending_new_deals: List[Dict[str, Any]] = []
     state = _StateStub()  # type: ignore
 
-# История изменений: 2025-08-20 — блок выровнен; добавлен ui_context в заглушку state.
-
+# История изменений: 
+# 2025-08-20 — блок выровнен; добавлен ui_context в заглушку state.
+# 2025-08-29 — расширены заглушки settings (BRON_STATUS_ID, PRE_APPLICATION_STATUS_ID, SUCCESSFUL_STATUS_ID, POLL_WINDOW_DAYS);
+#              добавлен pending_new_deals в заглушку state.
 
 try:
     from core.utils import delete_previous_private_messages, truncate  # type: ignore
@@ -139,6 +147,7 @@ MSK_TZ = timezone("Europe/Moscow")
 
 # История изменений:
 #   • 2025-08-20 — v6.5-fix: удалён мусор в середине блока, выровнены импорты под SSOT, Pylance-типы сохранены.
+#   • 2025-08-29 — v6.5-fix2: добавлены недостающие поля настроек и состояния под «Новая игра» и окно POLL_WINDOW_DAYS.
 
 
 
@@ -1287,6 +1296,78 @@ async def _find_deal_snapshot(deal_id: int) -> Dict[str, Any]:
 # История изменений:
 # 2025-08-27 — trainee как список (мульти-стажёры); _first_empty_slot больше не возвращает принудительный prefix1;
 #              _insert_candidate... не перезаписывает занятые core-слоты (no-op), строгое соблюдение инвариантов SSOT.
+# ────────────────────────────────────────────────────────────────────
+# [2.8] FILTER HELPERS: статусы/окно дат/теги ведущих/«предварительно»
+# ────────────────────────────────────────────────────────────────────
+_TAG_RE = re.compile(r".+\.(?:1|2|Адм|Стаж)$", re.IGNORECASE)
+
+def _window_days() -> int:
+    try:
+        d = int(getattr(settings, "POLL_WINDOW_DAYS", 0) or 10)
+        return d if d > 0 else 10
+    except Exception:
+        return 10
+
+def _status_ids_for_new_games() -> Set[Any]:
+    """
+    Набор статус_id для отбора игр в опрос:
+    • settings.BRON_STATUS_ID
+    • settings.PRE_APPLICATION_STATUS_ID
+    • settings.NEW_GAMES_STATUS_IDS (массив)
+    """
+    out: Set[Any] = set()
+    for k in ("BRON_STATUS_ID", "PRE_APPLICATION_STATUS_ID"):
+        v = getattr(settings, k, None)
+        if v is not None:
+            out.add(v)
+    try:
+        arr = getattr(settings, "NEW_GAMES_STATUS_IDS", []) or []
+        for it in arr:
+            out.add(it)
+    except Exception:
+        pass
+    return out
+
+def _event_dt(d: Dict[str, Any]) -> Optional[datetime]:
+    dt = d.get("event_datetime")
+    return dt if isinstance(dt, datetime) else None
+
+def _deal_in_window(d: Dict[str, Any], now: datetime, window: datetime) -> bool:
+    dt = _event_dt(d)
+    return bool(dt and now <= dt <= window)
+
+def _has_leader_tags(d: Dict[str, Any]) -> bool:
+    """
+    Возвращает True, если среди тегов сделки есть тег ведущего:
+    «Имя Ф.1/2/Адм/Стаж». Поддерживает list[str] и list[dict{name:...}].
+    """
+    tags = d.get("tags") or []
+    names: List[str] = []
+    if isinstance(tags, list):
+        for t in tags:
+            if isinstance(t, str):
+                names.append(t)
+            elif isinstance(t, dict) and "name" in t:
+                names.append(str(t["name"]))
+    for name in names:
+        if _TAG_RE.match(name.strip()):
+            return True
+    return False
+
+def _is_preliminary_status(d: Dict[str, Any]) -> bool:
+    """
+    Определяем «Предварительная заявка»:
+    • точным равенством status_id к settings.PRE_APPLICATION_STATUS_ID (если задан),
+    • либо по эвристике имени статуса (contains 'предвар').
+    """
+    try:
+        pre_id = getattr(settings, "PRE_APPLICATION_STATUS_ID", None)
+        if pre_id is not None and d.get("status_id") == pre_id:
+            return True
+    except Exception:
+        pass
+    name = str(d.get("status_name") or d.get("pipeline_status_name") or "").lower()
+    return "предвар" in name
 
 # ════════════════════════════════════════════════════════════════════
 # [3] СОЗДАНИЕ ОПРОСА
@@ -1329,15 +1410,14 @@ async def create_poll_handler(message: types.Message) -> None:
         return
 
     # Куда публиковать опросы — единый резолвер общего чата (SSOT)
-    from core.utils import resolve_notify_chat_id  # локальный импорт, чтобы не плодить циклы
+    from core.utils import resolve_notify_chat_id  # локальный импорт
     chat_id = resolve_notify_chat_id(bot)
     if not chat_id:
         await _screen("⚠️ Чат не настроен.", kb=await get_main_menu(uid))
         with contextlib.suppress(Exception):
             await message.delete()
         return
-    # Сохраняем в state для обратной совместимости с остальными участками модуля
-    state.admin_chat_id = chat_id
+    state.admin_chat_id = chat_id  # сохранить
 
     # 2) загрузка сделок
     try:
@@ -1350,31 +1430,19 @@ async def create_poll_handler(message: types.Message) -> None:
         return
 
     # окно дат — settings.POLL_WINDOW_DAYS (фолбэк 10)
-    try:
-        _days = int(getattr(settings, "POLL_WINDOW_DAYS", 0) or 10)
-    except Exception:
-        _days = 10
-    if _days <= 0:
-        _days = 10
-
     now = datetime.now(tz=MSK_TZ)
-    window = now + timedelta(days=_days)
+    window = now + timedelta(days=_window_days())
+    valid_statuses = _status_ids_for_new_games()
 
-    def _event_dt(d: Dict[str, Any]) -> Optional[datetime]:
-        dt = d.get("event_datetime")
-        return dt if isinstance(dt, datetime) else None
-
-    # Фильтр по статусам и окну дат
-    valid_statuses = set(getattr(settings, "NEW_GAMES_STATUS_IDS", []) or [])
+    # Фильтр: только статусы Бронь/Предварительная, в окне, без тегов ведущих
     raw_deals: List[Dict[str, Any]] = []
     for d in (deals or []):
         try:
-            if d.get("status_id") not in valid_statuses:
+            if valid_statuses and d.get("status_id") not in valid_statuses:
                 continue
-            dt = _event_dt(d)
-            if not dt or dt < now or dt > window:
+            if not _deal_in_window(d, now, window):
                 continue
-            if d.get("team_leads"):  # уже укомплектована/назначена
+            if _has_leader_tags(d):  # 🚫 уже назначены
                 continue
             raw_deals.append(d)
         except Exception:
@@ -1393,12 +1461,14 @@ async def create_poll_handler(message: types.Message) -> None:
     state.distribution_cache.clear()
     state.poll_distribution.clear()
     state.deal_force_closed.clear()
-    state.confirmed_users.clear() if hasattr(state, "confirmed_users") else None
+    if hasattr(state, "confirmed_users"):  # совместимость
+        state.confirmed_users.clear()
     state.current_deal_ready.clear()
     state.all_ready_notified         = False
     state.personal_report_message_id = None
     state.coordination_cycle_active  = True
     state.force_closed               = False
+    state.pending_new_deals          = []  # обнуляем буфер «новых игр»
 
     with contextlib.suppress(Exception):
         await _refresh_menu(uid)
@@ -1417,7 +1487,8 @@ async def create_poll_handler(message: types.Message) -> None:
         return pkg, str(bonuses or "").strip()
 
     def _title(d: Dict[str, Any]) -> str:
-        return str(d.get("game_name") or d.get("name") or f"Сделка #{d.get('id')}")
+        base = str(d.get("game_name") or d.get("name") or f"Сделка #{d.get('id')}")
+        return f"{base} (предварительно)" if _is_preliminary_status(d) else base
 
     def _is_embedded(d: Dict[str, Any]) -> bool:
         src = str(d.get("source") or "").strip().lower()
@@ -1434,7 +1505,6 @@ async def create_poll_handler(message: types.Message) -> None:
     chunks: List[List[Dict[str, Any]]] = [[d] for d in embedded]
     chunks += [regular[i:i + 8] for i in range(0, len(regular), 8)] or []
 
-    # функция публикации одного чанка
     async def _post_chunk(idx: int, total: int, chunk: List[Dict[str, Any]]) -> None:
         header = f"{header_base} (Часть {idx})" if total > 1 else header_base
         opts: List[str] = []
@@ -1452,7 +1522,7 @@ async def create_poll_handler(message: types.Message) -> None:
             opts.append(truncate(" ".join(parts)))
             idx_map[i] = int(d.get("id", 0))
 
-        # служебные опции
+        # служебные опции (обязательны!)
         opts += ["🚫 Не смогу работать", "🛡️ Могу Администратором"]
 
         poll = await bot.send_poll(
@@ -1483,26 +1553,285 @@ async def create_poll_handler(message: types.Message) -> None:
     with contextlib.suppress(Exception):
         await message.delete()
 
-# История изменений:
-# 2025-08-20 — v6.6-SSOT: окно дат = settings.POLL_WINDOW_DAYS (фолбэк 10);
-#                публикация в чат через resolve_notify_chat_id();
-#                «встроенные» сделки публикуются отдельными опросами; Pylance-типы сохранены.
+# История изменений (2025-08-29):
+# • Фильтр на окно дат = POLL_WINDOW_DAYS (фолбэк 10) и статусы Бронь/Предварительная;
+# • Исключены сделки с тегами ведущих (только теги, не team_leads);
+# • Маркер «(предварительно)» в названиях в опросах.
+
+# ════════════════════════════════════════════════════════════════════
+# [3.1] «Новая игра» в активном цикле → отдельный опрос «Срочные игры»
+# ════════════════════════════════════════════════════════════════════
+
+async def _find_pending_new_deals() -> List[Dict[str, Any]]:
+    """
+    Ищем новые подходящие сделки в окне дат, которых ещё нет в state.current_poll_deals.
+    Учитываем статусы Бронь/Предварительная и отсутствие тегов ведущих.
+    """
+    if not state.coordination_cycle_active:
+        return []
+
+    try:
+        deals = await get_amocrm_deals()
+    except Exception as e:
+        logger.debug("[new_game] get_amocrm_deals failed: %s", e)
+        return []
+
+    now = datetime.now(tz=MSK_TZ)
+    window = now + timedelta(days=_window_days())
+    valid_statuses = _status_ids_for_new_games()
+    existing = {int(d.get("id", 0)) for d in (state.current_poll_deals or [])}
+    out: List[Dict[str, Any]] = []
+    for d in (deals or []):
+        try:
+            did = int(d.get("id", 0))
+            if not did or did in existing:
+                continue
+            if valid_statuses and d.get("status_id") not in valid_statuses:
+                continue
+            if not _deal_in_window(d, now, window):
+                continue
+            if _has_leader_tags(d):
+                continue
+            out.append(d)
+        except Exception:
+            continue
+    return out
+
+@router.callback_query(lambda c: c.data == "poll_new_game")
+async def poll_new_game_handler(callback: types.CallbackQuery) -> None:
+    """
+    Публикует отдельный опрос «🚨 Срочные игры» по накопленным pending_new_deals.
+    После публикации пополняет state.current_poll_deals и очищает pending_new_deals.
+    """
+    with contextlib.suppress(Exception):
+        await callback.answer()
+
+    bot = Bot.get_current()
+    chat_id = state.admin_chat_id or (resolve_notify_chat_id(bot) if callable(resolve_notify_chat_id) else None)  # type: ignore[arg-type]
+    if not chat_id:
+        with contextlib.suppress(Exception):
+            await callback.answer("⚠️ Чат не настроен.", show_alert=True)
+        return
+
+    # Обновим буфер перед отправкой (на случай, если он пуст, но уже появились новые)
+    try:
+        fresh = await _find_pending_new_deals()
+    except Exception:
+        fresh = []
+    state.pending_new_deals = list(fresh or [])
+
+    if not state.pending_new_deals:
+        with contextlib.suppress(Exception):
+            await callback.answer("Новых игр нет.", show_alert=True)
+        return
+
+    deals_chunk = state.pending_new_deals[:8]  # на всякий случай ограничим одним сообщением
+    opts: List[str] = []
+    idx_map: Dict[int, int] = {}
+
+    def _title(d: Dict[str, Any]) -> str:
+        base = str(d.get("game_name") or d.get("name") or f"Сделка #{d.get('id')}")
+        return f"{base} (предварительно)" if _is_preliminary_status(d) else base
+
+    def _deal_dt_parts(d: Dict[str, Any]) -> Tuple[str, str]:
+        dt = d.get("event_datetime")
+        date_s = dt.strftime("%d.%m") if isinstance(dt, datetime) else str(d.get("event_date") or "—")
+        et = str(d.get("event_time") or "").strip()
+        time_s = et if et else (dt.strftime("%H:%M") if isinstance(dt, datetime) else str(d.get("event_time") or "—"))
+        return date_s, time_s
+
+    def _deal_extras(d: Dict[str, Any]) -> Tuple[str, str]:
+        pkg = str(d.get("package") or "").strip()
+        bonuses = d.get("bonuses", d.get("bonus", d.get("extra_bonuses", d.get("extra_services"))))
+        return pkg, str(bonuses or "").strip()
+
+    for i, d in enumerate(deals_chunk):
+        title = _title(d)
+        date_s, time_s = _deal_dt_parts(d)
+        pkg_s, bonus_s = _deal_extras(d)
+        parts = [f"🎉 {title} — {date_s} {time_s}"]
+        if pkg_s:
+            parts.append(pkg_s)
+        if bonus_s:
+            parts.append(bonus_s)
+        opts.append(truncate(" ".join(parts)))
+        idx_map[i] = int(d.get("id", 0))
+
+    opts += ["🚫 Не смогу работать", "🛡️ Могу Администратором"]
+
+    poll = await bot.send_poll(
+        chat_id,
+        "🚨 Срочные игры",
+        opts,
+        is_anonymous=False,
+        allows_multiple_answers=True,
+    )
+    state.responses[poll.poll.id] = {
+        "deals": {int(d.get("id", 0)): [] for d in deals_chunk},
+        "not_available": [],
+        "admin_available": [],
+        "deal_indices": idx_map,
+    }
+
+    # Добавим эти сделки в текущий цикл и очистим буфер «новых»
+    existing_ids = {int(d.get("id", 0)) for d in (state.current_poll_deals or [])}
+    state.current_poll_deals.extend([d for d in deals_chunk if int(d.get("id", 0)) not in existing_ids])
+    state.pending_new_deals = []
+
+    # Перерисуем отчёт
+    await _sync_leader_report()
+
+    with contextlib.suppress(Exception):
+        await callback.answer("Опрос по срочным играм отправлен.", show_alert=False)
+
+# История изменений (2025-08-29):
+# • Реализована кнопка «Новая игра» → отдельный опрос «Срочные игры» + включение игр в текущий цикл.
+
 
 
 # ════════════════════════════════════════════════════════════════════
 # [4] ОТЧЁТ ЛИДЕРУ / ПРИЁМ ОТВЕТОВ — редактирование «на месте»
-# Версия 6.6 · 2025-08-20 (выровнено под SSOT; дубль хендлеров удалён)
+# Версия 6.7 · 2025-08-29 (выровнено под SSOT; «Новая игра» + срочный опрос)
 # ────────────────────────────────────────────────────────────────────
 # • Используем _edit_or_send_report() из [0.96] → отчёт не копится в ЛС.
 # • Хендлер "📊 Отчёт по опросу" и _sync_leader_report уже определены в [0.96].
-# • Здесь оставлены только построитель отчёта/клавиатуры и приём ответов.
+# • Здесь: построитель отчёта/клавиатуры, приём ответов и логика «Новых игр».
 # ════════════════════════════════════════════════════════════════════
+
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from typing import Any, Dict, List, Optional, Set, Tuple
+from datetime import datetime, timedelta
+import asyncio
+import logging
+import re
+
+logger = logging.getLogger(__name__)
+
+# ────────────────────────────────────────────────────────────────────
+# ВСПОМОГАТЕЛЬНЫЕ ХЕЛПЕРЫ ДЛЯ «НОВЫХ ИГР» (SSOT, безопасные фолбэки)
+# ────────────────────────────────────────────────────────────────────
+
+def _event_dt(d: Dict[str, Any]) -> Optional[datetime]:
+    dt = d.get("event_datetime")
+    return dt if isinstance(dt, datetime) else None
+
+def _is_within_window(dt: Optional[datetime]) -> bool:
+    try:
+        days = int(getattr(settings, "POLL_WINDOW_DAYS", 0) or 10)
+    except Exception:
+        days = 10
+    if days <= 0:
+        days = 10
+    if not isinstance(dt, datetime):
+        return False
+    now = datetime.now(tz=MSK_TZ)
+    return now <= dt <= (now + timedelta(days=days))
+
+def _is_status(d: Dict[str, Any], status_id: Optional[int]) -> bool:
+    try:
+        return int(d.get("status_id")) == int(status_id) if status_id is not None else False
+    except Exception:
+        return False
+
+def _is_preliminary_status(d: Dict[str, Any]) -> bool:
+    return _is_status(d, getattr(settings, "PRE_APPLICATION_STATUS_ID", None))
+
+def _is_bron_status(d: Dict[str, Any]) -> bool:
+    return _is_status(d, getattr(settings, "BRON_STATUS_ID", None))
+
+_ROLE_TAG_RE = re.compile(r"\.(\d+|Адм)\b", re.IGNORECASE | re.UNICODE)
+
+def _has_leader_tags(d: Dict[str, Any]) -> bool:
+    """
+    Признак наличия проставленных «ролевых» тегов в сделке AmoCRM.
+    Ожидаемые примеры: 'Иван П.1', 'Пётр С.2', 'Анна К.Адм'.
+    """
+    tags = d.get("tags") or []
+    if not isinstance(tags, (list, tuple)):
+        return False
+    for t in tags:
+        s = str(t or "")
+        if _ROLE_TAG_RE.search(s):
+            return True
+    return False
+
+def _deal_id_set(arr: List[Dict[str, Any]]) -> Set[int]:
+    out: Set[int] = set()
+    for d in arr or []:
+        try:
+            did = int(d.get("id", 0))
+            if did:
+                out.add(did)
+        except Exception:
+            continue
+    return out
+
+async def _refresh_pending_new_games() -> int:
+    """
+    Обновляет буфер state.pending_new_deals в активном цикле:
+    • статусы: «Бронь» или «Предварительная заявка» (из settings);
+    • дата игры в ближайшем окне settings.POLL_WINDOW_DAYS (фолбэк 10);
+    • нет ролевых тегов (ведущие не проставлены);
+    • не участвуют в текущем опросе и не залочены/не исключены.
+    Возвращает количество игр в буфере после обновления.
+    """
+    if not getattr(state, "coordination_cycle_active", False):
+        return 0
+
+    try:
+        deals = await get_amocrm_deals()
+    except Exception as e:
+        logger.debug("[new_games] Amo fetch failed: %s", e)
+        return len(getattr(state, "pending_new_deals", []) or [])
+
+    current_ids = _deal_id_set(getattr(state, "current_poll_deals", []) or [])
+    locked_ids  = set((getattr(state, "locked_distribution", {}) or {}).keys())
+    forced_off  = getattr(state, "deal_force_closed", set()) or set()
+
+    # Сбор кандидатов
+    candidates: List[Dict[str, Any]] = []
+    for d in deals or []:
+        try:
+            did = int(d.get("id", 0))
+            if not did or did in current_ids or did in locked_ids or did in forced_off:
+                continue
+            dt = _event_dt(d)
+            if not _is_within_window(dt):
+                continue
+            if not (_is_bron_status(d) or _is_preliminary_status(d)):
+                continue
+            if _has_leader_tags(d):
+                continue
+            candidates.append(d)
+        except Exception:
+            continue
+
+    # Текущий буфер и уникализация по id
+    pending = getattr(state, "pending_new_deals", []) or []
+    kept: Dict[int, Dict[str, Any]] = {int(x.get("id", 0)): x for x in pending if int(x.get("id", 0))}
+    for d in candidates:
+        did = int(d.get("id", 0))
+        if did and did not in kept:
+            kept[did] = d
+
+    new_list = list(kept.values())
+    setattr(state, "pending_new_deals", new_list)
+    logger.debug("[new_games] pending=%d (added=%d)", len(new_list), max(0, len(new_list) - len(pending)))
+    return len(new_list)
+
+# ────────────────────────────────────────────────────────────────────
+# ПОСТРОИТЕЛЬ ОТЧЁТА/КЛАВИАТУРЫ
+# ────────────────────────────────────────────────────────────────────
 
 def _merge_keyboards(k1: InlineKeyboardMarkup, k2: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[*(k1.inline_keyboard or []), *(k2.inline_keyboard or [])])
 
 async def generate_poll_report() -> str:
-    """Короткий заголовок отчёта; галочки/кнопки — в клавиатуре."""
+    """
+    Короткий заголовок отчёта; галочки/кнопки — в клавиатуре.
+    Побочно: освежаем буфер «Новые игры», чтобы кнопка появлялась автоматически.
+    """
+    await _refresh_pending_new_games()
     return "📊 Выберите игру, чтобы открыть детали."
 
 def _counts_ready_for_deal(deal: Dict[str, Any]) -> Tuple[bool, Dict[str, int]]:
@@ -1549,11 +1878,25 @@ def _build_report_keyboard() -> InlineKeyboardMarkup:
     """
     Список игр: статус ✅/❌ + название + дата/время.
     Справа: «👍 Утвердить» для готовых, «✅ Утверждено» для зафиксированных.
+    Вверху: «🆕 Новая игра», если есть заявки в окне дат без тегов (буфер pending_new_deals).
     Внизу: «Утвердить все», если есть готовые незалоченные.
     """
     rows: List[List[InlineKeyboardButton]] = []
     any_ready_unlocked = False
     locked_map = (getattr(state, "locked_distribution", {}) or {})
+
+    # Кнопка «Новая игра»
+    try:
+        pending_cnt = len(getattr(state, "pending_new_deals", []) or [])
+        if getattr(state, "coordination_cycle_active", False) and pending_cnt > 0:
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"🆕 Новая игра ({pending_cnt})",
+                    callback_data="poll_new_game"
+                )
+            ])
+    except Exception:
+        pass  # безопасная деградация — скрываем кнопку
 
     for d in (state.current_poll_deals or []):
         did = int(d.get("id") or 0)
@@ -1561,7 +1904,14 @@ def _build_report_keyboard() -> InlineKeyboardMarkup:
             continue
 
         ready, _ = _counts_ready_for_deal(d)
-        name = str(d.get("game_name") or d.get("name") or "Игра")
+
+        base_name = str(d.get("game_name") or d.get("name") or "Игра")
+        # пометка «(предварительно)» для статуса «Предварительная заявка»
+        try:
+            name = f"{base_name} (предварительно)" if _is_preliminary_status(d) else base_name
+        except Exception:
+            name = base_name
+
         dt = d.get("event_datetime")
         date_s = dt.strftime("%d.%m") if hasattr(dt, "strftime") else str(d.get("event_date") or "—")
         time_s = str(d.get("event_time") or "—")
@@ -1591,7 +1941,97 @@ def _build_report_keyboard() -> InlineKeyboardMarkup:
     except Exception:
         pass
 
-    return InlineKeyboardMarkup(inline_keyboard=rows if rows else [[InlineKeyboardButton(text="Обновить", callback_data="poll_back_to_games_list")]])
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows if rows else [[InlineKeyboardButton(text="Обновить", callback_data="poll_back_to_games_list")]]
+    )
+
+# ────────────────────────────────────────────────────────────────────
+# ХЕНДЛЕР СРOЧНОГО ОПРОСА ПО КНОПКЕ «Новая игра»
+# ────────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "poll_new_game")
+async def _cb_post_new_games_poll(callback: types.CallbackQuery) -> None:
+    """
+    Публикует отдельный опрос «Срочные игры» по pending_new_deals,
+    добавляет игры в текущий дашборд опроса и очищает буфер.
+    """
+    with contextlib.suppress(Exception):
+        await callback.answer()
+
+    pending = list(getattr(state, "pending_new_deals", []) or [])
+    if not pending:
+        # возможно, уже кто-то опубликовал — просто синхронизируем отчёт
+        await _sync_leader_report()
+        return
+
+    # Куда публиковать — общий рабочий чат
+    bot = Bot.get_current()
+    chat_id = resolve_notify_chat_id(bot)  # из core.utils (импортирован выше в модуле)
+    if not chat_id:
+        with contextlib.suppress(Exception):
+            await callback.answer("⚠️ Не настроен чат для опросов.", show_alert=True)
+        return
+
+    # Формирование опций опроса
+    def _deal_dt_parts(d: Dict[str, Any]) -> Tuple[str, str]:
+        dt = d.get("event_datetime")
+        date_s = dt.strftime("%d.%m") if isinstance(dt, datetime) else str(d.get("event_date") or "—")
+        et = str(d.get("event_time") or "").strip()
+        time_s = et if et else (dt.strftime("%H:%M") if isinstance(dt, datetime) else str(d.get("event_time") or "—"))
+        return date_s, time_s
+
+    def _title(d: Dict[str, Any]) -> str:
+        return str(d.get("game_name") or d.get("name") or f"Сделка #{d.get('id')}")
+
+    opts: List[str] = []
+    idx_map: Dict[int, int] = {}
+
+    for i, d in enumerate(pending):
+        title = _title(d)
+        date_s, time_s = _deal_dt_parts(d)
+        parts: List[str] = [f"🎉 {title} — {date_s} {time_s}"]
+        pkg = str(d.get("package") or "").strip()
+        if pkg:
+            parts.append(pkg)
+        opts.append(truncate(" ".join(parts)))
+        idx_map[i] = int(d.get("id", 0))
+
+    # обязательные опции
+    opts += ["🚫 Не смогу работать", "🛡️ Могу Администратором"]
+
+    # Отправляем опрос «Срочные игры»
+    poll = await bot.send_poll(
+        chat_id,
+        "🚨 Срочные игры",
+        opts,
+        is_anonymous=False,
+        allows_multiple_answers=True,
+    )
+    state.responses[poll.poll.id] = {
+        "deals": {int(d.get("id", 0)): [] for d in pending},
+        "not_available": [],
+        "admin_available": [],
+        "deal_indices": idx_map,
+    }
+    logger.debug("[new_games] urgent poll sent id=%s, deals=%s", poll.poll.id, list(idx_map.values()))
+
+    # Добавляем в активный цикл, очищаем буфер, обновляем отчёт
+    # (без дублей по id)
+    current = getattr(state, "current_poll_deals", []) or []
+    have_ids = _deal_id_set(current)
+    for d in pending:
+        did = int(d.get("id", 0))
+        if did and did not in have_ids:
+            current.append(d)
+            have_ids.add(did)
+    state.current_poll_deals = current
+    state.pending_new_deals = []
+
+    await _sync_leader_report()
+
+# ────────────────────────────────────────────────────────────────────
+# ПРИЁМ ОТВЕТОВ ПОЛЛА (без изменений логики распределения)
+# ────────────────────────────────────────────────────────────────────
 
 @router.poll_answer()
 async def handle_poll_answer(event: types.PollAnswer) -> None:
@@ -1664,16 +2104,11 @@ async def handle_poll_answer(event: types.PollAnswer) -> None:
             new_admin_flag = True
 
     # --- 3) определить область пересчёта
-    #    • всегда пересчитываем снятые и новые сделки;
-    #    • если изменился админ-флаг (поставили или сняли) — пересчитываем все игры цикла.
     impacted: Set[int] = set(prev_impacted) | set(new_impacted)
     admin_flag_changed: bool = (new_admin_flag != prev_admin_flag)
 
     if admin_flag_changed:
-        # все текущие игры цикла
         impacted = {int(d.get("id", 0)) for d in (state.current_poll_deals or []) if int(d.get("id", 0))}
-    # если impacted пуст (например, пользователь снял ВСЕ галочки, кроме «не смогу»),
-    # но ранее был где-то отмечен — пересчитаем хотя бы прежние
     if not impacted and prev_impacted:
         impacted = set(prev_impacted)
 
@@ -1692,9 +2127,12 @@ async def handle_poll_answer(event: types.PollAnswer) -> None:
         "[answer] uid=%d prev_impacted=%s new_impacted=%s admin_changed=%s → recomputed=%s",
         uid, sorted(prev_impacted), sorted(new_impacted), admin_flag_changed, sorted(impacted),
     )
+
 # История изменений:
 # 2025-08-26 — при отмене голоса удаляем пользователя из кэша и пересчитываем затронутые сделки;
-#               изменение флага «🛡️ Админом» триггерит пересчёт всех игр цикла.
+# 2025-08-29 — добавлен _refresh_pending_new_games() и кнопка «🆕 Новая игра»;
+#              generate_poll_report теперь освежает буфер «новых игр»;
+#              обработчик poll_new_game публикует «🚨 Срочные игры» и добавляет сделки в активный цикл.
 
 
 
@@ -2017,44 +2455,81 @@ __all__ = [
     "finish_if_all_deals_completed",
 ]
 
-
 # ███ [99] _TEST
 # --------------------------------------------------------------------
+
 async def _test() -> None:
     """
     Smoke-тест: проверяем _sync_leader_report + «пылесос» поверх заглушек.
+    Тест не требует реального Telegram API:
+    • Подменяем Bot.get_current() на заглушку с send/edit/delete.
+    • Глушим delete_previous_private_messages и vacuum_private.
+    • Подменяем generate_poll_report и _build_report_keyboard.
     """
     class _Msg:
         def __init__(self, mid: int) -> None:
             self.message_id = mid
 
     uid = 777
+    # подготовка состояния
     state.current_poll_leader = uid
     state.coordination_cycle_active = True
     state.current_poll_deals = []
     state.responses = {}
+    state.last_user_messages.setdefault(uid, [])
     state.last_user_messages[uid] = [_Msg(10), _Msg(11)]
     state.personal_report_message_id = None
 
-    async def _fake_report() -> str: return "⚠️ Нет активных опросов."
-    def _fake_kb() -> InlineKeyboardMarkup: return InlineKeyboardMarkup(inline_keyboard=[])
+    async def _fake_report() -> str:
+        return "⚠️ Нет активных опросов."
+
+    def _fake_kb() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[])
+
     globals()["generate_poll_report"] = _fake_report
     globals()["_build_report_keyboard"] = _fake_kb
 
-    class _Bot:
-        async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None):
-            class _S: message_id = 99
+    class _DummyBot:
+        async def send_message(self, chat_id: int, text: str, parse_mode: Optional[str] = None,
+                               reply_markup: Optional[InlineKeyboardMarkup] = None, disable_web_page_preview: Optional[bool] = None):
+            class _S:
+                message_id = 99
             return _S()
-    Bot.set_current(_Bot())  # type: ignore
 
-    async def _fake_delete(*args, **kwargs): return None
+        async def edit_message_text(self, text: str, chat_id: int, message_id: int, parse_mode: Optional[str] = None,
+                                    reply_markup: Optional[InlineKeyboardMarkup] = None, disable_web_page_preview: Optional[bool] = None) -> None:
+            return None
+
+        async def delete_message(self, chat_id: int, message_id: int) -> None:
+            return None
+
+    # Подменяем Bot.get_current() на заглушку
+    orig_get = getattr(Bot, "get_current")
+    setattr(Bot, "get_current", staticmethod(lambda: _DummyBot()))  # type: ignore[method-assign]
+
+    # Глушим побочные эффекты
+    async def _fake_delete(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def _fake_vacuum(*args: Any, **kwargs: Any) -> None:
+        return None
+
     globals()["delete_previous_private_messages"] = _fake_delete
+    globals()["vacuum_private"] = _fake_vacuum
 
-    await _sync_leader_report()
-    assert state.personal_report_message_id == 99
-    assert [m.message_id for m in state.last_user_messages[uid]] == [99]
-    print("handlers/polls_lifecycle ✅ smoke")
+    try:
+        await _sync_leader_report()
+        assert state.personal_report_message_id == 99
+        assert [m.message_id for m in state.last_user_messages[uid]] == [99]
+        print("handlers/polls_lifecycle ✅ smoke")
+    finally:
+        # Восстановим оригинальный резолвер бота
+        setattr(Bot, "get_current", orig_get)  # type: ignore[misc]
 
 if __name__ == "__main__":
     import asyncio as _a
     _a.run(_test())
+
+# История изменений:
+# 2025-08-29 — усилен dummy-бот (send/edit/delete), добавлен no-op vacuum_private;
+#              выровнено под SSOT/фиксы Pylance, стабильная подмена Bot.get_current().

@@ -1252,33 +1252,61 @@ async def _soft_redraw_my_games(uid: int) -> None:
 # ════════════════════════════════════════════════════════════════════
 # [4] ВЫБОРКА ИГР
 # ════════════════════════════════════════════════════════════════════
+from typing import Any, Dict, List, Optional, Set
+import logging
+
+from core.utils import assigned_role_from_state  # SSOT: определение роли из state
+
+
+def _success_status_id() -> str:
+    """
+    Безопасно возвращает ID статуса «Завершение сделки», если он доступен в глобалах.
+    Поддерживает возможные варианты имен, чтобы не ловить NameError/Pylance.
+    """
+    for key in ("SUCCESSFUL_STATUS_ID", "OK_STATUS_ID", "SUCCESS_STATUS_ID"):
+        val = globals().get(key)
+        if val:
+            return str(val)
+    return ""
+
+
 def _wanted_status(deal: Dict) -> bool:
     """
     Игра попадает в «Мои игры», если её статус один из допустимых:
-    «Бронь» (BRON_STATUS_ID), «Предварительная заявка» (PRELIM_STATUS_ID/по названию)
-    или «Завершение сделки» (OK_STATUS_ID).
-    Если статус не указан/не распознан — считаем «Бронь» как безопасный фолбэк.
+    • «Бронь» (BRON_STATUS_ID),
+    • «Предварительная заявка» (PRELIM_STATUS_ID или по названию),
+    • «Завершение сделки» (успех: по ID из _success_status_id() или по названию).
+
+    Если статус не указан/не распознан — применяем безопасный фолбэк: считаем «Бронь».
     """
     try:
-        sid = _safe_status_id(deal)
+        sid_any = _safe_status_id(deal)  # определена выше в файле
     except Exception:
-        sid = None
-    sid = sid or str(BRON_STATUS_ID)
+        sid_any = None
 
-    # поддержка «Предварительной заявки»: по ID (если определён глобально) и по названию
+    sid = str(sid_any or globals().get("BRON_STATUS_ID", ""))  # «Бронь» как фолбэк
     prelim_id = str(globals().get("PRELIM_STATUS_ID", "") or "")
+    success_id = _success_status_id()
+
     name = str(deal.get("status_name") or deal.get("status") or "").strip().lower()
 
+    prelim_names = {"предварительная заявка", "предварительно", "предварит.", "предварит", "prelim"}
+    success_names = {"завершение сделки", "успешно реализовано", "успешно", "завершена"}
+
     # допустимые статусы
-    if sid in {str(BRON_STATUS_ID), str(OK_STATUS_ID)}:
+    if sid == str(globals().get("BRON_STATUS_ID", "")):
+        return True
+    if success_id and sid == success_id:
         return True
     if prelim_id and sid == prelim_id:
         return True
-    if name in {"предварительная заявка", "предварительно", "предварит."}:
+    if name in prelim_names:
+        return True
+    if name in success_names:
         return True
 
     # фолбэк: «неизвестный» считаем как «Бронь»
-    return sid == str(BRON_STATUS_ID)
+    return sid == str(globals().get("BRON_STATUS_ID", ""))
 
 
 def _assigned_deal_ids_from_locked(uid: int) -> Set[int]:
@@ -1289,7 +1317,7 @@ def _assigned_deal_ids_from_locked(uid: int) -> Set[int]:
     Поддерживаем строку и коллекции (list/tuple) значений слотов.
     """
     out: Set[int] = set()
-    locked = (getattr(state, "locked_distribution", {}) or {})
+    locked = (getattr(state, "locked_distribution", {}) or {})  # state доступен в файле
     for did_key, dist in locked.items():
         if not isinstance(dist, dict):
             continue
@@ -1303,7 +1331,7 @@ def _assigned_deal_ids_from_locked(uid: int) -> Set[int]:
             if k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"}:
                 # значение слота может быть строкой или списком ярлыков
                 if isinstance(v, str):
-                    if _label_belongs_to_uid(v, uid):
+                    if _label_belongs_to_uid(v, uid):  # определена выше
                         out.add(did)
                         break
                 elif isinstance(v, (list, tuple)):
@@ -1316,12 +1344,13 @@ def _assigned_deal_ids_from_locked(uid: int) -> Set[int]:
 def _assigned_role_via_locked(uid: int, deal_id: int) -> Optional[str]:
     """
     Роль пользователя в сделке по зафиксированным слотам:
-    1) сначала стандартный способ (_assigned_role_from_state),
+    1) сначала SSOT-хелпер assigned_role_from_state(uid, deal_id),
     2) затем фолбэк по ярлыку слота (когда в значении нет «|uid», а также при списках).
+
     Возвращает: 'main' | 'assist' | 'admin' | 'trainee' | None
     """
     try:
-        role = _assigned_role_from_state(uid, deal_id)
+        role = assigned_role_from_state(uid, deal_id)
         if role:
             return role
     except Exception:
@@ -1442,7 +1471,7 @@ def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
                 "tags": details.get("tags") or [],
                 "comment": details.get("comment") or "",
                 # статус обязателен — по умолчанию считаем «Бронь», чтобы пройти фильтр
-                "status_id": str(BRON_STATUS_ID),
+                "status_id": str(globals().get("BRON_STATUS_ID", "")),
             }
 
         # Нормализуем критичные поля и добавляем, соблюдая уникальность id
@@ -1460,9 +1489,11 @@ def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
 def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
     """
     Итоговая выборка для «Мои игры»:
-      • статус «Бронь» / «Предварительная заявка» / «Завершение сделки» (неизвестный → «Бронь»);
+      • статус «Бронь» / «Предварительная заявка» / «Завершение сделки»
+        (неизвестный → «Бронь»);
       • пользователь назначен (в первую очередь — по locked_distribution);
       • + дополнение из локального кэша, если CRM вернул пусто.
+
     Сильная гарантия отсутствия дублей: внутри — индекс by_id и фильтр seen.
     """
     all_deals = _augment_with_locked(uid, list(all_deals or []))
@@ -1470,10 +1501,20 @@ def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
     out: List[Dict] = []
     seen: Set[int] = set()
 
+    def _to_epoch(dt_obj):
+        try:
+            if dt_obj is None:
+                return float("inf")
+            if getattr(dt_obj, "tzinfo", None):
+                return dt_obj.timestamp()
+            # локализуем «наивное» время в МСК для стабильной сортировки
+            return dt_obj.replace(tzinfo=MSK_TZ).timestamp()
+        except Exception:
+            return float("inf")
+
     def _key(d: Dict):
         dt = _safe_event_dt(d)
-        from datetime import datetime as _dt
-        return (dt is None, dt or _dt.max)
+        return (dt is None, _to_epoch(dt))
 
     for d in sorted(all_deals, key=_key):
         try:
@@ -1489,7 +1530,7 @@ def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
         assigned_role = _assigned_role_via_locked(uid, did)
         assigned_by_locked = assigned_role is not None
 
-        # Дополнительные источники (совместимость)
+        # Дополнительные источники (совместимость со старыми индексами/тегами)
         assigned_legacy = _is_user_assigned_legacy(uid, d) or _has_confirmation_tag(d, uid)
         try:
             aidx: Dict[int, Set[int]] = getattr(state, "assigned_index", {}) or {}
@@ -1505,17 +1546,15 @@ def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
 
     return out
 
+
 # История изменений [4]:
-# • 2025-08-24 — усилена дедупликация и поддержка коллекций в слотах;
-#                это устраняет «дубли карточек», из-за которых оставались
-#                хвосты деталей и казалось, будто пылесос не работает.
-# • 2025-08-19 — видимость «Моих игр» выровнена под слоты без |uid:
-#                _assigned_deal_ids_from_locked использует _label_belongs_to_uid;
-#                добавлен отладочный лог augment_with_locked;
-#                + новый фолбэк _assigned_role_via_locked (учёт ярлыка без |uid)
-#                  и использование его в _visible_deals_for_user.
-# • 2025-08-19 — добавлена поддержка статуса «Предварительная заявка»:
-#                распознаётся по PRELIM_STATUS_ID (если определён) и по названию.
+# • 2025-08-29 — безопасная сортировка по timestamp (naive/aware совместимо; фиксы Pylance/Runtime).
+# • 2025-08-29 — фиксы Pylance: убрана прямая ссылка на SUCCESSFUL_STATUS_ID,
+#                добавлен _success_status_id() и распознавание по названию.
+# • 2025-08-24 — усилена дедупликация и поддержка коллекций в слотах (устранение дублей карточек).
+# • 2025-08-19 — учёт слотов без «|uid» + фолбэк по ярлыку; добавлен отладочный лог augment_with_locked.
+# • 2025-08-19 — поддержка статуса «Предварительная заявка» (по ID и по названию).
+
 
 
 
@@ -1527,16 +1566,15 @@ def _my_games(uid: int, deals: List[Dict]) -> List[Dict]:
     return _visible_deals_for_user(uid, deals)
 
 # ███ [5] DASHBOARD / DETAILS — липкий дашборд + пылесос как в отчёте
-# Версия 5.7.2 · 2025-08-28
+# Версия 5.7.3 · 2025-08-29
 # Изменения:
 # • Добавлен sticky-слот дашборда «Мои игры» (state.my_games_dashboard).
 # • _send_dashboard теперь редактирует существующее сообщение (edit_message_text/…),
 #   а не удаляет/создаёт заново. Это устраняет «пустые оболочки» в ленте.
 # • _vacuum_safe сохраняет sticky и мягко чистит хвосты деталей (как в отчёте).
 # • Добавлен update_my_games_buttons_only — «тихая» перекраска кнопок без текста.
-# • Переименован помощник разметки на _build_dashboard_kb_v2 для избежания пересечений имён.
-# • ФИКС: _build_dashboard_kb_v2 больше не зависит от внешних make_my_games_*;
-#   кнопки «✅ Подтвердить»/«🔁 Замена» строятся локально по SSOT (как в [3.4]).
+# • _build_dashboard_kb_v2 не зависит от внешних make_my_games_*; SSOT-логика внутри.
+# • NEW: безопасная сортировка по timestamp (совместима с naive/aware datetime).
 import logging
 from contextlib import suppress
 from typing import Any, Dict, List, Optional, TYPE_CHECKING, Callable, cast
@@ -1755,10 +1793,19 @@ async def _send_dashboard(uid: int, deals: List[Dict[str, Any]]) -> None:
     """
     bot = Bot.get_current()
 
-    # сортировка карточек
+    # сортировка карточек: по времени (без сравнения naive/aware datetime)
     def _key(d: Dict[str, Any]) -> tuple:
         dt = _safe_event_dt(d)
-        return (dt is None, dt or datetime.max)
+        try:
+            if dt is None:
+                ts = float("inf")
+            elif getattr(dt, "tzinfo", None):
+                ts = dt.timestamp()
+            else:
+                ts = dt.replace(tzinfo=MSK_TZ).timestamp()
+        except Exception:
+            ts = float("inf")
+        return (dt is None, ts)
 
     deals_sorted = sorted(list(deals or []), key=_key)
 
@@ -1853,6 +1900,7 @@ async def _send_details(uid: int, deal: Dict[str, Any]) -> None:
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ Назад к списку", callback_data="mygames_back")
     await bot.send_message(int(uid), text, reply_markup=kb.as_markup())
+
 
 
 
@@ -2207,11 +2255,11 @@ async def on_report_text(message: types.Message) -> None:
 
 
 # [7.4] POST-CONFIRM UI HOOK (no callback intercept)
-# Версия 7.4.3 · 2025-08-28
+# Версия 7.4.4 · 2025-08-29
 # Изменения:
 # • УБРАНЫ любые локальные обработчики CONFIRM_PREFIX (чтобы не перехватывать подтверждение).
 # • Добавлен безопасный UI-патч, который можно вызвать ИЗ handlers/confirmations.py.
-# • «Детали»: кнопка мгновенно меняется на «🔄 Попросить замену»; «Дашборд»: мягкий редрав.
+# • «Детали»: кнопка мгновенно меняется на «🔁 Замена»; «Дашборд»: мягкий редрав.
 from typing import Callable, Optional, cast, TYPE_CHECKING
 from contextlib import suppress
 
@@ -2229,7 +2277,7 @@ async def mygames_after_confirm_ui_patch(
 ) -> None:
     """
     Мягкий локальный патч UI после подтверждения (по желанию вызывающей стороны):
-      • если подтверждение пришло из ДЕТАЛЕЙ — меняем кнопку на «🔄 Попросить замену»;
+      • если подтверждение пришло из ДЕТАЛЕЙ — меняем кнопку на «🔁 Замена»;
       • если подтверждение пришло из ДАШБОРДА — НЕ редактируем его клавиатуру,
         а выполняем мягкий редрав всего дашборда;
       • отмечаем локально confirmed (для мгновенного отображения) и делаем мягкий редрав списка.
@@ -2255,12 +2303,12 @@ async def mygames_after_confirm_ui_patch(
         pc.setdefault("confirmed", {}).setdefault(str(role), set()).add(int(uid))
 
         # 3) Ветвление по контексту:
-        #    — если ДЕТАЛИ: редактируем inline-клавиатуру конкретного сообщения (кнопка «Замена»),
+        #    — если ДЕТАЛИ: изменить кнопку на «🔁 Замена»,
         #    — если ДАШБОРД: не трогаем клавиатуру — делаем мягкий редрав целиком.
         if not is_dashboard_msg:
-            # Контекст ДЕТАЛЕЙ: изменить кнопку на «🔄 Попросить замену»
+            # Контекст ДЕТАЛЕЙ: изменить кнопку на «🔁 Замена»
             kb = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="🔄 Попросить замену",
+                inline_keyboard=[[InlineKeyboardButton(text="🔁 Замена",
                                                       callback_data=f"{SWAP_PREFIX}{int(deal_id)}")]]
             )
             target = None
@@ -2281,6 +2329,7 @@ async def mygames_after_confirm_ui_patch(
     except Exception:
         # UI-патч не критичен, ошибки гасим.
         pass
+
 
 
 # ════════════════════════════════════════════════════════════════════
