@@ -181,8 +181,12 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
       • кнопка «📝 Написать отчёт» — после наступления даты и времени игры.
       • повторно кнопку подтверждения не показываем, если подтверждение уже учтено локально/по тегам.
 
-    ФИКС «пылесоса»: все отправленные сообщения аккумулируются и сохраняются
-    в state.last_user_messages[uid] — следующий vacuum их удалит гарантированно.
+    ФИКС «пылесоса»: перед рендером деталей мягко удаляем sticky-дашборд (vacuum с ignore_sticky=True),
+    затем все отправленные сообщения аккумулируются и сохраняются в state.last_user_messages[uid] — 
+    следующий vacuum их удалит гарантированно.
+
+    Изм. 2025-08-29 — корректное время: приоритет event_time (нормализация до HH:MM), 
+    затем — время из event_datetime (игнор «00:00»), иначе «—».
     """
     # — фильтр против автоперехода из дашборда — только details
     if not str(callback.data).startswith("mygame_details_"):
@@ -192,6 +196,15 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
 
     bot = Bot.get_current()
     uid = callback.from_user.id
+
+    # Предварительная уборка sticky-дашборда — чтобы он не «улетал вверх»
+    with contextlib.suppress(Exception):
+        vac = globals().get("_vacuum_safe")
+        if callable(vac):
+            coro = vac(int(uid), ignore_sticky=True)  # type: ignore[misc]
+            if hasattr(coro, "__await__"):
+                await coro
+
     try:
         deal_id = int(str(callback.data).rsplit("_", 1)[-1])
     except Exception:
@@ -227,8 +240,20 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
     name = str(deal.get("game_name") or deal.get("name") or f"Сделка #{deal_id}")
     event_dt = deal.get("event_datetime")
     date_s = event_dt.strftime("%d.%m.%Y") if hasattr(event_dt, "strftime") else str(deal.get("event_date") or "—")
-    # время: если есть точное в event_datetime — берём его, иначе строку event_time
-    time_s = event_dt.strftime("%H:%M") if hasattr(event_dt, "strftime") else str(deal.get("event_time") or "—")
+
+    # ВРЕМЯ: приоритет у текстового event_time (нормализуем до HH:MM), затем — из event_datetime (если не "00:00")
+    try:
+        _norm = globals().get("_normalize_time_str")
+        time_s = _norm(str(deal.get("event_time") or "")) if callable(_norm) else str(deal.get("event_time") or "").replace(".", ":").strip()
+    except Exception:
+        time_s = str(deal.get("event_time") or "").replace(".", ":").strip()
+    if not time_s:
+        if hasattr(event_dt, "strftime"):
+            t_from_dt = event_dt.strftime("%H:%M")
+            time_s = "" if t_from_dt == "00:00" else t_from_dt
+    if not time_s:
+        time_s = "—"
+
     place = str(deal.get("address") or deal.get("location") or "—")
     pkg_raw = str(deal.get("package") or "—")
     players = truncate(str(deal.get("players") or "—"), 60)
@@ -318,8 +343,7 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
     # Второе сообщение с кнопками
     second_rows: List[List[InlineKeyboardButton]] = []
     if can_confirm:
-        # ВАЖНО: подтверждение из «Моих игр» идёт через общий handlers.confirmations:
-        # callback = f"{CONFIRM_PREFIX}{deal_id}_{role}"
+        # подтверждение из «Моих игр» идёт через общий handlers.confirmations:
         second_rows.append([
             InlineKeyboardButton(
                 text="✅ Подтвердить участие",
@@ -346,6 +370,9 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
     with contextlib.suppress(Exception):
         await callback.answer()
 
+# История изменений [2.1]:
+# • 2025-08-29 — Исправлено отображение времени: приоритет event_time (нормализация до HH:MM), 
+#                затем — из event_datetime (игнор «00:00»), иначе «—». В остальном без изменений.
 
 # ════════════════════════════════════════════════════════════════════
 # [3] DOMAIN HELPERS
@@ -1790,14 +1817,12 @@ async def _send_dashboard(uid: int, deals: List[Dict[str, Any]]) -> None:
 async def _send_details(uid: int, deal: Dict[str, Any]) -> None:
     """
     Открывает карточку деталей «Мои игры».
-    • Перед показом деталей не удаляем sticky-дашборд; чистим только хвосты.
+    • Перед показом НЕ вызываем локальный vacuum: предварительную уборку sticky/хвостов
+      выполняет сам show_my_game_details (см. [2.1]).
     • Основной рендер делаем через show_my_game_details(fake_cb) (см. блок [2.1]).
     """
     bot = Bot.get_current()
     deal_id = int(deal.get("id") or 0)
-
-    # подчистим только хвосты (sticky сохраняем)
-    await _vacuum_safe(int(uid))
 
     # основной путь — переиспользуем публичный рендер деталей
     with suppress(Exception):
@@ -1828,6 +1853,8 @@ async def _send_details(uid: int, deal: Dict[str, Any]) -> None:
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ Назад к списку", callback_data="mygames_back")
     await bot.send_message(int(uid), text, reply_markup=kb.as_markup())
+
+
 
 
 
@@ -2050,13 +2077,14 @@ async def _open_my_game_details_cb(callback: types.CallbackQuery) -> None:
             await callback.answer()
         return
 
-    # Фолбэк: отдаём управление стандартному рендеру деталей (он сам соберёт снапшот)
+    # Фолбэк: отдаём управление стандартному рендеру деталей (он сам выполнит предварительный vacuum)
     try:
         await show_my_game_details(callback)
     except Exception as e:
         with contextlib.suppress(Exception):
             await callback.answer("Не удалось открыть детали.", show_alert=True)
         logger.warning("[my_games] open details failed (fallback): %s", e)
+
 
 
 @router.callback_query(lambda c: c.data == "mygames_back")
@@ -2253,10 +2281,6 @@ async def mygames_after_confirm_ui_patch(
     except Exception:
         # UI-патч не критичен, ошибки гасим.
         pass
-
-# История изменений [7]:
-# • 2025-08-28 — удалены дубли [7.2]–[7.4] в конце файла; оставлены единичные обработчики.
-#                Логика подтверждений/замены/отчёта без изменений; совместимость с SSOT сохранена.
 
 
 # ════════════════════════════════════════════════════════════════════
