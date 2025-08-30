@@ -1255,69 +1255,90 @@ async def _soft_redraw_my_games(uid: int) -> None:
 from typing import Any, Dict, List, Optional, Set
 import logging
 
-from core.utils import assigned_role_from_state  # SSOT: определение роли из state
+from core.config import settings
+from core.state import state
+from core.utils import assigned_role_from_state  # SSOT: присутствует для совместимости
+
+logger = logging.getLogger(__name__)
 
 
 def _success_status_id() -> str:
     """
-    Безопасно возвращает ID статуса «Завершение сделки», если он доступен в глобалах.
-    Поддерживает возможные варианты имен, чтобы не ловить NameError/Pylance.
+    Безопасно возвращает ID статуса «Завершение сделки» из настроек.
+    Поддерживаем несколько ключей для совместимости.
     """
     for key in ("SUCCESSFUL_STATUS_ID", "OK_STATUS_ID", "SUCCESS_STATUS_ID"):
-        val = globals().get(key)
-        if val:
-            return str(val)
+        try:
+            val = getattr(settings, key)  # type: ignore[attr-defined]
+            if val:
+                return str(val)
+        except Exception:
+            continue
+    return ""
+
+
+def _prelim_status_id() -> str:
+    """
+    Безопасно возвращает ID статуса «Предварительная заявка» из настроек.
+    """
+    for key in ("PRELIM_STATUS_ID", "PRELIMINARY_STATUS_ID"):
+        try:
+            val = getattr(settings, key)  # type: ignore[attr-defined]
+            if val:
+                return str(val)
+        except Exception:
+            continue
     return ""
 
 
 def _wanted_status(deal: Dict) -> bool:
     """
     Игра попадает в «Мои игры», если её статус один из допустимых:
-    • «Бронь» (BRON_STATUS_ID),
-    • «Предварительная заявка» (PRELIM_STATUS_ID или по названию),
-    • «Завершение сделки» (успех: по ID из _success_status_id() или по названию).
+    • «Бронь» (settings.BRON_STATUS_ID),
+    • «Предварительная заявка» (settings.PRELIM_STATUS_ID или по названию),
+    • «Завершение сделки» (settings.SUCCESSFUL_STATUS_ID или по названию).
 
-    Если статус не указан/не распознан — применяем безопасный фолбэк: считаем «Бронь».
+    Если статус не распознан — фолбэк «Бронь».
     """
     try:
         sid_any = _safe_status_id(deal)  # определена выше в файле
     except Exception:
         sid_any = None
 
-    sid = str(sid_any or globals().get("BRON_STATUS_ID", ""))  # «Бронь» как фолбэк
-    prelim_id = str(globals().get("PRELIM_STATUS_ID", "") or "")
+    bron_id = str(getattr(settings, "BRON_STATUS_ID", ""))
+    prelim_id = _prelim_status_id()
     success_id = _success_status_id()
 
+    sid = str(sid_any or bron_id)
     name = str(deal.get("status_name") or deal.get("status") or "").strip().lower()
 
     prelim_names = {"предварительная заявка", "предварительно", "предварит.", "предварит", "prelim"}
     success_names = {"завершение сделки", "успешно реализовано", "успешно", "завершена"}
 
-    # допустимые статусы
-    if sid == str(globals().get("BRON_STATUS_ID", "")):
-        return True
-    if success_id and sid == success_id:
+    if sid == bron_id:
         return True
     if prelim_id and sid == prelim_id:
+        return True
+    if success_id and sid == success_id:
         return True
     if name in prelim_names:
         return True
     if name in success_names:
         return True
 
-    # фолбэк: «неизвестный» считаем как «Бронь»
-    return sid == str(globals().get("BRON_STATUS_ID", ""))
+    # фолбэк: неизвестный → считаем «Бронь»
+    return sid == bron_id
 
 
 def _assigned_deal_ids_from_locked(uid: int) -> Set[int]:
     """
-    Собираем id всех сделок, где пользователь записан в зафиксированном составе
-    (слоты lead*/assistant*/admin/trainee). SSOT — state.locked_distribution.
-    Учитываем как «Имя Ф..1|uid», так и «Имя Ф..1» (фолбэк по ярлыку).
-    Поддерживаем строку и коллекции (list/tuple) значений слотов.
+    Собираем id всех сделок, где пользователь записан в ЗАФИКСИРОВАННОМ составе
+    (слоты lead*/assistant*/admin/trainee). Источник — state.locked_distribution.
+
+    Поддерживаем строки и коллекции (list/tuple) значений слотов.
     """
     out: Set[int] = set()
-    locked = (getattr(state, "locked_distribution", {}) or {})  # state доступен в файле
+    locked = (getattr(state, "locked_distribution", {}) or {})
     for did_key, dist in locked.items():
         if not isinstance(dist, dict):
             continue
@@ -1329,7 +1350,6 @@ def _assigned_deal_ids_from_locked(uid: int) -> Set[int]:
             if not isinstance(k, str):
                 continue
             if k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"}:
-                # значение слота может быть строкой или списком ярлыков
                 if isinstance(v, str):
                     if _label_belongs_to_uid(v, uid):  # определена выше
                         out.add(did)
@@ -1343,25 +1363,28 @@ def _assigned_deal_ids_from_locked(uid: int) -> Set[int]:
 
 def _assigned_role_via_locked(uid: int, deal_id: int) -> Optional[str]:
     """
-    Роль пользователя в сделке по зафиксированным слотам:
-    1) сначала SSOT-хелпер assigned_role_from_state(uid, deal_id),
-    2) затем фолбэк по ярлыку слота (когда в значении нет «|uid», а также при списках).
+    Роль пользователя строго по ЗАФИКСИРОВАННОМУ составу:
+    только state.locked_distribution (никаких legacy-источников/голосов/тегов).
 
     Возвращает: 'main' | 'assist' | 'admin' | 'trainee' | None
     """
+    # Вызов SSOT-хелпера сохраняем для совместимости/телеметрии, но решение принимаем по locked.
     try:
-        role = assigned_role_from_state(uid, deal_id)
-        if role:
-            return role
+        _ = assigned_role_from_state(uid, deal_id)  # не используем результат, полагаемся на locked
     except Exception:
         pass
 
     locked_all = (getattr(state, "locked_distribution", {}) or {})
+
+    # поддерживаем int/str ключи
     dist: Optional[Dict[str, Any]] = None
-    if isinstance(locked_all.get(deal_id), dict):
-        dist = locked_all.get(deal_id)
-    elif isinstance(locked_all.get(str(deal_id)), dict):
-        dist = locked_all.get(str(deal_id))
+    raw = locked_all.get(deal_id)
+    if isinstance(raw, dict):
+        dist = raw
+    else:
+        raw = locked_all.get(str(deal_id))
+        if isinstance(raw, dict):
+            dist = raw
 
     if not isinstance(dist, dict):
         return None
@@ -1389,7 +1412,7 @@ def _assigned_role_via_locked(uid: int, deal_id: int) -> Optional[str]:
 
 def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
     """
-    Дополняем CRM-список сделками из зафиксированного распределения,
+    Дополняем CRM-список сделками из ЗАФИКСИРОВАННОГО распределения,
     чтобы утверждённые игры были видны даже при пустом ответе CRM.
 
     Источники карточки (по приоритету):
@@ -1398,22 +1421,13 @@ def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
       3) state.games_by_user,
       4) state.poll_details / state.deal_titles (минимальный фолбэк).
 
-    Усилено: жёсткая дедупликация по id (by_id), чтобы не плодить
-    дубли карточек (это мешало корректной очистке интерфейса в ЛС).
+    Жёсткая дедупликация по id (by_id).
     """
-    logger = logging.getLogger(__name__)
-
-    # id из слотов (SSOT) + из assigned_index (на случай старых индексов)
+    # ТОЛЬКО из locked_distribution: никаких legacy-индексов/голосов/тегов
     want_ids: Set[int] = _assigned_deal_ids_from_locked(uid)
-    try:
-        aidx: Dict[int, Set[int]] = getattr(state, "assigned_index", {}) or {}
-        want_ids |= set(aidx.get(uid) or set())
-    except Exception:
-        pass
 
     logger.debug("[my_games] augment_with_locked: uid=%s want_ids=%s", uid, sorted(want_ids))
 
-    # Индекс уже имеющихся карточек (CRM) + исходный список
     by_id: Dict[int, Dict] = {}
     out: List[Dict] = []
     for d in all_deals or []:
@@ -1426,7 +1440,6 @@ def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
             out.append(d)
 
     if not want_ids:
-        # возвращаем CRM-список как есть (уже без дублей)
         return list(out)
 
     def _find_snap_in_poll(did: int) -> Optional[Dict]:
@@ -1470,17 +1483,16 @@ def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
                 "players": details.get("players") or "—",
                 "tags": details.get("tags") or [],
                 "comment": details.get("comment") or "",
-                # статус обязателен — по умолчанию считаем «Бронь», чтобы пройти фильтр
-                "status_id": str(globals().get("BRON_STATUS_ID", "")),
+                # статус обязателен — по умолчанию «Бронь», чтобы пройти фильтр
+                "status_id": str(getattr(settings, "BRON_STATUS_ID", "")),
             }
 
-        # Нормализуем критичные поля и добавляем, соблюдая уникальность id
         try:
-            did2 = int(snap.get("id") or 0)
+            did2 = int(snap.get("id") or 0)  # type: ignore[arg-type]
         except Exception:
             did2 = 0
         if did2 and did2 not in by_id:
-            by_id[did2] = snap
+            by_id[did2] = snap  # type: ignore[assignment]
             out.append(dict(snap))
 
     return out
@@ -1489,12 +1501,11 @@ def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
 def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
     """
     Итоговая выборка для «Мои игры»:
-      • статус «Бронь» / «Предварительная заявка» / «Завершение сделки»
-        (неизвестный → «Бронь»);
-      • пользователь назначен (в первую очередь — по locked_distribution);
+      • статус: «Бронь» / «Предварительная заявка» / «Завершение сделки»;
+      • пользователь назначен И УТВЕРЖДЁН (locked_distribution/SSOT);
       • + дополнение из локального кэша, если CRM вернул пусто.
 
-    Сильная гарантия отсутствия дублей: внутри — индекс by_id и фильтр seen.
+    Дубли исключаем (by_id/seen). Сортировка по дате мероприятия.
     """
     all_deals = _augment_with_locked(uid, list(all_deals or []))
 
@@ -1526,36 +1537,25 @@ def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
         if not _wanted_status(d):
             continue
 
-        # Главный критерий — назначение через слоты (с поддержкой слотов без |uid и списков)
-        assigned_role = _assigned_role_via_locked(uid, did)
-        assigned_by_locked = assigned_role is not None
-
-        # Дополнительные источники (совместимость со старыми индексами/тегами)
-        assigned_legacy = _is_user_assigned_legacy(uid, d) or _has_confirmation_tag(d, uid)
-        try:
-            aidx: Dict[int, Set[int]] = getattr(state, "assigned_index", {}) or {}
-            assigned_by_index = did in (aidx.get(uid) or set())
-        except Exception:
-            assigned_by_index = False
-
-        if not (assigned_by_locked or assigned_by_index or assigned_legacy):
+        # Единственный валидный критерий — утверждение через locked_distribution
+        if not _assigned_role_via_locked(uid, did):
             continue
 
         out.append(d)
         seen.add(did)
 
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("[my_games] visible_deals uid=%s -> %s", uid, [int(x.get("id") or 0) for x in out])
+
     return out
 
 
 # История изменений [4]:
-# • 2025-08-29 — безопасная сортировка по timestamp (naive/aware совместимо; фиксы Pylance/Runtime).
-# • 2025-08-29 — фиксы Pylance: убрана прямая ссылка на SUCCESSFUL_STATUS_ID,
-#                добавлен _success_status_id() и распознавание по названию.
-# • 2025-08-24 — усилена дедупликация и поддержка коллекций в слотах (устранение дублей карточек).
-# • 2025-08-19 — учёт слотов без «|uid» + фолбэк по ярлыку; добавлен отладочный лог augment_with_locked.
-# • 2025-08-19 — поддержка статуса «Предварительная заявка» (по ID и по названию).
-
-
+# • 2025-08-30 — добавлен статус «Предварительная заявка» (ID + текстовые синонимы);
+#                выборка жёстко ограничена только locked_distribution; фиксы Pylance.
+# • 2025-08-29 — безопасная сортировка по timestamp (naive/aware); распознавание success-name.
+# • 2025-08-24 — дедупликация и коллекции в слотах; отладочный лог augment_with_locked.
+# • 2025-08-19 — учёт слотов без «|uid» + фолбэк по ярлыку.
 
 
 # ════════════════════════════════════════════════════════════════════
