@@ -8,6 +8,9 @@
 • Корректная работа и с pydantic v2, и без pydantic (заглушки/фолбэки).
 • Безопасные дефолты: бот не падает без переменных окружения.
 • Проверка/нормализация chat_id, Google scopes, загрузка GAME_ROLE_MAPPING/AMOCRM_FIELDS.
+
+Дополнительно:
+• WON_STATUS_ID — ID статуса «Успешно реализовано» (финальный). Берётся из ENV/JSON.
 """
 
 from __future__ import annotations
@@ -128,6 +131,8 @@ class Settings(BaseSettings):
     NEW_GAMES_STATUS_IDS: List[str] = Field(default_factory=lambda: ["18913930", "18913933"])
     BRON_STATUS_ID: str = Field(default="18913933", env="BRON_STATUS_ID")
     SUCCESSFUL_STATUS_ID: str = Field(default="18960415", env="SUCCESSFUL_STATUS_ID")
+    # NEW: финальный статус «Успешно реализовано»
+    WON_STATUS_ID: str = Field(default="", env="WON_STATUS_ID")
 
     # — access matrix —
     ACCESS: Dict[str, List[str]] = Field(default_factory=lambda: {
@@ -298,6 +303,8 @@ def _test():
     assert isinstance(s.POLL_WINDOW_DAYS, int) and s.POLL_WINDOW_DAYS > 0
     assert isinstance(s.BRON_STATUS_ID, str) and s.BRON_STATUS_ID
     assert isinstance(s.SUCCESSFUL_STATUS_ID, str) and s.SUCCESSFUL_STATUS_ID
+    # WON_STATUS_ID может быть пустым, но тип должен быть строка
+    assert isinstance(s.WON_STATUS_ID, str)
     print("✅ core/config.py tests passed")
 
 
@@ -307,3 +314,4 @@ if __name__ == "__main__":
 # История изменений:
 # 2025-08-18 — выровнено под SSOT/фиксы Pylance: добавлены BRON_STATUS_ID, POLL_WINDOW_DAYS, GOOGLE_CREDENTIALS_JSON,
 #               безопасные дефолты вместо обязательных полей, нормализаторы chat_id/scopes, самотест.
+# 2025-08-26 — добавлен WON_STATUS_ID (финальный статус «Успешно реализовано») с поддержкой ENV/config.json.
