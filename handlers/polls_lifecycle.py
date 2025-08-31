@@ -2282,9 +2282,12 @@ async def swap_request_handler(callback: types.CallbackQuery) -> None:
     # чтобы они понимали, что запрос зафиксирован, и дадим текст для ручного форварда.
     if not sent_ok:
         try:
-            await bot.send_message(uid, "⚠️ Не удалось отправить объявление в чат. "
-                                        "Я сохранил запрос на замену. "
-                                        "Скинь этот текст в рабочий чат вручную:\n\n" + text)
+            await bot.send_message(
+                uid,
+                "⚠️ Не удалось отправить объявление в чат. "
+                "Я сохранил запрос на замену. "
+                "Скинь этот текст в рабочий чат вручную:\n\n" + text
+            )
         except Exception:
             pass
 
@@ -2301,8 +2304,6 @@ async def swap_request_handler(callback: types.CallbackQuery) -> None:
     await _sync_leader_report()
     asyncio.create_task(_refresh_detail_views({int(deal_id)}, refresh_all=False))
 
-# История изменений:
-# 2025-08-18 — выровнено под SSOT: resolve_notify_chat_id (core.utils) + short_name.
 
 # ════════════════════════════════════════════════════════════════════
 # [4.9] HANDLER: «Откликнуться» на замену (swap_accept_{deal_id}_{role})
@@ -2337,6 +2338,12 @@ async def swap_accept_handler(callback: types.CallbackQuery) -> None:
         logger.warning("[swap] accept: no open request for deal=%s", deal_id)
         return
 
+    # запрет самопринятия (инициатор не может принять сам себя)
+    if int(req.get("by") or 0) == uid:
+        await callback.answer("Вы уже запрашивали замену на эту игру.", show_alert=True)
+        logger.info("[swap] accept: same user tried to accept own swap uid=%s deal=%s", uid, deal_id)
+        return
+
     # «первый клик выигрывает»
     accepted = req.get("accepted_by")
     if accepted is not None:
@@ -2344,11 +2351,14 @@ async def swap_accept_handler(callback: types.CallbackQuery) -> None:
         logger.info("[swap] accept: already taken by uid=%s", accepted)
         return
 
-    # фиксируем победителя
+    # фиксируем победителя без промежуточных await, чтобы минимизировать гонки
     req["accepted_by"] = uid
 
     # проверка по «Светофору»
     deal = next((d for d in (state.current_poll_deals or []) if int(d.get("id", 0)) == int(deal_id)), {}) or {}
+    if not deal:
+        # фолбэк: достанем снапшот из AmoCRM
+        deal = await _find_deal_snapshot(deal_id)
     game_name = str(deal.get("game_name") or deal.get("name") or f"Сделка #{deal_id}")
     status = await _sv_status(uid, game_name)  # '' | green | yellow | red
 
@@ -2389,8 +2399,188 @@ async def swap_accept_handler(callback: types.CallbackQuery) -> None:
     with contextlib.suppress(Exception):
         await callback.answer("Спасибо! Вы в составе на эту игру.", show_alert=False)
 
+
+# ────────────────────────────────────────────────────────────────────
+# ПОСТРОИТЕЛЬ КЛАВИАТУРЫ ОТЧЁТА + ЕДИНЫЙ ФИЛЬТР «АКТИВНОСТИ ДЛЯ РАСПРЕДЕЛЕНИЯ»
+# ────────────────────────────────────────────────────────────────────
+
+def _is_active_for_distribution(d: Dict[str, Any], locked_map: Dict[int, Any]) -> bool:
+    """
+    ЕДИНЫЙ фильтр «активности для распределения» в отчёте.
+
+    Игра считается АКТИВНОЙ (показываем в списке), если:
+      • у неё валидный id;
+      • она НЕ помечена как снятая вручную (state.deal_force_closed);
+      • она НЕ имеет успешного статуса (SUCCESSFUL_STATUS_ID) по локальному снапшоту/state;
+      • она НЕ подпадает под правила скрытия _should_hide_in_report_sync(...)
+        (т.е. ещё не полностью закрыта по тегам/статусу).
+
+    Важное требование задачи:
+      • При скрытии «снятых»/«успешных» пишем лог:
+        [report] hide finished/closed deal in report: {deal_id}
+    """
+    try:
+        did = int(d.get("id") or 0)
+    except Exception:
+        return False
+    if not did:
+        return False
+
+    # 1) Снятые/закрытые вручную (deal_force_closed)
+    closed_set: Set[int] = getattr(state, "deal_force_closed", set()) or set()
+    if did in closed_set:
+        logger.info("[report] hide finished/closed deal in report: %s", did)
+        return False
+
+    # 2) Успешные по локальному снапшоту или текущему dict сделки
+    def _status_from_snapshot(did_: int, deal: Dict[str, Any]) -> Optional[int]:
+        snap = getattr(state, "current_poll_snapshot", None)
+        # dict: {id|str(id): {...}|status_id}
+        if isinstance(snap, dict):
+            val = snap.get(did_, snap.get(str(did_)))
+            if isinstance(val, dict):
+                sid = val.get("status_id", val.get("statusId"))
+            else:
+                sid = val
+            try:
+                return int(sid) if sid is not None else None
+            except Exception:
+                return None
+        # list[dict]
+        if isinstance(snap, list):
+            for item in snap:
+                if isinstance(item, dict):
+                    try:
+                        if int(item.get("id", 0) or 0) == did_:
+                            sid = item.get("status_id", item.get("statusId"))
+                            return int(sid) if sid is not None else None
+                    except Exception:
+                        continue
+        # фолбэк: прямо из сделки
+        try:
+            sid = deal.get("status_id", deal.get("statusId"))
+            return int(sid) if sid is not None else None
+        except Exception:
+            return None
+
+    succ_id = getattr(settings, "SUCCESSFUL_STATUS_ID", None)
+    if succ_id is not None:
+        sid = _status_from_snapshot(did, d)
+        if sid is not None and int(sid) == int(succ_id):
+            logger.info("[report] hide finished/closed deal in report: %s", did)
+            return False
+
+    # 3) Скрытие «полностью закрытых» по тегам/статусу (существующая логика)
+    try:
+        return not _should_hide_in_report_sync(d, locked_map)
+    except Exception:
+        # На любой ошибке — показываем, чтобы не потерять игру из отчёта
+        return True
+
+
+def _build_report_keyboard() -> InlineKeyboardMarkup:
+    """
+    Список игр: статус ✅/❌ + название + дата/время.
+    Справа: «👍 Утвердить» для готовых, «✅ Утверждено» для зафиксированных.
+    Вверху: «🆕 Новая игра», если есть pending_new_deals.
+    Внизу: «Утвердить все», если есть готовые незалоченные.
+    Отбор игр — через единый фильтр _is_active_for_distribution(...).
+    """
+    rows: List[List[InlineKeyboardButton]] = []
+    any_ready_unlocked = False
+
+    # Набор залоченных сделок (int-ключи)
+    raw_locked = (getattr(state, "locked_distribution", {}) or {})
+    locked_map: Dict[int, Any] = {}
+    for k, v in raw_locked.items():
+        try:
+            locked_map[int(k)] = v
+        except Exception:
+            continue
+
+    # Кнопка «Новая игра»
+    try:
+        pending_cnt = len(getattr(state, "pending_new_deals", []) or [])
+        if getattr(state, "coordination_cycle_active", False) and pending_cnt > 0:
+            rows.append([InlineKeyboardButton(text=f"🆕 Новая игра ({pending_cnt})", callback_data="poll_new_game")])
+    except Exception:
+        pass
+
+    # Нормализация времени — только из кастомного поля event_time (фолбэк на event_datetime != 00:00)
+    def _norm_time(deal: Dict[str, Any]) -> str:
+        try:
+            _norm = globals().get("_normalize_time_str")
+            ts = _norm(str(deal.get("event_time") or "")) if callable(_norm) else str(deal.get("event_time") or "")
+        except Exception:
+            ts = str(deal.get("event_time") or "")
+        ts = ts.replace(".", ":").strip()
+        if ts:
+            return ts
+        dt = deal.get("event_datetime")
+        if hasattr(dt, "strftime"):
+            hhmm = dt.strftime("%H:%M")
+            if hhmm != "00:00":  # не сбрасывать в 00:00
+                return hhmm
+        return "—"
+
+    # Фильтрация перед рендером
+    filtered_deals: List[Dict[str, Any]] = []
+    for d in (state.current_poll_deals or []):
+        try:
+            if _is_active_for_distribution(d, locked_map):
+                filtered_deals.append(d)
+        except Exception as e:
+            logger.debug("[report] active-filter fail deal=%s: %s", d.get("id"), e)
+
+    # Построение строк клавиатуры
+    for d in filtered_deals:
+        try:
+            did = int(d.get("id") or 0)
+        except Exception:
+            continue
+        if not did:
+            continue
+
+        ready, _ = _counts_ready_for_deal(d)
+
+        base_name = str(d.get("game_name") or d.get("name") or "Игра")
+        name = f"{base_name} (предварительно)" if _is_preliminary_status(d) else base_name
+
+        dt = d.get("event_datetime")
+        date_s = dt.strftime("%d.%m") if hasattr(dt, "strftime") else str(d.get("event_date") or "—")
+        time_s = _norm_time(d)
+
+        left = InlineKeyboardButton(
+            text=f"{'✅' if (ready or did in locked_map) else '❌'} {name} · {date_s} {time_s}",
+            callback_data=f"show_deal_{did}",
+        )
+        row: List[InlineKeyboardButton] = [left]
+
+        if did in locked_map:
+            row.append(InlineKeyboardButton(text="✅ Утверждено", callback_data="noop"))
+        elif ready:
+            row.append(InlineKeyboardButton(text="👍 Утвердить", callback_data=f"poll_approve_{did}"))
+            any_ready_unlocked = True
+
+        rows.append(row)
+
+    if any_ready_unlocked:
+        rows.append([InlineKeyboardButton(text="Утвердить все", callback_data="approve_all_ready")])
+
+    # actions из polls_distribution (если есть)
+    try:
+        from handlers.polls_distribution import distribution_actions_markup  # lazy import
+        actions = distribution_actions_markup()
+        rows.extend(actions.inline_keyboard or [])
+    except Exception:
+        pass
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows if rows else [[InlineKeyboardButton(text="Обновить", callback_data="poll_back_to_games_list")]]
+    )
+
 # История изменений:
-# 2025-08-18 — выровнено под SSOT: resolve_notify_chat_id (core.utils) + team_bulleted_lines для печати состава.
+# 2025-08-31 · отчёт скрывает закрытые/успешные/снятые сделки (deal_force_closed)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2484,18 +2674,136 @@ async def clear_poll_data(uid: int) -> None:
         with contextlib.suppress(Exception):
             await _vacuum_old_messages()
 
+
+async def hide_deal_from_report(deal_id: int) -> None:
+    """
+    Помечает сделку завершённой для отчёта по опросу.
+    Реализация: добавить deal_id в state.deal_force_closed (set[int]).
+    Поддержать ключ и как int, и как str, т.к. в state встречаются оба варианта.
+    Логи: [lifecycle] hide deal from report: {deal_id}
+    """
+    # Если набора нет — создаём
+    if not isinstance(getattr(state, "deal_force_closed", None), set):
+        state.deal_force_closed = set()
+
+    # Всегда добавляем как int(deal_id)
+    did: int = 0
+    try:
+        did = int(deal_id)
+    except Exception:
+        with contextlib.suppress(Exception):
+            did = int(str(deal_id).strip())
+
+    if did:
+        state.deal_force_closed.add(did)
+        logger.info("[lifecycle] hide deal from report: %s", did)
+    else:
+        logger.debug("[lifecycle] hide deal from report skipped for deal_id=%r", deal_id)
+
+
 async def finish_if_all_deals_completed() -> None:
     """
-    Если все игры цикла уже «утверждены» (есть в locked_distribution),
-    завершаем цикл. Идемпотентно.
+    Завершить цикл, когда все игры текущего опроса:
+      • зафиксированы (есть в locked_distribution), ИЛИ
+      • отмечены как закрытые вручную (state.deal_force_closed), ИЛИ
+      • имеют статус SUCCESS (по локальному снапшоту, если доступен).
+
+    После выполнения:
+      • await clear_poll_data(state.current_poll_leader or 0)
+      • Обновить кнопку в ЛС руководителя обратно на «📋 Создать опрос»
+        (используем имеющиеся механизмы без нового API).
+      • Лог: [lifecycle] all deals locked/closed → finish cycle
     """
-    if not state.coordination_cycle_active:
+    if not getattr(state, "coordination_cycle_active", False):
         return
-    deals = [int(d.get("id", 0) or 0) for d in (state.current_poll_deals or [])]
-    locked = set((getattr(state, "locked_distribution", {}) or {}).keys())
-    if deals and all(d in locked for d in deals):
-        logger.info("[lifecycle] all deals locked → finish cycle")
-        await clear_poll_data(getattr(state, "current_poll_leader", 0) or 0)
+
+    # 1) Текущий набор сделок (поддерживаем как список ID, так и список dict'ов)
+    raw_deals = getattr(state, "current_poll_deals", []) or []
+    current_ids: List[int] = []
+    for it in raw_deals:
+        try:
+            if isinstance(it, dict):
+                did = int(it.get("id", 0) or 0)
+            else:
+                did = int(it)
+            if did:
+                current_ids.append(did)
+        except Exception:
+            continue
+
+    if not current_ids:
+        return
+
+    # 2) locked (поддерживаем int и str ключи), closed (пустое множество, если нет)
+    raw_locked = getattr(state, "locked_distribution", {}) or {}
+    locked: Set[int] = set()
+    for k in raw_locked.keys():
+        try:
+            locked.add(int(k))
+        except Exception:
+            with contextlib.suppress(Exception):
+                locked.add(int(str(k).strip()))
+
+    raw_closed = getattr(state, "deal_force_closed", set()) or set()
+    closed: Set[int] = set()
+    for k in raw_closed:
+        try:
+            closed.add(int(k))
+        except Exception:
+            with contextlib.suppress(Exception):
+                closed.add(int(str(k).strip()))
+
+    # Помощник: статус из локального снапшота (если есть)
+    def _status_from_snapshot(did: int) -> Optional[int]:
+        snap = getattr(state, "current_poll_snapshot", None)
+        # dict: {id: {...}|status_id} или {str(id): ...}
+        if isinstance(snap, dict):
+            val = snap.get(did, snap.get(str(did)))
+            if isinstance(val, dict):
+                sid = val.get("status_id", val.get("statusId"))
+            else:
+                sid = val
+            try:
+                return int(sid) if sid is not None else None
+            except Exception:
+                return None
+        # list[dict]
+        if isinstance(snap, list):
+            for item in snap:
+                if isinstance(item, dict):
+                    try:
+                        if int(item.get("id", 0) or 0) == did:
+                            sid = item.get("status_id", item.get("statusId"))
+                            return int(sid) if sid is not None else None
+                    except Exception:
+                        continue
+        return None
+
+    succ_cfg = getattr(settings, "SUCCESSFUL_STATUS_ID", None)
+
+    def _is_success(did: int) -> bool:
+        if succ_cfg is None:
+            return False
+        sid = _status_from_snapshot(did)
+        try:
+            return sid is not None and int(sid) == int(succ_cfg)
+        except Exception:
+            return False
+
+    # 3) Условие завершения
+    done = all((did in closed) or (did in locked) or _is_success(did) for did in current_ids)
+
+    # 4) Завершение цикла + обновление UI
+    if done:
+        logger.info("[lifecycle] all deals locked/closed → finish cycle")
+        leader_id = getattr(state, "current_poll_leader", 0) or 0
+        await clear_poll_data(leader_id)
+
+        # Обновим интерфейс руководителя существующими механизмами
+        with contextlib.suppress(Exception):
+            await _sync_leader_report(leader_id)   # мягкая синхронизация отчёта/кнопок
+        with contextlib.suppress(Exception):
+            await _refresh_menu(leader_id)         # если доступно — перерисовать главное меню
 
 
 # Экспортируем символы, используемые снаружи
@@ -2515,8 +2823,13 @@ __all__ = [
     "_auto_assign_from_responses",
     "_sv_status",
     "clear_poll_data",
+    "hide_deal_from_report",  # ← новый публичный хук
     "finish_if_all_deals_completed",
 ]
+
+# История изменений [6]:
+# 2025-08-31 · добавлен public-hook hide_deal_from_report, выровнено под SSOT.
+
 
 # ███ [99] _TEST
 # --------------------------------------------------------------------

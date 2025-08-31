@@ -146,7 +146,7 @@ def _mark_confirmed_on_message_kb(callback: CallbackQuery, deal_id: int, role: s
     Поддерживает два формата исходных кнопок:
       • confirm_role_{deal_id}_{role}
       • mygames_confirm_{deal_id}
-    Новый callback: replace_{deal_id}_{role}
+    Новый callback: mygames_swap_{deal_id}
     """
     try:
         msg = getattr(callback, "message", None)
@@ -156,7 +156,7 @@ def _mark_confirmed_on_message_kb(callback: CallbackQuery, deal_id: int, role: s
         new_rows: List[List[InlineKeyboardButton]] = []
         target_cd_role = f"{CONFIRM_PREFIX}{deal_id}_{role}"
         target_cd_mg   = f"mygames_confirm_{deal_id}"
-        replace_cd     = f"replace_{deal_id}_{role}"
+        replace_cd     = f"mygames_swap_{deal_id}"  # FIX: plural to match my_games handlers
 
         for row in (kb.inline_keyboard or []):
             new_row: List[InlineKeyboardButton] = []
@@ -171,6 +171,7 @@ def _mark_confirmed_on_message_kb(callback: CallbackQuery, deal_id: int, role: s
     except Exception:
         logger.exception("[confirm] failed to rebuild keyboard")
     return None
+
 
 
 # [1.5] SLOT MEMBERSHIP & SLOT KEY HELPERS — поддержка слотов БЕЗ «|uid»
@@ -481,7 +482,7 @@ async def confirm_role_handler(callback: CallbackQuery) -> None:
 
     await _perform_confirm(callback, deal_id, role)
 
-# ███ [4.1] CORE HELPERS — идемпотентность + единый источник правды
+# ███ [4.1] CORE HELPERS — идемпотентность + единый источник правды 
 # --------------------------------------------------------------------
 async def _role_of_user_in_locked(uid: int, deal_id: int) -> Optional[str]:
     """main/assist/admin/trainee/None — по зафиксированному составу (поддержка слотов без «|uid»)."""
@@ -506,11 +507,53 @@ async def _maybe_move_to_success(deal_id: int) -> None:
       • текущий статус сделки — «Бронь».
     Для «Предварительной заявки» и любого другого статуса — статус НЕ меняем.
     Уведомление «вся команда подтвердила» всегда отправляет handlers.my_games.announce_if_all_confirmed.
+
+    Дополнения (2025-08-31):
+    • После успешного перевода — мягкая «очистка замков» локальных подтверждений по сделке:
+      state.pending_confirmations[deal_id], state.confirmed[deal_id], state.swap_requests[deal_id] (если были).
+    • Синхронизация: безопасный вызов _sync_leader_report() и finish_if_all_deals_completed()
+      (lazy-import, с подавлением ошибок), чтобы отчёт обновился и цикл мог завершиться сам.
+    • Обновление локального состояния для логики скрытия: после добавления тегов и/или перевода в SUCCESS
+      подтягиваем свежие теги/статус из CRM и сбрасываем кеш снапшотов для этой сделки.
     """
     try:
         moved_set: Set[int] = state.__dict__.setdefault("_moved_success", set())  # type: ignore[assignment]
         if int(deal_id) in moved_set:
             return
+
+        # Локальный helper для обновления снапшота из CRM и сброса кеша
+        async def _refresh_local_snapshot_for_hiding() -> None:
+            with contextlib.suppress(Exception):
+                ts = state.__dict__.setdefault("deal_snapshots_ts", {})  # type: ignore[assignment]
+                if isinstance(ts, dict):
+                    ts[int(deal_id)] = 0.0
+                if hasattr(amo, "get_deal_by_id"):
+                    snap = await amo.get_deal_by_id(int(deal_id))  # type: ignore[arg-type]
+                else:
+                    snap = None
+                if isinstance(snap, dict):
+                    # current_poll_deals — обновляем статусы и теги (для отчёта)
+                    with contextlib.suppress(Exception):
+                        for d in (getattr(state, "current_poll_deals", []) or []):
+                            if int(d.get("id") or 0) == int(deal_id):
+                                if "tags" in snap:
+                                    d["tags"] = snap["tags"]
+                                sid2 = snap.get("status_id") or snap.get("pipeline_status_id")
+                                if sid2 is not None:
+                                    d["status_id"] = sid2
+                                sname2 = snap.get("status_name") or snap.get("status")
+                                if sname2:
+                                    d["status_name"] = sname2
+                                break
+                    # ВАЖНО: games_by_user НЕ меняем статус — чтобы «Мои игры» не пропадали.
+                    # Разрешено аккуратно обновить только теги (без статуса).
+                    with contextlib.suppress(Exception):
+                        for _uid, arr in (getattr(state, "games_by_user", {}) or {}).items():
+                            for d in (arr or []):
+                                if int(d.get("id") or 0) == int(deal_id):
+                                    if "tags" in snap:
+                                        d["tags"] = snap["tags"]
+                                    break
 
         expected_map: Dict[str, Set[str]] = _expected_tag_map(deal_id)
         expected_required: Set[str] = set()
@@ -538,13 +581,33 @@ async def _maybe_move_to_success(deal_id: int) -> None:
 
         if not all_ok:
             return
+        # Попытка явного скрытия из отчёта, если есть хук в polls_lifecycle
+        try:
+            from handlers.polls_lifecycle import hide_deal_from_report  # type: ignore
+            with contextlib.suppress(Exception):
+                await hide_deal_from_report(int(deal_id))
+        except Exception:
+            pass
 
-        # дольём недостающие теги в CRM, если подтверждали только локально
+        # Уже все подтвердили — синхронизация снапшота и отчёта
+        with contextlib.suppress(Exception):
+            await _refresh_local_snapshot_for_hiding()
+        try:
+            from handlers.polls_lifecycle import _sync_leader_report, finish_if_all_deals_completed  # type: ignore
+            with contextlib.suppress(Exception):
+                await _sync_leader_report()
+            with contextlib.suppress(Exception):
+                await finish_if_all_deals_completed()
+        except Exception:
+            pass
+
+        # Доливаем недостающие теги в CRM при локальном подтверждении
         if not crm_tags:
             to_add = expected_required - crm_tags
             for tag in sorted(to_add):
                 with contextlib.suppress(Exception):
                     await _amo_add_tag(deal_id, tag)
+            await _refresh_local_snapshot_for_hiding()
 
         # текущее состояние статуса
         sid, name = await _read_status_info(deal_id)
@@ -566,6 +629,7 @@ async def _maybe_move_to_success(deal_id: int) -> None:
         if _is_bron(sid, name) and SUCCESSFUL_STATUS_ID:
             with contextlib.suppress(Exception):
                 await update_deal_status(int(deal_id), str(SUCCESSFUL_STATUS_ID))
+                # Обновляем только current_poll_deals (для отчёта)
                 try:
                     for d in (getattr(state, "current_poll_deals", []) or []):
                         if int(d.get("id") or 0) == int(deal_id):
@@ -573,21 +637,75 @@ async def _maybe_move_to_success(deal_id: int) -> None:
                             d["status_name"] = "Завершение сделки"
                 except Exception:
                     pass
+                # ВАЖНО: games_by_user НЕ трогаем (пусть остаётся в «Моих играх»)
+                logger.info("[confirm] deal %d moved to SUCCESS (%s)", deal_id, SUCCESSFUL_STATUS_ID)
+                # ⬇ NEW (2025-08-31): скрыть из отчёта и ПЕРЕНЕСТИ «замки» в finished_* вместо удаления
                 try:
-                    for _uid, arr in (getattr(state, "games_by_user", {}) or {}).items():
-                        for d in (arr or []):
-                            if int(d.get("id") or 0) == int(deal_id):
-                                d["status_id"] = int(SUCCESSFUL_STATUS_ID)
-                                d["status_name"] = "Завершение сделки"
+                    from handlers.polls_lifecycle import hide_deal_from_report, finish_if_all_deals_completed  # type: ignore
+                    with contextlib.suppress(Exception):
+                        await hide_deal_from_report(int(deal_id))  # 1) скрыть из отчёта
+
+                    # 2) перенос «замков» и кэша автораспределения в резерв (int и str ключи)
+                    try:
+                        finished_ld = state.__dict__.setdefault("finished_locked_distribution", {})
+                        finished_dc = state.__dict__.setdefault("finished_distribution_cache", {})
+                        src_ld = (getattr(state, "locked_distribution", {}) or {})
+                        src_dc = (getattr(state, "distribution_cache", {}) or {})
+                        for k in (int(deal_id), str(deal_id)):
+                            if k in src_ld:
+                                finished_ld[k] = src_ld.pop(k)
+                            if k in src_dc:
+                                finished_dc[k] = src_dc.pop(k)
+                    except Exception:
+                        logger.debug("[confirm] move locks to finished_* skipped (no-op) deal=%s", deal_id)
+
+                    logger.info("[confirm] hidden in report & moved to finished_locked: %s", int(deal_id))
+
+                    # 3) возможное завершение цикла
+                    with contextlib.suppress(Exception):
+                        await finish_if_all_deals_completed()
                 except Exception:
                     pass
-                logger.info("[confirm] deal %d moved to SUCCESS (%s)", deal_id, SUCCESSFUL_STATUS_ID)
                 moved_set.add(int(deal_id))
+
+            # NEW: очистка локальных подтверждений/обменов
+            try:
+                pc = getattr(state, "pending_confirmations", None)
+                if isinstance(pc, dict):
+                    pc.pop(int(deal_id), None)
+            except Exception:
+                pass
+            try:
+                conf = getattr(state, "confirmed", None)
+                if isinstance(conf, dict):
+                    conf.pop(int(deal_id), None)
+            except Exception:
+                pass
+            try:
+                swaps = getattr(state, "swap_requests", None)
+                if isinstance(swaps, dict):
+                    swaps.pop(int(deal_id), None)
+            except Exception:
+                pass
+
+            # После перевода — ещё раз обновим снапшот отчёта (без изменения «Моих игр»)
+            await _refresh_local_snapshot_for_hiding()
+            try:
+                from handlers.polls_lifecycle import _sync_leader_report, finish_if_all_deals_completed  # type: ignore
+                with contextlib.suppress(Exception):
+                    await _sync_leader_report()
+                with contextlib.suppress(Exception):
+                    await finish_if_all_deals_completed()
+            except Exception:
+                pass
+
         elif _is_bron(sid, name) and not SUCCESSFUL_STATUS_ID:
             logger.warning("[confirm] SUCCESS status id not configured; lead=%s", deal_id)
+            # даже если не можем перевести — отчёт уже синхронизирован выше
 
     except Exception as e:
         logger.warning("[confirm] _maybe_move_to_success failed: %s", e)
+
 
 
 async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> None:
@@ -690,6 +808,10 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
 
     with contextlib.suppress(Exception):
         await _safe_answer(callback, "Готово ✅")
+
+# История изменений:
+# 2025-08-31 · скрытие игры из отчёта и перенос «замков» в finished_* вместо удаления (сохранение в «Моих играх» до пост-отчёта)
+
 
 
 

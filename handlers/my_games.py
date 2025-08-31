@@ -373,6 +373,9 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
 # История изменений [2.1]:
 # • 2025-08-29 — Исправлено отображение времени: приоритет event_time (нормализация до HH:MM), 
 #                затем — из event_datetime (игнор «00:00»), иначе «—». В остальном без изменений.
+# • 2025-08-31 — Выровнено под SSOT: «🔁 Замена» доступна после личного подтверждения или при SUCCESS;
+#                сохранён мягкий vacuum sticky; без изменений публичных API.
+
 
 # ════════════════════════════════════════════════════════════════════
 # [3] DOMAIN HELPERS
@@ -1248,7 +1251,6 @@ async def _soft_redraw_my_games(uid: int) -> None:
         logger.warning("[my_games] soft redraw failed for uid=%s: %s", uid, e)
 
 
-
 # ════════════════════════════════════════════════════════════════════
 # [4] ВЫБОРКА ИГР
 # ════════════════════════════════════════════════════════════════════
@@ -1364,7 +1366,8 @@ def _assigned_deal_ids_from_locked(uid: int) -> Set[int]:
 def _assigned_role_via_locked(uid: int, deal_id: int) -> Optional[str]:
     """
     Роль пользователя строго по ЗАФИКСИРОВАННОМУ составу:
-    только state.locked_distribution (никаких legacy-источников/голосов/тегов).
+    используем объединение источников locked_distribution ∪ finished_locked_distribution
+    (при наличии «активного» распределения оно имеет приоритет).
 
     Возвращает: 'main' | 'assist' | 'admin' | 'trainee' | None
     """
@@ -1375,16 +1378,17 @@ def _assigned_role_via_locked(uid: int, deal_id: int) -> Optional[str]:
         pass
 
     locked_all = (getattr(state, "locked_distribution", {}) or {})
+    finished_all = (getattr(state, "finished_locked_distribution", {}) or {})
 
-    # поддерживаем int/str ключи
+    # поддерживаем int/str ключи и приоритет активного распределения
     dist: Optional[Dict[str, Any]] = None
-    raw = locked_all.get(deal_id)
+    raw = locked_all.get(deal_id) or locked_all.get(str(deal_id))
     if isinstance(raw, dict):
         dist = raw
     else:
-        raw = locked_all.get(str(deal_id))
-        if isinstance(raw, dict):
-            dist = raw
+        raw_f = finished_all.get(deal_id) or finished_all.get(str(deal_id))
+        if isinstance(raw_f, dict):
+            dist = raw_f
 
     if not isinstance(dist, dict):
         return None
@@ -1412,8 +1416,11 @@ def _assigned_role_via_locked(uid: int, deal_id: int) -> Optional[str]:
 
 def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
     """
-    Дополняем CRM-список сделками из ЗАФИКСИРОВАННОГО распределения,
-    чтобы утверждённые игры были видны даже при пустом ответе CRM.
+    Дополняем CRM-список сделками из утверждённого состава,
+    чтобы игры были видны даже при пустом ответе CRM.
+
+    База назначений — объединение источников:
+      locked_distribution ∪ finished_locked_distribution
 
     Источники карточки (по приоритету):
       1) уже в all_deals (CRM),
@@ -1423,10 +1430,35 @@ def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
 
     Жёсткая дедупликация по id (by_id).
     """
-    # ТОЛЬКО из locked_distribution: никаких legacy-индексов/голосов/тегов
-    want_ids: Set[int] = _assigned_deal_ids_from_locked(uid)
+    # 1) active
+    want_ids_active: Set[int] = _assigned_deal_ids_from_locked(uid)
 
-    logger.debug("[my_games] augment_with_locked: uid=%s want_ids=%s", uid, sorted(want_ids))
+    # 2) finished_* — сканируем так же, как в _assigned_deal_ids_from_locked
+    want_ids_finished: Set[int] = set()
+    raw_finished = (getattr(state, "finished_locked_distribution", {}) or {})
+    if isinstance(raw_finished, dict):
+        for did_key, dist in raw_finished.items():
+            if not isinstance(dist, dict):
+                continue
+            try:
+                did = int(did_key)
+            except Exception:
+                continue
+            for k, v in dist.items():
+                if not isinstance(k, str):
+                    continue
+                if k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"}:
+                    if isinstance(v, str):
+                        if _label_belongs_to_uid(v, uid):
+                            want_ids_finished.add(did)
+                            break
+                    elif isinstance(v, (list, tuple)):
+                        if any(isinstance(lbl, str) and _label_belongs_to_uid(lbl, uid) for lbl in v):
+                            want_ids_finished.add(did)
+                            break
+
+    want_ids: Set[int] = want_ids_active | want_ids_finished
+    logger.debug("[my_games] augment_with_locked: using union(active+finished), want_ids=%s", sorted(want_ids))
 
     by_id: Dict[int, Dict] = {}
     out: List[Dict] = []
@@ -1502,7 +1534,7 @@ def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
     """
     Итоговая выборка для «Мои игры»:
       • статус: «Бронь» / «Предварительная заявка» / «Завершение сделки»;
-      • пользователь назначен И УТВЕРЖДЁН (locked_distribution/SSOT);
+      • пользователь назначен И УТВЕРЖДЁН (locked_distribution ∪ finished_locked_distribution / SSOT);
       • + дополнение из локального кэша, если CRM вернул пусто.
 
     Дубли исключаем (by_id/seen). Сортировка по дате мероприятия.
@@ -1534,10 +1566,13 @@ def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
             continue
         if not did or did in seen:
             continue
+        # не показываем удалённые сделки
+        if bool(d.get("is_deleted")):
+            continue
         if not _wanted_status(d):
             continue
 
-        # Единственный валидный критерий — утверждение через locked_distribution
+        # Единственный валидный критерий — утверждение через locked_distribution ∪ finished_locked_distribution
         if not _assigned_role_via_locked(uid, did):
             continue
 
@@ -1551,11 +1586,15 @@ def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
 
 
 # История изменений [4]:
+# • 2025-08-31 — учитываем union(active+finished) для want_ids и определения роли; добавлен DEBUG-лог
+#                '[my_games] augment_with_locked: using union(active+finished), want_ids=...'.
+# • 2025-08-31 — не показываем удалённые сделки (is_deleted); выровнено под SSOT/фиксы Pylance.
 # • 2025-08-30 — добавлен статус «Предварительная заявка» (ID + текстовые синонимы);
 #                выборка жёстко ограничена только locked_distribution; фиксы Pylance.
 # • 2025-08-29 — безопасная сортировка по timestamp (naive/aware); распознавание success-name.
 # • 2025-08-24 — дедупликация и коллекции в слотах; отладочный лог augment_with_locked.
 # • 2025-08-19 — учёт слотов без «|uid» + фолбэк по ярлыку.
+
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1909,73 +1948,200 @@ async def _send_details(uid: int, deal: Dict[str, Any]) -> None:
 
 # [5.2] CROSS-MODULE VACUUM — удаление и обнуление реестров poll_details
 from contextlib import suppress
-from typing import Any, Dict, Iterable, Set
+from typing import Any, Dict, Set
 
 async def _vacuum_poll_details_blocks(uid: int) -> None:
     """
     Жёсткая очистка «деталей отчёта опроса» у пользователя:
-      • пытаемся вызвать публичный API из handlers.poll_details (если он есть),
-      • иначе — best-effort: находим все известные реестры в state, удаляем сообщения
-        и обнуляем записи для данного uid, чтобы не оставались «хвостовые» индексы.
+      • если есть публичный API в handlers.poll_details — используем его (источник истины/SSOT);
+      • иначе — best-effort: находим все известные и эвристически подходящие реестры в `state`,
+        удаляем связанные с пользователем сообщения и вычищаем записи (включая sticky),
+        чтобы не происходил повторный редрав и «закольцовка».
     Никогда не пробрасывает исключения наружу.
     """
+    from aiogram import Bot
     bot = Bot.get_current()
     u = int(uid)
 
-    # 1) Если в poll_details есть готовый API — используем его.
+    # 0) Попытка воспользоваться официальным API модуля деталей (если он есть).
     with suppress(Exception):
         from handlers.poll_details import forget_all_details_for_user  # type: ignore
         if callable(forget_all_details_for_user):
             await forget_all_details_for_user(u, bot=bot)  # type: ignore[arg-type]
             return
 
-    # 2) Fallback: собираем id всех сообщений из возможных реестров и удаляем вручную.
-    def _collect_ints(obj: Any, acc: Set[int]) -> None:
+    # ─────────────────────────────────────────────────────────────────────────
+    # Вспомогательные утилиты: рекурсивный сбор message_id и чистка по uid.
+    # ─────────────────────────────────────────────────────────────────────────
+    def _as_int(v: Any) -> int | None:
+        try:
+            if isinstance(v, int):
+                return int(v)
+            if isinstance(v, str) and v.isdigit():
+                return int(v)
+        except Exception:
+            pass
+        return None
+
+    def _collect_msg_ids(obj: Any, acc: Set[int]) -> None:
+        """Рекурсивно собрать все int-подобные значения (как message_id)."""
         if obj is None:
             return
         if isinstance(obj, int):
             acc.add(int(obj)); return
+        if isinstance(obj, str):
+            x = _as_int(obj)
+            if x is not None:
+                acc.add(x)
+            return
         if isinstance(obj, (list, tuple, set)):
-            for x in obj: _collect_ints(x, acc); return
+            for x in obj:
+                _collect_msg_ids(x, acc)
+            return
         if isinstance(obj, dict):
-            for v in obj.values(): _collect_ints(v, acc); return
+            for v in obj.values():
+                _collect_msg_ids(v, acc)
+            return
 
-    ids: Set[int] = set()
-    # наиболее вероятные поля, которые использует handlers.poll_details для реестров
+    def _collect_for_uid(obj: Any, user_key: int | str, acc: Set[int]) -> None:
+        """
+        Вытащить сообщения, относящиеся к конкретному uid:
+          • если dict — берём obj[uid] / obj[str(uid)], иначе ищем глубже.
+        """
+        if obj is None:
+            return
+        if isinstance(obj, dict):
+            node = obj.get(user_key) or obj.get(str(user_key))
+            if node is not None:
+                _collect_msg_ids(node, acc)
+            else:
+                for v in obj.values():
+                    _collect_for_uid(v, user_key, acc)
+        elif isinstance(obj, (list, tuple, set)):
+            for v in obj:
+                _collect_for_uid(v, user_key, acc)
+
+    def _purge_uid_entries(obj: Any, user_key: int | str) -> None:
+        """Рекурсивно удалить записи по uid из dict'ов (obj[uid] / obj[str(uid)])."""
+        if isinstance(obj, dict):
+            obj.pop(user_key, None)
+            obj.pop(str(user_key), None)
+            for v in list(obj.values()):
+                _purge_uid_entries(v, user_key)
+        elif isinstance(obj, (list, tuple, set)):
+            for v in obj:
+                _purge_uid_entries(v, user_key)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 1) Известные «реестры деталей» (названия, встречавшиеся в разных ветках).
+    # ─────────────────────────────────────────────────────────────────────────
     candidate_names = [
+        # классика из модуля poll_details
         "poll_details_blocks", "poll_detail_blocks",   # списки message_id по сделкам
         "poll_details_index",  "poll_detail_index",    # map ключей 'header/main/...' -> mid
-        "pd_blocks", "pd_index",                       # возможные сокращения
-        # дополнительно: реестры деталей вне модуля poll_details (совместимость с отчётом/деталями)
+        "pd_blocks", "pd_index",                       # сокращения
+        # расширенные варианты, виденные в отчётах по опросу
+        "report_details_blocks", "report_detail_blocks",
+        "report_details_index",  "report_detail_index",
+        "report_registry", "report_blocks_map", "report_msgs", "report_messages",
+        "report_header", "report_rows", "report_footer",
+        # совместимость с «анонимными» деталями
         "detail_blocks", "details_blocks",
         "detail_index",  "details_index",
+        # возможные sticky-слоты «дашборда отчёта»
+        "report_dashboard", "report_sticky", "poll_report_dashboard", "polls_report_sticky",
     ]
 
     registries: Dict[str, Any] = {}
+
+    # Явный сбор известных имён…
     for name in candidate_names:
         with suppress(Exception):
-            val = getattr(state, name)
-            registries[name] = val
+            if hasattr(state, name):
+                registries[name] = getattr(state, name)
 
-    # собираем сообщения для конкретного uid из всех найденных структур
+    # …и эвристика: любой атрибут state, в имени которого есть
+    # ('report' или 'poll') И ('detail'/'dashboard'/'block'/'index'/'msg'/'message'/'registry')
+    with suppress(Exception):
+        for name in dir(state):
+            low = name.lower()
+            if ("report" in low or "poll" in low) and any(
+                key in low for key in ("detail", "dashboard", "block", "index", "msg", "message", "registry")
+            ):
+                if name not in registries:
+                    with suppress(Exception):
+                        registries[name] = getattr(state, name)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 2) Собираем message_id, удаляем сообщения пользователя и чистим реестры.
+    # ─────────────────────────────────────────────────────────────────────────
+    ids: Set[int] = set()
+
+    # 2.1 собрать все message_id для данного uid
     for name, reg in list(registries.items()):
         with suppress(Exception):
             if isinstance(reg, dict):
-                # поддержим и ключи int, и str
+                # прямой доступ по uid/str(uid)
                 node = reg.get(u) or reg.get(str(u))
-                _collect_ints(node, ids)
+                if node is not None:
+                    _collect_msg_ids(node, ids)
+                else:
+                    # рекурсивный поиск вложенных узлов, относящихся к uid
+                    _collect_for_uid(reg, u, ids)
+            else:
+                # иногда sticky-слоты/списки лежат не под uid; соберём всё, а затем сотрём ключи uid ниже
+                _collect_msg_ids(reg, ids)
 
-    # удаляем все найденные сообщения (мягко)
+    # 2.2 удалить найденные сообщения (мягко, без исключений)
     for mid in sorted(ids):
         with suppress(Exception):
             await bot.delete_message(chat_id=u, message_id=int(mid))
 
-    # обнуляем записи для uid во всех известных реестрах, чтобы индекс не «висел»
+    # 2.3 вычистить записи по uid во всех известных/эвристических реестрах
     for name, reg in list(registries.items()):
         with suppress(Exception):
             if isinstance(reg, dict):
+                # основной случай
                 reg.pop(u, None)
                 reg.pop(str(u), None)
+                _purge_uid_entries(reg, u)
+            elif isinstance(reg, list):
+                # списки обычно содержат dict'ы — подчистим вложенно
+                for v in reg:
+                    _purge_uid_entries(v, u)
+
+    # 2.4 специально: попытка убрать «sticky» дашборда отчёта,
+    #     если он хранится как map uid->message_id в одном из известных имён
+    for sticky_name in ("report_dashboard", "report_sticky", "poll_report_dashboard", "polls_report_sticky"):
+        with suppress(Exception):
+            sticky_map = getattr(state, sticky_name, None)
+            if isinstance(sticky_map, dict):
+                mid = sticky_map.pop(u, None) or sticky_map.pop(str(u), None)
+                if mid:
+                    x = _as_int(mid)
+                    if x is not None:
+                        with suppress(Exception):
+                            await bot.delete_message(chat_id=u, message_id=x)
+
+    # 2.5 финальный проход: если модуль деталей сохранял «последнее сообщение отчёта»
+    #     непосредственно в last_user_messages — удалим те, что совпадают с удалёнными id.
+    with suppress(Exception):
+        lum = (getattr(state, "last_user_messages", {}) or {}).get(u) or []
+        if isinstance(lum, list) and lum:
+            new_lum = []
+            ids_set = set(ids)
+            for msg in lum:
+                try:
+                    mid = int(getattr(msg, "message_id", 0))
+                except Exception:
+                    mid = 0
+                if mid and mid in ids_set:
+                    continue
+                new_lum.append(msg)
+            (getattr(state, "last_user_messages", {}) or {}).__setitem__(u, new_lum)  # type: ignore[index]
+
+    # Никаких исключений наружу — функция «тихая».
+
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2206,53 +2372,6 @@ async def _cb_swap_request_legacy_noop(callback: types.CallbackQuery) -> None:
     except Exception:
         pass
     logger.debug("[my_games.swap] legacy noop called for data=%s", getattr(callback, "data", ""))
-
-
-# [7.3] HANDLERS: REPORT FLOW — «📝 Написать отчёт»
-from services.amocrm import get_deal_by_id, patch_lead, update_deal_status  # type: ignore
-try:
-    from services.amocrm import _build_cf_patch  # type: ignore
-except Exception:
-    _build_cf_patch = None  # type: ignore
-
-@router.callback_query(lambda c: c.data and c.data.startswith(REPORT_PREFIX))
-async def cb_report_start(callback: _types.CallbackQuery) -> None:
-    uid = callback.from_user.id
-    deal_id = int((callback.data or "").split("_")[-1])
-    state.pending_report = getattr(state, "pending_report", {})
-    state.pending_report[uid] = deal_id
-    with contextlib.suppress(Exception):
-        await callback.message.edit_reply_markup(reply_markup=None)
-    await Bot.get_current().send_message(
-        uid,
-        "📝 Пришлите текст отчёта одним сообщением. Чтобы отменить — отправьте слово «Отмена».",
-    )
-    await callback.answer()
-
-@router.message(lambda m: (getattr(state, "pending_report", {}) or {}).get(m.from_user.id))
-async def on_report_text(message: types.Message) -> None:
-    uid = message.from_user.id
-    deal_id = int((getattr(state, "pending_report", {}) or {}).get(uid))
-    text = (message.text or "").strip()
-    if text.lower() in {"отмена", "cancel", "/cancel"}:
-        (getattr(state, "pending_report", {}) or {}).pop(uid, None)
-        await message.answer("Отмена. Возвращаюсь к «Моим играм».")
-        await redraw_my_games(uid)
-        return
-    deal = await get_deal_by_id(int(deal_id))
-    old_comment = str((deal or {}).get("comment") or "").strip()
-    stamp = datetime.now(MSK_TZ).strftime("%d.%m.%Y %H:%M")
-    author = _short_name(uid) or "Ведущий"
-    new_comment = (old_comment + "\n\n" if old_comment else "") + f"Отчёт {author} от {stamp}:\n{text}"
-    payload = await _build_cf_patch({"comment": new_comment}) if callable(_build_cf_patch) else None
-    if not payload or not await patch_lead(int(deal_id), payload):
-        await message.answer("⚠️ Не удалось сохранить отчёт в сделке. Попробуйте позже.")
-        return
-    ok = await update_deal_status(int(deal_id), str(OK_STATUS_ID))
-    await message.answer("✅ Отчёт принят и добавлен в сделку." + ("" if ok else " (статус сменить не удалось)"))
-    (getattr(state, "pending_report", {}) or {}).pop(uid, None)
-    await _soft_redraw_my_games(uid)
-
 
 # [7.4] POST-CONFIRM UI HOOK (no callback intercept)
 # Версия 7.4.4 · 2025-08-29
