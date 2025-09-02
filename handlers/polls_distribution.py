@@ -1113,7 +1113,7 @@ def distribution_actions_markup() -> InlineKeyboardMarkup:
 # находится в секциях [1], [1.k], [3], [4] и [5].
 
 # ════════════════════════════════════════════════════════════════════
-# [3] HANDLER: Утвердить одну игру (без автопереходов) — канон-уведомление + двусторонний refresh
+# [3] HANDLER: Утвердить одну игру (без автопереходов) — шапка 🎉 + двусторонний refresh
 # ════════════════════════════════════════════════════════════════════
 import inspect
 from contextlib import suppress
@@ -1125,7 +1125,7 @@ async def poll_approve_game_handler(callback: CallbackQuery) -> None:
     Утверждение одной игры. Без автопереходов:
     • перекраска кнопки «Утвердить» → «✅ Утверждено» в текущем сообщении,
     • запись состава (включая admin, если он есть) в locked_distribution,
-    • чат-уведомление строго каноническим текстом (название сделки в кавычках),
+    • чат-уведомление с согласованной шапкой 🎉 <Название> — DD.MM HH:MM <Пакет> <Бонусы/Нет бонусов>,
     • мягкий refresh и отчёта, и деталей (если доступно).
     """
     # разбор callback
@@ -1175,18 +1175,19 @@ async def poll_approve_game_handler(callback: CallbackQuery) -> None:
     with suppress(Exception):
         await callback.answer("Игра утверждена ✅")
 
-    # каноническое уведомление в общий чат
+    # уведомление в общий чат (НОВЫЙ формат шапки)
     try:
         bot = callback.message.bot if callback.message else None
         if bot:
             chat_id = await _resolve_notify_chat_id(bot)
             if chat_id is not None:
-                title = _deal_title_from_state(int(deal_id))
+                header = _approval_header_line(int(deal_id))
                 lines = await _lines_from_slots(slots)  # строго из зафиксированных слотов
                 text = (
-                    f'Состав команды на игру "{title}" утвержден.\n'
-                    + "\n".join(lines)
-                    + "\nПодтвердите свое участие в личном кабинете"
+                    f"🎉 {header}\n"
+                    f"Состав команды на игру утвержден.\n"
+                    f"{'\n'.join(lines)}\n"
+                    f"Подтвердите свое участие в личном кабинете!"
                 )
                 kb2 = await _approval_announce_kb()
                 await bot.send_message(chat_id, text, reply_markup=kb2)
@@ -1213,8 +1214,7 @@ async def poll_approve_game_handler(callback: CallbackQuery) -> None:
 
 # История изменений:
 #  • 2025-08-27 — канон-уведомление, список из slots (SSOT), двусторонний refresh (отчёт+детали), фиксы Pylance.
-
-
+#  • 2025-09-02 — сообщение приведено к утверждённому формату (шапка 🎉 + дата/время/пакет/бонусы, «!» в конце).
 
 # ════════════════════════════════════════════════════════════════════
 # [4] HANDLER: Утвердить все готовые (батч) — канон-уведомление и slots-списки
@@ -1260,15 +1260,16 @@ async def poll_approve_all_ready_handler(callback: CallbackQuery) -> None:
             slots = await _commit_locked_distribution_to_state(did, roles)
             approved.append(did)
 
-            # каноническое чат-уведомление (строго из slots)
+            # каноническое чат-уведомление (НОВЫЙ формат: шапка 🎉 + дата/время/пакет/бонусы)
             if bot and chat_id is not None:
                 try:
-                    title = _deal_title_from_state(did)
+                    header = _approval_header_line(did)
                     lines = await _lines_from_slots(slots)
                     text = (
-                        f'Состав команды на игру "{title}" утвержден.\n'
-                        + "\n".join(lines)
-                        + "\nПодтвердите свое участие в личном кабинете"
+                        f"🎉 {header}\n"
+                        f"Состав команды на игру утвержден.\n"
+                        f"{'\n'.join(lines)}\n"
+                        f"Подтвердите свое участие в личном кабинете!"
                     )
                     kb2 = await _approval_announce_kb()
                     await bot.send_message(chat_id, text, reply_markup=kb2)
@@ -1299,7 +1300,7 @@ async def poll_approve_all_ready_handler(callback: CallbackQuery) -> None:
 
 # История изменений:
 # • 2025-08-27 — канон-уведомление, список из slots (SSOT), фиксы Pylance.
-
+# • 2025-09-02 — сообщение приведено к утверждённому формату (шапка 🎉 + дата/время/пакет/бонусы, «!» в конце).
 
 # ════════════════════════════════════════════════════════════════════
 # [5] ПРОЧИЕ HANDLERS: stop / back

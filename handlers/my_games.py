@@ -174,19 +174,13 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
     """
     Детали игры в «🎲 Мои игры»:
       • подробности из CRM (дата, время, место, пакет, игроки, статус);
-      • утверждённый состав из state.locked_distribution (слоты lead*/assistant*/admin/trainee);
+      • утверждённый состав из locked_distribution (слоты lead*/assistant*/admin/trainee),
+        с фолбэком на finished_locked_distribution и snapshot из distribution_cache;
       • кнопка «✅ Подтвердить участие» — при статусе «Бронь» ИЛИ «Предварительная заявка», если назначен;
       • кнопка «🔁 Замена» — после ЛИЧНОГО подтверждения пользователя (даже если вся команда ещё не подтвердила),
         а также при статусе «Завершение сделки»;
       • кнопка «📝 Написать отчёт» — после наступления даты и времени игры.
       • повторно кнопку подтверждения не показываем, если подтверждение уже учтено локально/по тегам.
-
-    ФИКС «пылесоса»: перед рендером деталей мягко удаляем sticky-дашборд (vacuum с ignore_sticky=True),
-    затем все отправленные сообщения аккумулируются и сохраняются в state.last_user_messages[uid] — 
-    следующий vacuum их удалит гарантированно.
-
-    Изм. 2025-08-29 — корректное время: приоритет event_time (нормализация до HH:MM), 
-    затем — время из event_datetime (игнор «00:00»), иначе «—».
     """
     # — фильтр против автоперехода из дашборда — только details
     if not str(callback.data).startswith("mygame_details_"):
@@ -247,10 +241,9 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
         time_s = _norm(str(deal.get("event_time") or "")) if callable(_norm) else str(deal.get("event_time") or "").replace(".", ":").strip()
     except Exception:
         time_s = str(deal.get("event_time") or "").replace(".", ":").strip()
-    if not time_s:
-        if hasattr(event_dt, "strftime"):
-            t_from_dt = event_dt.strftime("%H:%M")
-            time_s = "" if t_from_dt == "00:00" else t_from_dt
+    if not time_s and hasattr(event_dt, "strftime"):
+        t_from_dt = event_dt.strftime("%H:%M")
+        time_s = "" if t_from_dt == "00:00" else t_from_dt
     if not time_s:
         time_s = "—"
 
@@ -270,13 +263,24 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
         or ("Предварительная заявка" if prelim else ("Бронь" if status_id == bron_id else "Завершение сделки" if status_id == ok_id else "—"))
     )
 
-    # Состав из locked_distribution (источник правды — новые "слоты")
+    # 🔧 Состав: locked → finished_locked → snapshot(distribution_cache)
+    dist: Dict[str, Any] = {}
     locked_all = (getattr(state, "locked_distribution", {}) or {})
-    dist: Dict[str, str] = {}
-    if isinstance(locked_all.get(deal_id), dict):
-        dist = locked_all[deal_id]
-    elif isinstance(locked_all.get(str(deal_id)), dict):
-        dist = locked_all[str(deal_id)]  # pragma: no cover
+    finished_all = (getattr(state, "finished_locked_distribution", {}) or {})
+    # 1) active locked
+    cand = locked_all.get(deal_id) or locked_all.get(str(deal_id))
+    if isinstance(cand, dict) and cand:
+        dist = cand
+    else:
+        # 2) finished locked
+        cand = finished_all.get(deal_id) or finished_all.get(str(deal_id))
+        if isinstance(cand, dict) and cand:
+            dist = cand
+        else:
+            # 3) snapshot (последний известный состав)
+            snap = (getattr(state, "distribution_cache", {}) or {}).get(str(deal_id)) or {}
+            if isinstance(snap, dict) and snap:
+                dist = snap
 
     lead_keys = _sorted_slots(dist, "lead")
     asst_keys = _sorted_slots(dist, "assistant")
@@ -318,8 +322,19 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
     msgs: List[types.Message] = []
     msgs.append(await bot.send_message(uid, "\n".join(lines), parse_mode="Markdown"))
 
-    # Роль пользователя (для кнопок)
-    role = _assigned_role_from_state(uid, deal_id)  # main/assist/admin/None
+    # Роль пользователя (для кнопок): prefer union helper, fallback на legacy
+    role: Optional[str] = None
+    try:
+        _role_union = globals().get("_assigned_role_via_locked")
+        if callable(_role_union):
+            role = _role_union(uid, deal_id)  # type: ignore[misc]
+    except Exception:
+        role = None
+    if role is None:
+        try:
+            role = _assigned_role_from_state(uid, deal_id)  # legacy helper из файла
+        except Exception:
+            role = None
 
     # confirmed по факту: теги ИЛИ локальный state.pending_confirmations
     confirmed_by_tags = _has_confirmation_tag(deal, uid)
@@ -375,6 +390,8 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
 #                затем — из event_datetime (игнор «00:00»), иначе «—». В остальном без изменений.
 # • 2025-08-31 — Выровнено под SSOT: «🔁 Замена» доступна после личного подтверждения или при SUCCESS;
 #                сохранён мягкий vacuum sticky; без изменений публичных API.
+# • 2025-09-02 — FIX: состав для деталей ищется в locked → finished_locked → distribution_cache (snapshot),
+#                роль для кнопок берётся через union-хелпер (если есть); выровнено под SSOT/фиксы Pylance.
 
 
 # ════════════════════════════════════════════════════════════════════
