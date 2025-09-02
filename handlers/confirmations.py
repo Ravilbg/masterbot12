@@ -450,6 +450,229 @@ def _is_bron(sid: Optional[str], name_lower: str) -> bool:
         return True
     return name_lower == "бронь"
 
+# ███ [3.2] ALL-CONFIRMED ANNOUNCE — SSOT title/date/time/team
+# --------------------------------------------------------------------
+from typing import Any, Dict, List, Optional, Tuple
+from contextlib import suppress
+
+from core.state import state  # глобальный state нужен хелперам
+
+def _deal_title(d: Dict[str, Any]) -> str:
+    """
+    SSOT для заголовка игры:
+      game_name → name → f"Сделка #{id}"
+    Идентично логике из handlers/polls_lifecycle.py.
+    """
+    try:
+        return str(d.get("game_name") or d.get("name") or f"Сделка #{int(d.get('id') or 0)}").strip()
+    except Exception:
+        return f"Сделка #{d.get('id')}" if d and d.get("id") else "Сделка"
+
+def _normalize_time_str(raw: Optional[str]) -> str:
+    """
+    Нормализует строку времени к 'HH:MM'. Примеры: '18.00'→'18:00', '930'→'09:30', '9'→'09:00'.
+    Пустое/мусор → ''.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    s = s.replace(" ", "").replace(".", ":")
+    if ":" not in s:
+        if not s.isdigit():
+            return ""
+        if len(s) == 4:
+            hh, mm = s[:2], s[2:]
+        elif len(s) == 3:
+            hh, mm = s[:1], s[1:]
+        elif len(s) == 2:
+            hh, mm = s, "00"
+        else:
+            hh, mm = s, "00"
+        return f"{int(hh):02d}:{int(mm):02d}"
+    try:
+        h, m = s.split(":", 1)
+        hh = int(h) if h else 0
+        mm = int(m) if m else 0
+        return f"{hh:02d}:{mm:02d}"
+    except Exception:
+        return ""
+
+def _team_slots_for_announce(deal_id: int) -> Dict[str, Any]:
+    """
+    Источник состава для анонса (НЕ модифицирует state):
+      1) state.locked_distribution[deal_id]
+      2) state.finished_locked_distribution[deal_id] или state.finished_locked[deal_id]
+      3) snapshot из state.distribution_cache[str(deal_id)]
+    """
+    raw = (getattr(state, "locked_distribution", {}) or {}).get(deal_id) \
+       or (getattr(state, "locked_distribution", {}) or {}).get(str(deal_id))
+    if isinstance(raw, dict) and raw:
+        return raw
+
+    fin = (getattr(state, "finished_locked_distribution", {}) or {}).get(deal_id) \
+       or (getattr(state, "finished_locked_distribution", {}) or {}).get(str(deal_id)) \
+       or (getattr(state, "finished_locked", {}) or {}).get(deal_id) \
+       or (getattr(state, "finished_locked", {}) or {}).get(str(deal_id))
+    if isinstance(fin, dict) and fin:
+        return fin
+
+    snap = (getattr(state, "distribution_cache", {}) or {}).get(str(deal_id)) or {}
+    return snap if isinstance(snap, dict) else {}
+
+def _date_time_for_announce(deal_id: int) -> Tuple[str, str]:
+    """
+    Возвращает (date_s, time_s) строго из кастомных полей CRM:
+      • event_date, event_time (time → HH:MM, '.'→':');
+      • фолбэк — время из event_datetime, если оно не '00:00'.
+    Источники: state.current_poll_deals → state.deals_index.
+    """
+    date_s, time_s = "", ""
+
+    # 1) текущий снапшот опроса
+    with suppress(Exception):
+        for d in (getattr(state, "current_poll_deals", []) or []):
+            if int(d.get("id") or 0) == int(deal_id):
+                date_s = str(d.get("event_date") or "").strip()
+                time_s = _normalize_time_str(d.get("event_time"))
+                if not time_s and d.get("event_datetime") and hasattr(d["event_datetime"], "strftime"):
+                    t_dt = d["event_datetime"].strftime("%H:%M")
+                    time_s = "" if t_dt == "00:00" else t_dt
+                return (date_s or "", time_s or "")
+
+    # 2) локальный индекс (например, собранный при опросе)
+    with suppress(Exception):
+        meta = (getattr(state, "deals_index", {}) or {}).get(deal_id) \
+            or (getattr(state, "deals_index", {}) or {}).get(str(deal_id)) \
+            or {}
+        if isinstance(meta, dict) and meta:
+            date_s = str(meta.get("event_date") or "").strip()
+            time_s = _normalize_time_str(meta.get("event_time"))
+            if not time_s and meta.get("event_datetime") and hasattr(meta["event_datetime"], "strftime"):
+                t_dt = meta["event_datetime"].strftime("%H:%M")
+                time_s = "" if t_dt == "00:00" else t_dt
+
+    return (date_s or "", time_s or "")
+
+async def _resolve_title_for_announce(deal_id: int) -> str:
+    """
+    Возвращает корректный заголовок для анонса:
+      1) state.current_poll_deals → _deal_title
+      2) state.deals_index → _deal_title
+      3) AmoCRM: пытаемся достать game_name из custom_fields_values; если нет — используем name.
+      4) Фолбэк: «Сделка #id»
+    """
+    did = int(deal_id)
+    # 1) current_poll_deals
+    with suppress(Exception):
+        for d in (getattr(state, "current_poll_deals", []) or []):
+            if int(d.get("id") or 0) == did:
+                t = _deal_title(d)
+                if t:
+                    return t
+
+    # 2) deals_index
+    with suppress(Exception):
+        meta = (getattr(state, "deals_index", {}) or {}).get(did) \
+            or (getattr(state, "deals_index", {}) or {}).get(str(did)) \
+            or {}
+        if isinstance(meta, dict) and meta:
+            t = _deal_title({"id": did, **meta})
+            if t:
+                return t
+
+    # 3) AmoCRM (custom_field «game_name» приоритетнее, чем обычное name)
+    with suppress(Exception):
+        from services import amocrm as _amo  # type: ignore
+        if hasattr(_amo, "get_deal_by_id"):
+            deal = await _amo.get_deal_by_id(did)
+            if isinstance(deal, dict) and deal:
+                # Попробуем достать game_name из custom_fields_values
+                cf_name = ""
+                with suppress(Exception):
+                    for cf in (deal.get("custom_fields_values") or []):
+                        code = (cf.get("field_code") or "").lower()
+                        if code in {"game_name", "gamename", "quest_name"}:
+                            vals = cf.get("values") or []
+                            if vals:
+                                cf_name = str(vals[0].get("value") or "").strip()
+                                if cf_name:
+                                    break
+                if cf_name:
+                    return _deal_title({"id": did, "game_name": cf_name})
+                # Иначе обычное name как мягкий фолбэк
+                name = str(deal.get("name") or "").strip()
+                if name:
+                    return _deal_title({"id": did, "name": name})
+
+    # 4) Фолбэк
+    return f"Сделка #{did}"
+
+async def _announce_all_confirmed(deal_id: int) -> None:
+    """
+    Единоразово шлёт в общий чат:
+      «✅ Вся команда подтвердила участие.»
+      «🎮 «<Заголовок>» — ДД.ММ.ГГГГ ЧЧ:ММ»
+      <буллет-список состава>
+    Идемпотентность на процесс: не более одного анонса на deal_id.
+    """
+    try:
+        did = int(deal_id)
+    except Exception:
+        return
+
+    # антидубли
+    announced: set[int] = state.__dict__.setdefault("_all_confirmed_announced", set())  # type: ignore[assignment]
+    if did in announced:
+        return
+
+    # состав
+    slots = _team_slots_for_announce(did)
+    if not isinstance(slots, dict) or not slots:
+        return
+
+    # строки состава
+    try:
+        from core.utils import team_bulleted_lines  # type: ignore
+        lines: List[str] = await team_bulleted_lines(slots)
+    except Exception:
+        lines = []
+
+    # заголовок/дата/время
+    title = await _resolve_title_for_announce(did)
+    date_s, time_s = _date_time_for_announce(did)
+    head = f"🎮 «{title}»"
+    tail = " ".join(x for x in (date_s, time_s) if x)
+    if tail:
+        head = f"{head} — {tail}"
+
+    # куда слать
+    try:
+        from core.utils import resolve_notify_chat_id  # type: ignore
+        chat_id = resolve_notify_chat_id()
+    except TypeError:
+        from core.utils import resolve_notify_chat_id  # type: ignore
+        chat_id = resolve_notify_chat_id()
+    if chat_id is None:
+        return
+
+    # текст
+    parts: List[str] = ["✅ Вся команда подтвердила участие."]
+    if head:
+        parts.append(head)
+    if lines:
+        parts.append("\n".join(lines))
+    text = "\n".join(p for p in parts if p)
+
+    # отправка
+    from aiogram import Bot as _Bot  # локальный импорт для типов
+    bot = _Bot.get_current()
+    await bot.send_message(chat_id, text)
+    announced.add(did)
+
+# История изменений:
+#   • 2025-09-02 — выровнено под SSOT: title=game_name→name→fallback; время из custom fields; Pylance ok.
+
+
 
 # ███ [4.0] CALLBACK: CONFIRM ROLE — универсальный вход из деталей и других мест
 # --------------------------------------------------------------------

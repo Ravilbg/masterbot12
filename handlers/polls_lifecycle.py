@@ -1429,27 +1429,57 @@ async def create_poll_handler(message: types.Message) -> None:
             await message.delete()
         return
 
-    # окно дат — settings.POLL_WINDOW_DAYS (фолбэк 10)
+    # --- SSOT-фильтры ------------------------------------------------
+    # • статус = BRON_STATUS_ID или PREBOOK_STATUS_ID (бэкомпат: PRE_APPLICATION_STATUS_ID);
+    # • НЕТ ролевых тегов ведущих в AmoCRM (анализируем d['tags'], не team_leads);
+    # • event_datetime ∈ [сейчас; +10 дней].
     now = datetime.now(tz=MSK_TZ)
-    window = now + timedelta(days=_window_days())
-    valid_statuses = _status_ids_for_new_games()
+    window = now + timedelta(days=10)  # требование: строго ближайшие 10 дней
 
-    # Фильтр: только статусы Бронь/Предварительная, в окне, без тегов ведущих
+    # Собираем допустимые status_id из настроек (без расширений)
+    def _allowed_statuses() -> List[Any]:
+        vals: List[Any] = []
+        for attr in ("BRON_STATUS_ID", "PREBOOK_STATUS_ID", "PRE_APPLICATION_STATUS_ID"):  # PREBOOK ~ PRE_APPLICATION
+            if hasattr(settings, attr):
+                v = getattr(settings, attr)
+                if v is not None:
+                    vals.append(v)
+        return vals
+
+    ALLOWED = _allowed_statuses()
+
+    def _status_matches(sid: Any) -> bool:
+        """Сопоставление с допуском разных типов (int/str) без падений."""
+        for a in ALLOWED:
+            try:
+                # прямое сравнение
+                if sid == a:
+                    return True
+                # мягкое приведение к int, если возможно
+                return int(sid) == int(a)  # noqa: PLW2901 (одно сравнение достаточно)
+            except Exception:
+                continue
+        return False
+
     raw_deals: List[Dict[str, Any]] = []
     for d in (deals or []):
         try:
-            if valid_statuses and d.get("status_id") not in valid_statuses:
+            # 1) статус — ровно BRON/PREBOOK (или PRE_APPLICATION как алиас)
+            if not _status_matches(d.get("status_id")):
                 continue
-            if not _deal_in_window(d, now, window):
+            # 2) дата события из кастомного поля AmoCRM
+            dt = d.get("event_datetime")
+            if not (isinstance(dt, datetime) and now <= dt <= window):
                 continue
-            if _has_leader_tags(d):  # 🚫 уже назначены
+            # 3) никаких ролевых тегов в AmoCRM ('.1/.2/.Адм/.Стаж')
+            if _has_leader_tags(d):
                 continue
             raw_deals.append(d)
         except Exception:
             continue
 
     if not raw_deals:
-        await _screen("😔 Нет новых игр.", kb=await get_main_menu(uid))
+        await _screen("😔 Нет подходящих игр на ближайшие 10 дней.", kb=await get_main_menu(uid))
         with contextlib.suppress(Exception):
             await message.delete()
         return
@@ -1498,7 +1528,7 @@ async def create_poll_handler(message: types.Message) -> None:
     embedded = [d for d in raw_deals if _is_embedded(d)]
     regular  = [d for d in raw_deals if not _is_embedded(d)]
 
-    urgent = any((_event_dt(d) or now) <= now + timedelta(days=3) for d in raw_deals)
+    urgent = any((d.get("event_datetime") or now) <= now + timedelta(days=3) for d in raw_deals)
     header_base = "🚨 Срочные!" if urgent else "📊 Новые игры"
 
     # общий план постов: каждый embedded — отдельный «чанк», обычные — пачками по 8
@@ -1553,10 +1583,6 @@ async def create_poll_handler(message: types.Message) -> None:
     with contextlib.suppress(Exception):
         await message.delete()
 
-# История изменений (2025-08-29):
-# • Фильтр на окно дат = POLL_WINDOW_DAYS (фолбэк 10) и статусы Бронь/Предварительная;
-# • Исключены сделки с тегами ведущих (только теги, не team_leads);
-# • Маркер «(предварительно)» в названиях в опросах.
 
 # ════════════════════════════════════════════════════════════════════
 # [3.1] «Новая игра» в активном цикле → отдельный опрос «Срочные игры»

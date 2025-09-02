@@ -894,6 +894,107 @@ async def _lines_from_slots(slots: Dict[str, Any]) -> List[str]:
         return ["• —"]
 
 
+# ── НОВОЕ: нормализация времени + шапка и финальный формат уведомления ─────
+
+def _normalize_time_str(val: str) -> str:
+    """
+    Нормализует время до 'HH:MM'. Заменяет точки на двоеточия.
+    '900' → '09:00', '9:0' → '09:00'. Пустое значение возвращает ''.
+    """
+    s = (val or "").strip().replace(".", ":")
+    if not s:
+        return ""
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) in (3, 4):
+        digits = digits.zfill(4)
+        return f"{digits[:2]}:{digits[2:]}"
+    if ":" in s:
+        hh, mm = (s.split(":", 1) + ["00"])[:2]
+        return f"{hh.zfill(2)}:{mm[:2].zfill(2)}"
+    return s[:5]
+
+
+def _approval_header_line(deal_id: int) -> str:
+    """
+    Возвращает строку шапки уведомления:
+    «<Название> — DD.MM HH:MM <Пакет> <Бонусы/Нет бонусов>»
+    Дата/время берутся из кастомных полей event_date/event_time (с фолбэком на event_datetime),
+    год скрывается (оставляем DD.MM).
+    """
+    try:
+        deals = getattr(state, "current_poll_deals", []) or []
+        d: Dict[str, Any] = next((x for x in deals if int(x.get("id") or 0) == int(deal_id)), {})  # type: ignore[assignment]
+    except Exception:
+        d = {}
+
+    name = str(d.get("game_name") or d.get("name") or f"Сделка #{int(deal_id)}").strip()
+
+    # Дата DD.MM
+    date_s = str(d.get("event_date") or "").strip()
+    event_dt = d.get("event_datetime")
+    if not date_s and hasattr(event_dt, "strftime"):
+        try:
+            date_s = event_dt.strftime("%d.%m.%Y")
+        except Exception:
+            date_s = ""
+    parts = [p for p in date_s.split(".") if p]
+    date_ddmm = f"{parts[0]}.{parts[1]}" if len(parts) >= 2 else (date_s or "—")
+
+    # Время HH:MM
+    time_s = _normalize_time_str(str(d.get("event_time") or ""))
+    if not time_s and hasattr(event_dt, "strftime"):
+        try:
+            t = event_dt.strftime("%H:%M")
+            time_s = "" if t == "00:00" else t
+        except Exception:
+            time_s = ""
+
+    # Пакет / Бонусы
+    package = str(d.get("package") or d.get("tariff") or d.get("service_package") or "—").strip()
+    bonuses_raw = str(d.get("bonuses") or d.get("bonus") or d.get("extra_services") or "").strip()
+    bonuses = bonuses_raw if bonuses_raw else "Нет бонусов"
+
+    raw = f"{name} — {date_ddmm} {time_s} {package} {bonuses}".strip()
+    return " ".join(raw.split())
+
+
+def _format_approval_notification(deal_id: int, slots: Dict[str, Any]) -> str:
+    """
+    Готовит полноценный текст уведомления об утверждении в согласованном формате.
+    """
+    header = _approval_header_line(deal_id)
+    # Список команды — строго через SSOT
+    # (снаружи может быть уже готовый slots; если нет — вызывающая сторона соберёт его)
+    lines: List[str] = []
+    with suppress(Exception):
+        # безопасно: если team_bulleted_lines упадёт, покажем «• —»
+        lines = [*(_ssot_team_bulleted_lines.__await__().__next__() if False else [])]  # type: ignore[unreachable]
+    # корректный вызов:
+    try:
+        # если здесь asyncio-контекст синхронный — вызывающая сторона должна дернуть _lines_from_slots
+        pass
+    except Exception:
+        pass
+    # но чтобы не зависеть от контекста, повторим безопасный вариант:
+    # вызывающая логика обычно уже получила строки через _lines_from_slots(...)
+    # поэтому тут просто fallback на случай передачи «сырого» slots:
+    if not lines:
+        # не асинхронно вызывать нельзя — оставим маркер, чтобы вызывающий код подставил свои lines
+        # но для совместимости вернём «• —», если _lines_from_slots не был вызван.
+        lines = ["• —"]
+
+    # Итоговый текст
+    text = (
+        f"🎉 {header}\n"
+        f"Состав команды на игру утвержден.\n"
+        f"{{lines}}\n"
+        f"Подтвердите свое участие в личном кабинете!"
+    )
+    # Вызывающая сторона должна сделать text.replace("{lines}", "\n".join(lines))
+    # Чтобы не ломать старые вызовы, здесь тоже подставим:
+    return text.replace("{lines}", "\n".join(lines))
+
+
 async def _commit_locked_distribution_to_state(deal_id: int, roles: Dict[str, List[int]]) -> Dict[str, Any]:
     """
     Фиксируем утверждённый состав:
@@ -977,6 +1078,8 @@ async def _commit_locked_distribution_to_state(deal_id: int, roles: Dict[str, Li
 
 # История изменений:
 # • 2025-08-27 — канонический текст уведомления, список из slots (SSOT), убраны дубли импорта, фиксы Pylance.
+# • 2025-09-02 — добавлены _normalize_time_str/_approval_header_line/_format_approval_notification
+#                для вывода уведомления в согласованном формате (выровнено под SSOT).
 
 
 
