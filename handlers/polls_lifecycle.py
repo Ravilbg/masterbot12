@@ -916,7 +916,7 @@ async def _auto_assign_from_responses(impacted: Set[int], apply_to_all_on_admin_
       4) Добираем ТОЛЬКО ПУСТЫЕ слоты по приоритетам:
          Светофор (green < yellow < red/нет) → меньше игр за месяц → uid.
          Для core-ролей (lead/assist) red не берём автоматически.
-         Для admin — сперва «могу админом», затем ассист-пул.
+         Для admin — только те, кто нажал «могу админом».
       5) Сохраняем результат обратно в distribution_cache[str(did)].
 
     apply_to_all_on_admin_flag: True → пересчитать все текущие игры цикла.
@@ -1082,7 +1082,7 @@ async def _auto_assign_from_responses(impacted: Set[int], apply_to_all_on_admin_
         # Админ (если требуется пакетом)
         if need_adm:
             if dist.get("admin") in (None, "", 0):
-                pick = _take_from_pool(pool_adm) or _take_from_pool(pool_ass)
+                pick = _take_from_pool(pool_adm)  # ← строго из тех, кто нажал «могу админом»
                 if pick:
                     dist["admin"] = _fmt(pick)
                     used.add(int(pick["uid"]))
@@ -1096,6 +1096,7 @@ async def _auto_assign_from_responses(impacted: Set[int], apply_to_all_on_admin_
     # История изменений:
     # 2025-08-26 — v2: «бережное автораспределение» — сохраняем ручные перестановки, чистим только снятых,
     #                   добор только пустых слотов; устранение дублей lead→assist→admin; SSOT/инварианты сохранены.
+    # 2025-09-02 — правка: админ только из pool_adm (без фолбэка на ассист).
 
 
 # ────────────────────────────────────────────────────────────────────
