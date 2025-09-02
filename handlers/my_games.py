@@ -25,6 +25,7 @@ import inspect
 import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Any
+from core.menu import get_menu_message_id  # NEW: не сносим сообщение главного меню
 
 from aiogram import Bot, Router, types
 from aiogram.filters import Command
@@ -1706,15 +1707,10 @@ def _my_games(uid: int, deals: List[Dict]) -> List[Dict]:
     return _visible_deals_for_user(uid, deals)
 
 # ███ [5] DASHBOARD / DETAILS — липкий дашборд + пылесос как в отчёте
-# Версия 5.7.3 · 2025-08-29
-# Изменения:
-# • Добавлен sticky-слот дашборда «Мои игры» (state.my_games_dashboard).
-# • _send_dashboard теперь редактирует существующее сообщение (edit_message_text/…),
-#   а не удаляет/создаёт заново. Это устраняет «пустые оболочки» в ленте.
-# • _vacuum_safe сохраняет sticky и мягко чистит хвосты деталей (как в отчёте).
-# • Добавлен update_my_games_buttons_only — «тихая» перекраска кнопок без текста.
-# • _build_dashboard_kb_v2 не зависит от внешних make_my_games_*; SSOT-логика внутри.
-# • NEW: безопасная сортировка по timestamp (совместима с naive/aware datetime).
+# Версия 5.7.4 · 2025-09-02
+# Изменения в этой правке:
+# • Гарантируем сохранение сообщения главного меню в keep (и в keep_for_vacuum, и в _vacuum_safe).
+# • Остальная логика блока без изменений.
 import logging
 from contextlib import suppress
 from typing import Any, Dict, List, Optional, TYPE_CHECKING, Callable, cast
@@ -1750,6 +1746,14 @@ def keep_for_vacuum(uid: int, *extra_msg_ids: int) -> List[int]:
     sticky = get_my_games_dashboard(int(uid))
     if isinstance(sticky, int):
         keep.append(sticky)
+
+    # ✅ также сохраняем сообщение главного меню (если известно)
+    with suppress(Exception):
+        from core.menu import get_menu_message_id  # опционально; совместимо с ранними сборками
+        mmid = get_menu_message_id(int(uid))
+        if isinstance(mmid, int) and mmid > 0 and mmid not in keep:
+            keep.append(mmid)
+
     for mid in extra_msg_ids:
         try:
             m2 = int(mid)
@@ -1798,11 +1802,19 @@ async def _vacuum_safe(uid: int, keep: Optional[List[Any]] = None, *, ignore_sti
                 keep_ids.append(int(k.message_id))
             elif isinstance(k, int):
                 keep_ids.append(int(k))
-    # приклеим sticky
+
+    # приклеим sticky (если не игнорируется)
     if not ignore_sticky:
         for mid in keep_for_vacuum(int(uid)):
             if mid not in keep_ids:
                 keep_ids.append(mid)
+
+    # ✅ независимо от ignore_sticky — сохраняем сообщение главного меню
+    with suppress(Exception):
+        from core.menu import get_menu_message_id  # локальный импорт безопасен и не ломает прежние сборки
+        mmid = get_menu_message_id(int(uid))
+        if isinstance(mmid, int) and mmid > 0 and mmid not in keep_ids:
+            keep_ids.append(mmid)
 
     bot = Bot.get_current()
 
@@ -1892,7 +1904,7 @@ def _build_dashboard_kb_v2(uid: int, deals_sorted: List[Dict[str, Any]]) -> Inli
             with suppress(Exception):
                 role = _assigned_role_from_state(uid, did)
 
-        # строка действия: «Замена» если подтверждено или «Заверш.»; иначе «Подтвердить», если назначен и статус допустим
+        # строка действия
         if confirmed or sid == OK_ID:
             kb.row(InlineKeyboardButton(text="🔁 Замена", callback_data=f"{globals().get('SWAP_PREFIX','mygame_swap_')}{did}"))
         elif role in {"main", "assist", "admin"} and (sid == BRON_ID or status == "Предвар."):
@@ -2040,8 +2052,6 @@ async def _send_details(uid: int, deal: Dict[str, Any]) -> None:
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ Назад к списку", callback_data="mygames_back")
     await bot.send_message(int(uid), text, reply_markup=kb.as_markup())
-
-
 
 
 

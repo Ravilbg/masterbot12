@@ -1,12 +1,15 @@
 # handlers/guide.py — «бот-проводник» для группового чата ведущих
 # ────────────────────────────────────────────────────────────────────
 """
-MasterBot v14.8 · 2025-08-24
+MasterBot v15.0 · 2025-09-02
 
-Fix 14.8
-• Переход на методы экземпляра Bot для пинов/распинов (aiogram 3.x):
-  bot.pin_chat_message(...) / bot.unpin_all_chat_messages(...)
-  вместо прямых вызовов классов методов (PinChatMessage / UnpinAllChatMessages).
+NEW 15.0
+• Приватное «Главное меню» теперь показывается как единственный блок через
+  SSOT-хелпер send_root_menu_singleton (жёсткий пылесос внутри).
+• Добавлены приватные хэндлеры: /start и «Меню» → показать корневое меню.
+
+Fix 14.8 (исторически)
+• Переход на методы экземпляра Bot для пинов/распинов (aiogram 3.x).
 • Поведение без изменений: авто-пин меню в группе, обновление разметки,
   обработка кастом-кнопок только в группах, SQLite-хранилище.
 • Добавлены типы и защитные проверки для state.group_menu_message_id.
@@ -22,16 +25,18 @@ import sqlite3
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from aiogram import Bot, Router
+from aiogram import Bot, Router, F
 from aiogram.enums import ChatType
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command  # ← NEW: Command
 from aiogram.types import (
     ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    ReplyKeyboardMarkup,
 )
 
+from core.menu import get_main_menu, send_root_menu_singleton  # SSOT: меню в ЛС
 from core.state import state
 
 logger = logging.getLogger(__name__)
@@ -78,7 +83,7 @@ def fetch_custom_buttons(chat_id: int) -> List[Tuple[str, str]]:
     return rows
 
 
-# ███ [3] Меню и пиннинг
+# ███ [3] Меню и пиннинг (для групп)
 # --------------------------------------------------------------------
 def build_menu_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -126,7 +131,22 @@ async def ensure_pinned_menu(chat_id: int) -> None:
     logger.info("[guide] pinned new menu %d in chat %d", sent.message_id, chat_id)
 
 
-# ███ [4] Групповое меню для main.py
+# ███ [3.2] Приватное «Главное меню» — как единственный блок
+# --------------------------------------------------------------------
+async def show_main_menu(uid: int) -> None:
+    """
+    Рисует корневое меню в ЛС как единственный блок:
+    • жёсткий пылесос внутри send_root_menu_singleton,
+    • сохраняет state.menu_message_id[uid],
+    • без пина в ЛС (pin=False), чтобы наверху не висело закреплённое сообщение.
+    """
+    kb: ReplyKeyboardMarkup | None = await get_main_menu(uid)
+    if kb:
+        # ключевое изменение: НЕ пинним в приватном чате
+        await send_root_menu_singleton(uid, kb, pin=False)
+
+
+# ███ [4] Клавиатура-группа для main.py (как было)
 # --------------------------------------------------------------------
 def group_keyboard() -> InlineKeyboardMarkup:
     return build_menu_markup()
@@ -149,13 +169,38 @@ async def on_bot_join(evt: ChatMemberUpdated) -> None:
 
 
 @router.message(CommandStart())
-async def on_group_start(message: Message) -> None:
+async def on_start(message: Message) -> None:
     """
-    Обработка /start в группе/супергруппе: гарантируем «закреп».
+    /start:
+    • в группах — гарантируем закреп меню,
+    • в личке — показываем корневое меню как единственный блок и снимаем старые пины.
     """
     if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         logger.info("[guide] /start in group %d", message.chat.id)
         await ensure_pinned_menu(message.chat.id)
+    elif message.chat.type == ChatType.PRIVATE:
+        # аккуратно снимаем старые пины в ЛС, если такие были
+        with contextlib.suppress(Exception):
+            bot = Bot.get_current()
+            await bot.unpin_all_chat_messages(chat_id=message.chat.id)
+        await show_main_menu(message.from_user.id)
+
+
+# ← NEW: отдельная команда /menu, чтобы всегда можно было вернуться
+@router.message(Command("menu"))
+async def on_menu_cmd(message: Message) -> None:
+    if message.chat.type == ChatType.PRIVATE:
+        await show_main_menu(message.from_user.id)
+
+# Кнопка «Меню» (надёжный фильтр)
+@router.message(F.text.lower() == "меню")
+async def on_menu_button(message: Message) -> None:
+    """
+    Кнопка «Меню» в личке — вернуться к корневому меню (один блок в ЛС).
+    В группах событие игнорируем.
+    """
+    if message.chat.type == ChatType.PRIVATE:
+        await show_main_menu(message.from_user.id)
 
 
 @router.message(lambda m: m.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP})
@@ -189,5 +234,6 @@ init_db()
 logger.info("[guide] module loaded, DB=%s", DB_FILE)
 
 # История изменений:
+# • 2025-09-02 — v15.0: приватное меню без pin (pin=False) + unpin_all в ЛС; добавлен /menu; фильтр «Меню» → lower().
 # • 2025-08-24 — v14.8: Pin/Unpin переведены на методы Bot (совместимость aiogram 3.x).
 # • 2025-08-08 — v14.7: кастом-кнопки только в группах, без SkipHandler; остальное без изменений.
