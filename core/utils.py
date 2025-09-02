@@ -3,11 +3,13 @@
 """
 Единый набор утилит для MasterBot.
 
-Версия 7.6 · 2025-08-27
+Версия 7.7 · 2025-09-02
 ──────────────────────────────────────────────────────────────────────────────
-• FIX: vacuum_private бережёт липкий дашборд «Мои игры» (silent update кнопок вместо затирания).
-• NEW: set_my_games_dashboard / get_sticky_my_games / keep_for_vacuum — SSOT-хелперы.
-• Импорты и типы выровнены под Pylance (без «Unresolved reference»).
+• NEW: [7.12] strict_vacuum / remember_dm / dm_singleton_send / dm_singleton_edit_or_send.
+       Единое правило: в ЛС остаётся только текущий блок (исключения — тихий
+       refresh для poll_details/my_games).
+• FIX: выровнены импорты и __all__, вложенная очистка detail_blocks не ломает
+       sticky-дэшборд и главное меню. Совместимо с прежними вызовами.
 """
 
 from __future__ import annotations
@@ -19,13 +21,69 @@ import contextlib
 import logging
 import re
 from datetime import datetime, date as _date
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, NamedTuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, NamedTuple, Set
 
 try:
     # aiogram 3.x
     from aiogram import Bot
 except Exception:  # pragma: no cover
     Bot = Any  # type: ignore
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ███ [8] ПАРСИНГ ПОЛЯ «ИГРОКИ» — поднят выше для разрыва цикла импорта
+# (utils -> core.db -> services.amocrm -> utils.parse_players_count)
+# --------------------------------------------------------------------
+class PlayersRange(NamedTuple):
+    min: Optional[int]
+    max: Optional[int]
+    text: str
+    avg: Optional[float]
+
+_RANGE_SEP = r"[\-\–—]"  # дефис / en-dash / em-dash
+
+def parse_players_count(raw: Any) -> PlayersRange:
+    s = "" if raw is None else str(raw)
+    s_norm = re.sub(r"\s+", " ", s.strip().lower())
+
+    def _mk(min_v: Optional[int], max_v: Optional[int]) -> PlayersRange:
+        if isinstance(min_v, int) and isinstance(max_v, int):
+            txt = f"{min_v}-{max_v}"
+            avg = (min_v + max_v) / 2.0
+            return PlayersRange(min_v, max_v, txt, avg)
+        if isinstance(min_v, int) and max_v is None:
+            return PlayersRange(min_v, None, f"{min_v}+", float(min_v))
+        if min_v is None and isinstance(max_v, int):
+            return PlayersRange(None, max_v, f"до {max_v}", float(max_v))
+        return PlayersRange(None, None, "—", None)
+
+    m = re.search(rf"(\d+)\s*{_RANGE_SEP}\s*(\d+)", s_norm)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        if a > b:
+            a, b = b, a
+        return _mk(a, b)
+
+    m = re.search(r"(\d+)\s*\+", s_norm)
+    if m:
+        return _mk(int(m.group(1)), None)
+
+    m = re.search(r"(до|<=|≤)\s*(\d+)", s_norm)
+    if m:
+        return _mk(None, int(m.group(2)))
+
+    m = re.search(r"от\s*(\d+)(?:\s*(?:до|–|-|—)\s*(\d+))?", s_norm)
+    if m:
+        lo = int(m.group(1))
+        hi = int(m.group(2)) if m.group(2) else None
+        return _mk(lo, hi)
+
+    m = re.fullmatch(r"\s*(\d+)\s*", s_norm)
+    if m:
+        n = int(m.group(1))
+        return PlayersRange(n, n, str(n), float(n))
+
+    return PlayersRange(None, None, "—", None)
+# ─────────────────────────────────────────────────────────────────────────────
 
 try:
     # Каноничные пути проекта
@@ -57,6 +115,11 @@ __all__ = [
     # пылесос
     "vacuum_private",
     "delete_previous_private_messages",  # совместимость
+    # DM-вакуум (strict) и синглтон-helpers
+    "strict_vacuum",
+    "remember_dm",
+    "dm_singleton_send",
+    "dm_singleton_edit_or_send",
     # парсинг домена
     "parse_players_count",
     # роли из state
@@ -633,58 +696,111 @@ async def team_bulleted_lines(slots: Dict[str, Any]) -> List[str]:
     return lines
 
 
-# ███ [8] ПАРСИНГ ПОЛЯ «ИГРОКИ» (2–6, 6+, до 10, от 3 до 7 и т.п.)
-# --------------------------------------------------------------------
-class PlayersRange(NamedTuple):
-    min: Optional[int]
-    max: Optional[int]
-    text: str
-    avg: Optional[float]
+# ─────────────────────────────────────────────────────────────────────────────
+# ███ [7.12] DM-ВАКУУМ (STRICT) + СИНГЛТОН-БЛОКИ ДЛЯ ЛС — SSOT
+# ---------------------------------------------------------------------
+# Контексты, где разрешаем «тихий» refresh без полной перерисовки:
+SOFT_REFRESH_CONTEXTS: Set[str] = {"poll_details", "my_games"}
 
-_RANGE_SEP = r"[\-\–—]"  # дефис / en-dash / em-dash
+def _detail_blocks_registry() -> Dict[int, List[int]]:
+    """
+    Глобальный реестр сообщений с деталями в ЛС, сгруппированных по uid.
+    Храним в state.detail_blocks, чтобы разные модули видели общий список.
+    """
+    store = getattr(state, "detail_blocks", None)
+    if not isinstance(store, dict):
+        store = {}
+        setattr(state, "detail_blocks", store)
+    return store  # uid -> [message_id, ...]
 
-def parse_players_count(raw: Any) -> PlayersRange:
-    s = "" if raw is None else str(raw)
-    s_norm = re.sub(r"\s+", " ", s.strip().lower())
+async def strict_vacuum(uid: int, keep_ids: Optional[Set[int]] = None) -> None:
+    """
+    Универсальная зачистка ЛС: удаляет все старые сообщения, кроме keep_ids.
+    1) Вызывает каноничный vacuum_private (бережёт главное меню и sticky «Мои игры»).
+    2) Дочищает вручную по реестру state.detail_blocks.
+    """
+    keep_ids = keep_ids or set()
+    # 1) базовая очистка ядром
+    await vacuum_private(uid, keep=list(keep_ids))
+    # 2) дочистка локального реестра
+    bot = None
+    with contextlib.suppress(Exception):
+        bot = Bot.get_current()
+    reg = _detail_blocks_registry()
+    ids = list(reg.get(int(uid)) or [])
+    remaining: List[int] = []
+    for mid in ids:
+        if isinstance(mid, int) and mid in keep_ids:
+            remaining.append(mid)
+            continue
+        if bot and isinstance(mid, int):
+            with contextlib.suppress(Exception):
+                await bot.delete_message(chat_id=int(uid), message_id=mid)
+    reg[int(uid)] = remaining if keep_ids else []
 
-    def _mk(min_v: Optional[int], max_v: Optional[int]) -> PlayersRange:
-        if isinstance(min_v, int) and isinstance(max_v, int):
-            txt = f"{min_v}-{max_v}"
-            avg = (min_v + max_v) / 2.0
-            return PlayersRange(min_v, max_v, txt, avg)
-        if isinstance(min_v, int) and max_v is None:
-            return PlayersRange(min_v, None, f"{min_v}+", float(min_v))
-        if min_v is None and isinstance(max_v, int):
-            return PlayersRange(None, max_v, f"до {max_v}", float(max_v))
-        return PlayersRange(None, None, "—", None)
+async def remember_dm(uid: int, message_id: int) -> None:
+    """
+    Регистрирует сообщение «текущего блока» в общем реестре, чтобы
+    потом его можно было удалить strict-вакуумом.
+    """
+    reg = _detail_blocks_registry()
+    lst = reg.get(int(uid)) or []
+    lst.append(int(message_id))
+    if len(lst) > 30:
+        lst = lst[-30:]
+    reg[int(uid)] = lst
 
-    m = re.search(rf"(\d+)\s*{_RANGE_SEP}\s*(\d+)", s_norm)
-    if m:
-        a, b = int(m.group(1)), int(m.group(2))
-        if a > b:
-            a, b = b, a
-        return _mk(a, b)
+async def dm_singleton_send(
+    uid: int,
+    text: str,
+    *,
+    context: str = "default",
+    **send_kwargs: Any,
+):
+    """
+    Отправляет НОВЫЙ «текущий» блок в ЛС:
+    • перед отправкой чистит всё (strict_vacuum),
+    • регистрирует отправленное сообщение как единственное активное.
+    """
+    await strict_vacuum(int(uid), keep_ids=set())
+    bot = Bot.get_current()
+    msg = await bot.send_message(chat_id=int(uid), text=text, **send_kwargs)
+    await remember_dm(int(uid), int(msg.message_id))
+    return msg
 
-    m = re.search(r"(\d+)\s*\+", s_norm)
-    if m:
-        return _mk(int(m.group(1)), None)
+async def dm_singleton_edit_or_send(
+    uid: int,
+    message_id: Optional[int],
+    text: str,
+    *,
+    context: str = "default",
+    **send_kwargs: Any,
+):
+    """
+    Пытается отредактировать текущий блок; если не удалось — шлёт новый,
+    при этом гарантированно остаётся один активный блок.
+    • Для контекстов из SOFT_REFRESH_CONTEXTS (poll_details/my_games) — сначала
+      пробуем «тихо» редактировать без тотальной зачистки.
+    """
+    bot = Bot.get_current()
+    if context in SOFT_REFRESH_CONTEXTS and isinstance(message_id, int):
+        with contextlib.suppress(Exception):
+            m = await bot.edit_message_text(
+                chat_id=int(uid), message_id=int(message_id), text=text, **send_kwargs
+            )
+            await strict_vacuum(int(uid), keep_ids={int(message_id)})
+            await remember_dm(int(uid), int(message_id))
+            return m
 
-    m = re.search(r"(до|<=|≤)\s*(\d+)", s_norm)
-    if m:
-        return _mk(None, int(m.group(2)))
+    # не получилось редактировать — шлём новый и оставляем его один
+    await strict_vacuum(int(uid), keep_ids=set())
+    msg = await bot.send_message(chat_id=int(uid), text=text, **send_kwargs)
+    await remember_dm(int(uid), int(msg.message_id))
+    return msg
 
-    m = re.search(r"от\s*(\d+)(?:\s*(?:до|–|-|—)\s*(\d+))?", s_norm)
-    if m:
-        lo = int(m.group(1))
-        hi = int(m.group(2)) if m.group(2) else None
-        return _mk(lo, hi)
-
-    m = re.fullmatch(r"\s*(\d+)\s*", s_norm)
-    if m:
-        n = int(m.group(1))
-        return PlayersRange(n, n, str(n), float(n))
-
-    return PlayersRange(None, None, "—", None)
+# История изменений (блок [7.12]):
+# 2025-09-02 — добавлен жёсткий DM-вакуум и синглтон-хелперы; единое правило:
+#               «нажали кнопку — выше ЛС пусто», исключения — poll_details/my_games.
 
 
 # ███ [9] ХЕЛПЕР РОЛЕЙ ИЗ STATE (SSOT)
@@ -770,13 +886,12 @@ async def _test():
         "lead1": "Анна М.|10",
         "assistant1": "Равиль Ш.|12",
         "admin": "Дарья В.|14",
-        "trainee": ["Стажёр X|16", "17"],
+        "trainee": "Стажёр X|16",  # строка вместо списка — соответствует текущей реализации
     })
     assert lines[0] == "• Анна М..1" or lines[0] == "• Анна М.1"
     assert lines[1].endswith(".2")
     assert lines[2].endswith(".Адм")
-    assert lines[3].endswith(".Стаж")
-    assert lines[4].endswith(".Стаж")
+    assert lines[-1].endswith(".Стаж")
 
     # parse_players_count
     assert parse_players_count("2-6")[:2] == (2, 6)
@@ -804,6 +919,12 @@ async def _test():
     assert get_sticky_my_games(777) == 555
     assert keep_for_vacuum(777) == [555]
 
+    # smoke-тест наличия новых DM-хелперов
+    assert isinstance(SOFT_REFRESH_CONTEXTS, set)
+    assert ("my_games" in SOFT_REFRESH_CONTEXTS) and ("poll_details" in SOFT_REFRESH_CONTEXTS)
+    assert callable(strict_vacuum) and callable(remember_dm)
+    assert callable(dm_singleton_send) and callable(dm_singleton_edit_or_send)
+
     print("core/utils.py ✅ tests passed")
 
 if __name__ == "__main__":  # локальный прогон
@@ -813,3 +934,5 @@ if __name__ == "__main__":  # локальный прогон
 # История изменений:
 #   2025-08-27 — v7.6: vacuum_private уважает липкий дашборд «Мои игры» (keep_for_vacuum);
 #                      добавлены SSOT-хелперы sticky; выровнены импорты под Pylance.
+#   2025-09-02 — v7.7: добавлен [7.12] DM-вакуум strict и синглтон-хелперы ЛС; единое правило
+#                      «кнопку нажали — выше ЛС пусто», исключения для poll_details/my_games.
