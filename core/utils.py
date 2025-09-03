@@ -702,16 +702,30 @@ async def team_bulleted_lines(slots: Dict[str, Any]) -> List[str]:
 # Контексты, где разрешаем «тихий» refresh без полной перерисовки:
 SOFT_REFRESH_CONTEXTS: Set[str] = {"poll_details", "my_games"}
 
-def _detail_blocks_registry() -> Dict[int, List[int]]:
+def _detail_blocks_registry() -> Dict[Any, Any]:
     """
-    Глобальный реестр сообщений с деталями в ЛС, сгруппированных по uid.
+    Глобальный реестр сообщений с деталями в ЛС.
     Храним в state.detail_blocks, чтобы разные модули видели общий список.
+
+    НОРМАЛИЗАЦИЯ: устаревшие ключи вида `uid: int` мигрируются в кортеж `(uid, 0)`,
+    чтобы внешние итераторы, ожидающие `(uid, deal_id)`, не падали.
     """
     store = getattr(state, "detail_blocks", None)
     if not isinstance(store, dict):
         store = {}
         setattr(state, "detail_blocks", store)
-    return store  # uid -> [message_id, ...]
+
+    # Миграция ключей int → (uid, 0)
+    legacy_int_keys = [k for k in list(store.keys()) if isinstance(k, int)]
+    for k in legacy_int_keys:
+        val = store.pop(k)
+        key_tuple = (int(k), 0)
+        # аккуратно слияние
+        if key_tuple in store and isinstance(store[key_tuple], list) and isinstance(val, list):
+            store[key_tuple] = list(store[key_tuple]) + list(val)
+        else:
+            store[key_tuple] = val
+    return store  # ключи: (uid, deal_id) → [message_id...] | int
 
 async def strict_vacuum(uid: int, keep_ids: Optional[Set[int]] = None) -> None:
     """
@@ -722,33 +736,60 @@ async def strict_vacuum(uid: int, keep_ids: Optional[Set[int]] = None) -> None:
     keep_ids = keep_ids or set()
     # 1) базовая очистка ядром
     await vacuum_private(uid, keep=list(keep_ids))
-    # 2) дочистка локального реестра
+
+    # 2) дочистка локального реестра — по всем кортежным ключам данного uid
     bot = None
     with contextlib.suppress(Exception):
         bot = Bot.get_current()
     reg = _detail_blocks_registry()
-    ids = list(reg.get(int(uid)) or [])
-    remaining: List[int] = []
-    for mid in ids:
-        if isinstance(mid, int) and mid in keep_ids:
-            remaining.append(mid)
-            continue
-        if bot and isinstance(mid, int):
+
+    # соберём все ключи для данного uid (k0 == uid)
+    keys_for_uid: List[Any] = [
+        k for k in list(reg.keys())
+        if (isinstance(k, tuple) and len(k) >= 2 and int(k[0]) == int(uid))
+    ]
+    for k in keys_for_uid:
+        v = reg.get(k)
+        remaining: List[int] = []
+        if isinstance(v, list):
+            for mid in list(v):
+                if isinstance(mid, int) and mid in keep_ids:
+                    remaining.append(mid)
+                    continue
+                if bot and isinstance(mid, int):
+                    with contextlib.suppress(Exception):
+                        await bot.delete_message(chat_id=int(uid), message_id=mid)
+        elif isinstance(v, int):
+            mid = v
+            if mid in keep_ids:
+                remaining = [mid]
+            else:
+                if bot:
+                    with contextlib.suppress(Exception):
+                        await bot.delete_message(chat_id=int(uid), message_id=mid)
+                remaining = []
+        # обновим реестр: если есть что держать — оставим, иначе очистим
+        if remaining:
+            reg[k] = remaining
+        else:
             with contextlib.suppress(Exception):
-                await bot.delete_message(chat_id=int(uid), message_id=mid)
-    reg[int(uid)] = remaining if keep_ids else []
+                del reg[k]
 
 async def remember_dm(uid: int, message_id: int) -> None:
     """
     Регистрирует сообщение «текущего блока» в общем реестре, чтобы
     потом его можно было удалить strict-вакуумом.
+    Храним под кортежным ключом (uid, 0).
     """
     reg = _detail_blocks_registry()
-    lst = reg.get(int(uid)) or []
+    key = (int(uid), 0)
+    lst = reg.get(key) or []
+    if not isinstance(lst, list):
+        lst = [lst] if isinstance(lst, int) else []
     lst.append(int(message_id))
     if len(lst) > 30:
         lst = lst[-30:]
-    reg[int(uid)] = lst
+    reg[key] = lst
 
 async def dm_singleton_send(
     uid: int,
@@ -801,49 +842,77 @@ async def dm_singleton_edit_or_send(
 # История изменений (блок [7.12]):
 # 2025-09-02 — добавлен жёсткий DM-вакуум и синглтон-хелперы; единое правило:
 #               «нажали кнопку — выше ЛС пусто», исключения — poll_details/my_games.
+# 2025-09-03 — нормализация ключей state.detail_blocks: int → (uid, 0);
+#               remember_dm пишет в (uid, 0); strict_vacuum чистит по кортежным ключам.
 
 
 # ███ [9] ХЕЛПЕР РОЛЕЙ ИЗ STATE (SSOT)
 # --------------------------------------------------------------------
 def assigned_role_from_state(uid: int, deal_id: int) -> Optional[str]:
     """
-    Возвращает роль ('main'|'assist'|'admin') пользователя по сделке из:
-      1) state.locked_distribution[deal_id]  (в приоритете)
-      2) state.distribution_cache[str(deal_id)]  (предварительный состав)
+    Возвращает роль ('main'|'assist'|'admin'|'trainee') пользователя по сделке из:
+      1) state.locked_distribution[deal_id]               — активные утверждённые (приоритет)
+      2) state.finished_locked[deal_id]                   — переведённые в «Завершение сделки» (вариант 1)
+      3) state.finished_locked_distribution[deal_id]      — переведённые в «Завершение сделки» (вариант 2)
+      4) state.distribution_cache[str(deal_id)]           — предварительный состав (snapshot/драфт)
     """
     uid = int(uid)
     did_i = int(deal_id)
-    locked = getattr(state, "locked_distribution", {}) or {}
-    cache  = getattr(state, "distribution_cache", {}) or {}
 
-    dist: Any = locked.get(did_i) or locked.get(str(did_i))
-    if not isinstance(dist, dict):
-        dist = cache.get(str(did_i)) or cache.get(did_i)
+    locked    = getattr(state, "locked_distribution", {}) or {}
+    finished1 = getattr(state, "finished_locked", {}) or {}
+    finished2 = getattr(state, "finished_locked_distribution", {}) or {}
+    cache     = getattr(state, "distribution_cache", {}) or {}
+
+    def _pick(d: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(d, dict):
+            return None
+        v = d.get(did_i)
+        if not isinstance(v, dict):
+            v = d.get(str(did_i))
+        return v if isinstance(v, dict) else None
+
+    # порядок приоритета: locked → finished (оба варианта ключа) → cache
+    dist: Optional[Dict[str, Any]] = (
+        _pick(locked) or _pick(finished1) or _pick(finished2) or _pick(cache)
+    )
     if not isinstance(dist, dict):
         return None
 
-    def _match_slot(val: Any) -> bool:
+    def _match_any(val: Any) -> bool:
+        # поддержка "Имя|uid", списков и чистых uid
+        if isinstance(val, list):
+            return any(parse_uid(x) == uid for x in val)
         return parse_uid(val) == uid
 
-    if any(isinstance(k, str) and (k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"})
-           for k in dist.keys()):
+    # Слотовый формат: lead*/assistant*/admin/trainee → строки "Имя Ф.<суф>|uid" или "Имя Ф.<суф>"
+    has_slot_keys = any(
+        isinstance(k, str) and (k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"})
+        for k in dist.keys()
+    )
+    if has_slot_keys:
         for k, v in dist.items():
             if not isinstance(k, str):
                 continue
-            if k.startswith("lead") and _match_slot(v):
+            if k.startswith("lead") and _match_any(v):
                 return "main"
-            if k.startswith("assistant") and _match_slot(v):
+            if k.startswith("assistant") and _match_any(v):
                 return "assist"
-        if _match_slot(dist.get("admin")):
+        if _match_any(dist.get("admin")):
             return "admin"
+        if _match_any(dist.get("trainee")):
+            return "trainee"
         return None
 
-    if parse_uid(dist.get("admin")) == uid or uid in to_uid_list(dist.get("admin")):
+    # Нормализованный формат {"main":[...], "assist":[...], "admin":[...], "trainee":[...]}
+    if _match_any(dist.get("admin")):
         return "admin"
-    if uid in to_uid_list(dist.get("main")):
+    if _match_any(dist.get("main")):
         return "main"
-    if uid in to_uid_list(dist.get("assist")):
+    if _match_any(dist.get("assist")):
         return "assist"
+    if _match_any(dist.get("trainee")):
+        return "trainee"
     return None
 
 
@@ -919,6 +988,12 @@ async def _test():
     assert get_sticky_my_games(777) == 555
     assert keep_for_vacuum(777) == [555]
 
+    # detail_blocks: миграция ключей int → (uid, 0)
+    setattr(state, "detail_blocks", {777: [101, 102]})
+    _ = _detail_blocks_registry()
+    assert isinstance(state.detail_blocks, dict)
+    assert (777, 0) in state.detail_blocks and 777 not in state.detail_blocks
+
     # smoke-тест наличия новых DM-хелперов
     assert isinstance(SOFT_REFRESH_CONTEXTS, set)
     assert ("my_games" in SOFT_REFRESH_CONTEXTS) and ("poll_details" in SOFT_REFRESH_CONTEXTS)
@@ -936,3 +1011,5 @@ if __name__ == "__main__":  # локальный прогон
 #                      добавлены SSOT-хелперы sticky; выровнены импорты под Pylance.
 #   2025-09-02 — v7.7: добавлен [7.12] DM-вакуум strict и синглтон-хелперы ЛС; единое правило
 #                      «кнопку нажали — выше ЛС пусто», исключения для poll_details/my_games.
+#   2025-09-03 — нормализация ключей state.detail_blocks (int → (uid, 0)),
+#                фиксация assigned_role_from_state для finished_locked.
