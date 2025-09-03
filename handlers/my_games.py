@@ -170,7 +170,7 @@ def _is_locally_confirmed(deal_id: int, uid: int) -> bool:
     return False
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("mygame_"))
+@router.callback_query(lambda c: c.data and c.data.startswith("mygame_details_"))
 async def show_my_game_details(callback: types.CallbackQuery) -> None:
     """
     Детали игры в «🎲 Мои игры»:
@@ -393,6 +393,52 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
 #                сохранён мягкий vacuum sticky; без изменений публичных API.
 # • 2025-09-02 — FIX: состав для деталей ищется в locked → finished_locked → distribution_cache (snapshot),
 #                роль для кнопок берётся через union-хелпер (если есть); выровнено под SSOT/фиксы Pylance.
+# • 2025-09-03 — ВАЖНЫЙ ФИКС: хэндлер матчится только на «mygame_details_…», чтобы не перехватывать
+#                колбэки «mygame_swap_…»; иначе кнопка «Замена» не срабатывала.
+
+
+# ════════════════════════════════════════════════════════════════════
+# [2.2] ЗАМЕНА: кнопка «🔁 Замена» из «Мои игры»
+# Версия 2.3.0 · 2025-09-03 (SSOT: делегирование в polls_lifecycle; фиксы префиксов/роутера)
+# ────────────────────────────────────────────────────────────────────
+# Минимальные правки:
+# • Убрана локальная реализация замены и повторные префиксы — используем глобальные
+#   SWAP_PREFIX="mygame_swap_" и RESPOND_PREFIX="swap_accept_" из файла.
+# • НЕ переопределяем router (используем общий router модуля).
+# • Делегируем логику в централизованные обработчики из handlers.polls_lifecycle,
+#   чтобы не дублировать SSOT (удаление тегов, точечная чистка слотов, уведомления в чат и т.п.).
+
+from aiogram import types
+import contextlib
+import logging
+
+logger = logging.getLogger(__name__)
+
+@router.callback_query(lambda c: c.data and c.data.startswith(SWAP_PREFIX))
+async def mygame_swap_shim(callback: types.CallbackQuery) -> None:
+    """Shim: обработка «🔁 Замена» делегируется в polls_lifecycle.swap_request_handler."""
+    try:
+        from handlers.polls_lifecycle import swap_request_handler as _swap_impl  # type: ignore
+        await _swap_impl(callback)
+    except Exception as e:
+        logger.error("[my_games.swap] delegate failed: %s", e)
+        with contextlib.suppress(Exception):
+            await callback.answer("⚠️ Не удалось запросить замену. Попробуйте ещё раз.", show_alert=True)
+
+@router.callback_query(lambda c: c.data and c.data.startswith(RESPOND_PREFIX))
+async def mygame_swap_accept_shim(callback: types.CallbackQuery) -> None:
+    """Shim: обработка «Откликнуться» делегируется в polls_lifecycle.swap_accept_handler."""
+    try:
+        from handlers.polls_lifecycle import swap_accept_handler as _accept_impl  # type: ignore
+        await _accept_impl(callback)
+    except Exception as e:
+        logger.error("[my_games.swap_accept] delegate failed: %s", e)
+        with contextlib.suppress(Exception):
+            await callback.answer("⚠️ Кнопка недоступна. Возможно, замена уже найдена.", show_alert=True)
+
+# История изменений [2.2]:
+# • 2025-09-03 — 2.3.0: выровнено под SSOT — делегирование в polls_lifecycle; убраны локальные префиксы/роутер.
+
 
 
 # ════════════════════════════════════════════════════════════════════
