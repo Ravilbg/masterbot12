@@ -2343,7 +2343,7 @@ async def handle_poll_answer(event: types.PollAnswer) -> None:
 
 # ════════════════════════════════════════════════════════════════════
 # [4.8] HANDLER: «Попросить замену» (swap_request_{deal_id})
-# Версия 6.9.4 · 2025-09-03 · FIX/SSOT: поиск роли в locked/finished_locked/finished_locked_distribution
+# Версия 6.9.5 · 2025-09-03 · FIX/SSOT: корректное удаление тегов; статус не меняем; поиск роли в locked/finished_locked/finished_locked_distribution
 # ════════════════════════════════════════════════════════════════════
 @router.callback_query(lambda c: c.data and c.data.startswith("swap_request_"))
 async def swap_request_handler(callback: types.CallbackQuery) -> None:
@@ -2410,13 +2410,13 @@ async def swap_request_handler(callback: types.CallbackQuery) -> None:
         await callback.answer("Вы не назначены на эту игру.", show_alert=True)
         return
 
-    # 1) удаляем из CRM только тег(и) просившего
+    # 1) удаляем из CRM только тег(и) просившего (оба варианта формата: «Имя Ф.1» и «Имя Ф..1»)
     suffix = {"main": "1", "assist": "2", "admin": "Адм", "trainee": "Стаж"}[role]
-    human = await short_name(uid)  # «Имя Ф.»
-    # удалим оба распространённых варианта тегов: «Имя Ф.1» и «Имя Ф..1»
+    human = await short_name(uid)
     remove_tags = [f"{human}{suffix}", f"{human}.{suffix}"]
     try:
-        await update_amocrm_tags(deal_id=deal_id, add=[], remove=remove_tags)
+        # FIX: корректный вызов — пакетно (без deal_id=, как требует сигнатура)
+        await update_amocrm_tags({int(deal_id): {"add": [], "remove": remove_tags}})
         logger.info("[swap] removed CRM tags: %s (deal=%s)", ", ".join(remove_tags), deal_id)
     except Exception as e:
         logger.warning("[swap] CRM tag remove failed deal=%s: %s", deal_id, e)
@@ -2451,9 +2451,13 @@ async def swap_request_handler(callback: types.CallbackQuery) -> None:
     setattr(state, "finished_locked", pools[1])
     setattr(state, "finished_locked_distribution", pools[2])
 
-    # 3) откатываем статус в «Бронь»
+    # 3) статус сделки НЕ трогаем (чтобы игра не исчезала из «Моих игр»)
+    #    Оставляем no-op для совместимости: проставляем текущий статус.
     with contextlib.suppress(Exception):
-        await update_deal_status(deal_id=deal_id, status_id=settings.BRON_STATUS_ID)
+        deal0 = await get_deal_by_id(deal_id)
+        cur_status = str((deal0 or {}).get("status_id") or "")
+        if cur_status:
+            await update_deal_status(deal_id=deal_id, status_id=cur_status)
 
     # 4) фиксируем запрос замены
     if not getattr(state, "swap_requests", None):
@@ -2469,9 +2473,9 @@ async def swap_request_handler(callback: types.CallbackQuery) -> None:
     date_s = str((deal or {}).get("event_date") or "—")
     time_s = str((deal or {}).get("event_time") or "—")
     package = str((deal or {}).get("package") or "—")
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🖐 Откликнуться", callback_data=f"swap_accept_{deal_id}_{role}")
-    ]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="🖐 Откликнуться", callback_data=f"swap_accept_{deal_id}_{role}"
+    )]])
     chat_id = resolve_notify_chat_id(Bot.get_current())
     if chat_id:
         text = (
@@ -2489,13 +2493,18 @@ async def swap_request_handler(callback: types.CallbackQuery) -> None:
         await callback.answer("Запрос на замену отправлен. Ждём отклик.", show_alert=False)
 
 # История изменений:
-# 2025-09-03 · роль ищем и в finished_locked, и в finished_locked_distribution; остальное без изменений.
-
+# 2025-09-03 · роль ищем и в finished_locked, и в finished_locked_distribution; корректный вызов update_amocrm_tags; статус не меняем (no-op).
 
 
 # ════════════════════════════════════════════════════════════════════
 # [4.9] HANDLER: «Откликнуться» (swap_accept_{deal_id}_{role})
-# Версия 6.9.3 · 2025-09-03 · FIX: запрет, если уже назначен в locked_distribution ИЛИ finished_locked
+# Версия 7.0.1 · 2025-09-03
+# Изменения (минимальные):
+# • Жёсткое правило «1 человек = 1 роль»: запрет отклика, если уже назначен
+#   на эту же игру в ЛЮБОЙ роли (SSOT + проверка в finished* + CRM-теги).
+# • Автор запроса замены может вернуться в состав по этой же кнопке:
+#   аккуратно восстанавливаем слот локально и закрываем запрос.
+# Остальное — без изменений.
 # ════════════════════════════════════════════════════════════════════
 @router.callback_query(lambda c: c.data and c.data.startswith("swap_accept_"))
 async def swap_accept_handler(callback: types.CallbackQuery) -> None:
@@ -2503,7 +2512,13 @@ async def swap_accept_handler(callback: types.CallbackQuery) -> None:
     import contextlib, asyncio
 
     from core.state import state
-    from core.utils import parse_uid, short_name, team_bulleted_lines, resolve_notify_chat_id
+    from core.utils import (
+        parse_uid,
+        short_name,
+        team_bulleted_lines,
+        resolve_notify_chat_id,
+        assigned_role_from_state,  # SSOT
+    )
     from services.amocrm import get_deal_by_id
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -2520,24 +2535,100 @@ async def swap_accept_handler(callback: types.CallbackQuery) -> None:
     uid = int(callback.from_user.id)
     logger.info("[swap] accept candidate uid=%s deal=%s role=%s", uid, deal_id, role)
 
-    # запреты: сам просил / уже занято / уже назначен
+    # Текущая запись запроса замены (int/str-ключи поддержаны)
     req = (getattr(state, "swap_requests", {}) or {}).get(deal_id) \
           or (getattr(state, "swap_requests", {}) or {}).get(str(deal_id))
     if not isinstance(req, dict):
         await callback.answer("Запрос замены уже закрыт.", show_alert=True)
         return
+
+    # [A] ВОЗВРАТ АВТОРА ЗАПРОСА (нажал «Откликнуться» по ошибке или передумал)
+    is_author = False
     with contextlib.suppress(Exception):
-        if int(str(req.get("by"))) == uid:
-            await callback.answer("Вы сами просили замену на эту игру.", show_alert=True)
-            return
+        is_author = int(str(req.get("by"))) == uid
+    if is_author:
+        request_role = str(req.get("role") or role or "").strip().lower()
+        try:
+            deal = await get_deal_by_id(deal_id)
+        except Exception:
+            deal = {}
+
+        game_name = str((deal or {}).get("game_name") or (deal or {}).get("name") or "")
+        package   = str((deal or {}).get("package") or "")
+        label     = f"{(await short_name(uid))}|{uid}"
+
+        # dist_cache
+        if not getattr(state, "distribution_cache", None):
+            state.distribution_cache = {}
+        dist_cache: Dict[str, Any] = dict((state.distribution_cache or {}).get(str(deal_id)) or {})
+        need_main, need_ass, _ = _ensure_role_slots(dist_cache, game_name, package)
+        _remove_uid_from_dist(dist_cache, uid)
+        if request_role == "main":
+            k = _first_empty_slot(dist_cache, "lead", need_main);  k and dist_cache.__setitem__(k, label)
+        elif request_role == "assist":
+            k = _first_empty_slot(dist_cache, "assistant", need_ass);  k and dist_cache.__setitem__(k, label)
+        elif request_role == "admin":
+            if dist_cache.get("admin") in (None, "", 0):
+                dist_cache["admin"] = label
+        state.distribution_cache[str(deal_id)] = dist_cache
+
+        # locked_distribution
+        locked_all = getattr(state, "locked_distribution", {}) or {}
+        dist_locked: Dict[str, Any] = dict(locked_all.get(deal_id) or locked_all.get(str(deal_id)) or {})
+        need_main, need_ass, _ = _ensure_role_slots(dist_locked, game_name, package)
+        _remove_uid_from_dist(dist_locked, uid)
+        if request_role == "main":
+            k = _first_empty_slot(dist_locked, "lead", need_main);  k and dist_locked.__setitem__(k, label)
+        elif request_role == "assist":
+            k = _first_empty_slot(dist_locked, "assistant", need_ass);  k and dist_locked.__setitem__(k, label)
+        elif request_role == "admin":
+            if dist_locked.get("admin") in (None, "", 0):
+                dist_locked["admin"] = label
+        locked_all[int(deal_id)] = dist_locked
+        setattr(state, "locked_distribution", locked_all)
+
+        # закрываем запрос
+        with contextlib.suppress(Exception):
+            getattr(state, "swap_requests", {}).pop(deal_id, None)
+            getattr(state, "swap_requests", {}).pop(str(deal_id), None)
+
+        # уведомление (локально)
+        bot = Bot.get_current()
+        chat_id = resolve_notify_chat_id(bot)
+        if chat_id:
+            with contextlib.suppress(Exception):
+                title  = _deal_title(deal or {"id": deal_id})
+                dt     = (deal or {}).get("event_datetime")
+                date_s = dt.strftime("%d.%m") if hasattr(dt, "strftime") else str((deal or {}).get("event_date") or "—")
+                time_s = str((deal or {}).get("event_time") or "—")
+                lines  = await team_bulleted_lines(dist_locked or dist_cache)
+                text   = (
+                    "↩️ Возврат в состав (локально).\n"
+                    f"🎮 «{title}» — {date_s} {time_s}\n"
+                    f"{'\n'.join(lines)}\n\n"
+                    "Если всё верно — подтвердите участие в «Моих играх»."
+                )
+                await bot.send_message(chat_id, text)
+
+        impacted = {int(deal_id)}
+        await _sync_leader_report()
+        await _check_ready_state(impacted)
+        asyncio.create_task(_refresh_detail_views(impacted, refresh_all=False))
+        with contextlib.suppress(Exception):
+            await callback.answer("Вы вернулись в состав. Спасибо!", show_alert=False)
+        return
+
+    # [B] ОГРАНИЧЕНИЯ ПЕРЕД ПРИНЯТИЕМ КАНДИДАТА
     if req.get("accepted_by") is not None:
         await callback.answer("Уже занято — замена назначена.", show_alert=True)
         return
 
-    def _is_assigned(u: int, did: int) -> bool:
+    # 1чел=1роль: SSOT + доп.пулы
+    def _is_assigned_in_pools(u: int, did: int) -> bool:
         pools = [
             getattr(state, "locked_distribution", {}) or {},
             getattr(state, "finished_locked", {}) or {},
+            getattr(state, "finished_locked_distribution", {}) or {},
         ]
         for pool in pools:
             slots = pool.get(did) or pool.get(str(did)) or {}
@@ -2555,11 +2646,15 @@ async def swap_accept_handler(callback: types.CallbackQuery) -> None:
                         return True
         return False
 
-    if _is_assigned(uid, deal_id):
+    try:
+        existing_role = assigned_role_from_state(uid, deal_id)
+    except Exception:
+        existing_role = None
+    if existing_role in {"main", "assist", "admin", "trainee"} or _is_assigned_in_pools(uid, deal_id):
         await callback.answer("Вы уже назначены на эту игру — отклик не требуется.", show_alert=True)
         return
 
-    # + страховка по тегам CRM
+    # страхуемся по тегам CRM (оба формата)
     try:
         deal = await get_deal_by_id(deal_id)
     except Exception:
@@ -2567,66 +2662,62 @@ async def swap_accept_handler(callback: types.CallbackQuery) -> None:
     base = await short_name(uid)
     tags = (deal or {}).get("tags") or []
     tag_names = [t if isinstance(t, str) else str(t.get("name") or "") for t in tags]
-    if any(t.startswith(f"{base}.") for t in tag_names):
+    expected = {
+        f"{base}1", f"{base}2", f"{base}Адм",
+        f"{base}.1", f"{base}.2", f"{base}.Адм",
+    }
+    if any(t in expected for t in tag_names):
         await callback.answer("Вы уже назначены на эту игру (по тегам CRM).", show_alert=True)
         return
 
-    # фиксируем победителя
+    # [C] ФИКСИРУЕМ КАНДИДАТА И ЛОКАЛЬНО ПОДСТАВЛЯЕМ В СОСТАВ
     req["accepted_by"] = uid
 
-    # 1) локальная подстановка (dist_cache + locked_distribution)
     game_name = str((deal or {}).get("game_name") or (deal or {}).get("name") or "")
-    package = str((deal or {}).get("package") or "")
+    package   = str((deal or {}).get("package") or "")
+    label     = f"{(await short_name(uid))}|{uid}"
 
+    # distribution_cache
     if not getattr(state, "distribution_cache", None):
         state.distribution_cache = {}
     dist_cache: Dict[str, Any] = dict((state.distribution_cache or {}).get(str(deal_id)) or {})
     need_main, need_ass, _ = _ensure_role_slots(dist_cache, game_name, package)
-
     _remove_uid_from_dist(dist_cache, uid)
-    label = f"{(await short_name(uid))}|{uid}"
     if role == "main":
-        k = _first_empty_slot(dist_cache, "lead", need_main)
-        if k:
-            dist_cache[k] = label
+        k = _first_empty_slot(dist_cache, "lead", need_main);  k and dist_cache.__setitem__(k, label)
     elif role == "assist":
-        k = _first_empty_slot(dist_cache, "assistant", need_ass)
-        if k:
-            dist_cache[k] = label
+        k = _first_empty_slot(dist_cache, "assistant", need_ass);  k and dist_cache.__setitem__(k, label)
     elif role == "admin":
         if dist_cache.get("admin") in (None, "", 0):
             dist_cache["admin"] = label
     state.distribution_cache[str(deal_id)] = dist_cache
 
+    # locked_distribution
     locked_all = getattr(state, "locked_distribution", {}) or {}
     dist_locked: Dict[str, Any] = dict(locked_all.get(deal_id) or locked_all.get(str(deal_id)) or {})
     need_main, need_ass, _ = _ensure_role_slots(dist_locked, game_name, package)
     _remove_uid_from_dist(dist_locked, uid)
     if role == "main":
-        k = _first_empty_slot(dist_locked, "lead", need_main)
-        if k:
-            dist_locked[k] = label
+        k = _first_empty_slot(dist_locked, "lead", need_main);  k and dist_locked.__setitem__(k, label)
     elif role == "assist":
-        k = _first_empty_slot(dist_locked, "assistant", need_ass)
-        if k:
-            dist_locked[k] = label
+        k = _first_empty_slot(dist_locked, "assistant", need_ass);  k and dist_locked.__setitem__(k, label)
     elif role == "admin":
         if dist_locked.get("admin") in (None, "", 0):
             dist_locked["admin"] = label
     locked_all[int(deal_id)] = dist_locked
     setattr(state, "locked_distribution", locked_all)
 
-    # 2) уведомление в чат
+    # [D] уведомление в чат (локально) + кнопка «Подтвердить замену»
     bot = Bot.get_current()
     chat_id = resolve_notify_chat_id(bot)
     if chat_id:
         with contextlib.suppress(Exception):
-            title = _deal_title(deal or {"id": deal_id})
-            dt = (deal or {}).get("event_datetime")
+            title  = _deal_title(deal or {"id": deal_id})
+            dt     = (deal or {}).get("event_datetime")
             date_s = dt.strftime("%d.%m") if hasattr(dt, "strftime") else str((deal or {}).get("event_date") or "—")
             time_s = str((deal or {}).get("event_time") or "—")
-            lines = await team_bulleted_lines(dist_locked or dist_cache)
-            text = (
+            lines  = await team_bulleted_lines(dist_locked or dist_cache)
+            text   = (
                 "✅ Состав обновлён (локально).\n"
                 f"🎮 «{title}» — {date_s} {time_s}\n"
                 f"{'\n'.join(lines)}\n\n"
@@ -2637,7 +2728,7 @@ async def swap_accept_handler(callback: types.CallbackQuery) -> None:
             )
             await bot.send_message(chat_id, text, reply_markup=kb)
 
-    # 3) UI
+    # [E] UI-обновления
     impacted = {int(deal_id)}
     await _sync_leader_report()
     await _check_ready_state(impacted)
@@ -2646,7 +2737,8 @@ async def swap_accept_handler(callback: types.CallbackQuery) -> None:
         await callback.answer("Спасибо! Вы поставлены в состав. Ожидается подтверждение.", show_alert=False)
 
 # История изменений:
-# 2025-09-03 · проверка already-assigned расширена на finished_locked; остальное без изменений.
+# 2025-09-03 · v7.0.1 — жёсткое правило 1чел=1роль (SSOT + finished* + CRM-теги);
+#                       автор запроса может вернуться по той же кнопке; статус не меняем.
 
 
 
