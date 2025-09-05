@@ -194,7 +194,13 @@ async def _request_json(
     payload: Optional[Dict[str, Any]] = None,
     ok_statuses: Tuple[int, ...] = (200,),
 ) -> Optional[Dict[str, Any]]:
-    """Единый враппер с ретраями 429/401."""
+    """
+    Единый враппер с ретраями 429/401.
+
+    ВАЖНО: AmoCRM иногда отвечает **204 No Content** (например, для /api/v4/leads при отсутствии лидов).
+    Мы трактуем 204 как «пустой ответ» и возвращаем **{}** без логирования ошибки — чтобы
+    вызывающий код корректно воспринимал это как *нет данных*, а не как сбой.
+    """
     if not await ensure_valid_token():
         return None
 
@@ -214,6 +220,13 @@ async def _request_json(
                 params=params,
                 json=payload,
             ) as resp:
+                # ── спец-обработка пустых ответов AmoCRM ───────────────────────
+                if resp.status == 204:
+                    # «Нет содержимого» → «нет данных» (пустой ответ), без ошибки в логах.
+                    # Это поведение нужно для стабильной работы пагинации /leads и подобных.
+                    return {}
+
+                # ── стандартные ретраи и ошибки ───────────────────────────────
                 if resp.status == 429:
                     await asyncio.sleep(min(2**tries * 0.2, 3.0))
                     continue
@@ -230,7 +243,8 @@ async def _request_json(
                 try:
                     return await resp.json()
                 except Exception:
-                    return None
+                    # На случай редких ответов без тела при 2xx — нормализуем как пустой dict.
+                    return {}
     return None
 
 
