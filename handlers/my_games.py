@@ -1753,9 +1753,10 @@ def _my_games(uid: int, deals: List[Dict]) -> List[Dict]:
     return _visible_deals_for_user(uid, deals)
 
 # ███ [5] DASHBOARD / DETAILS — липкий дашборд + пылесос как в отчёте
-# Версия 5.7.4 · 2025-09-02
+# Версия 5.7.6 · 2025-09-05
 # Изменения в этой правке:
-# • Гарантируем сохранение сообщения главного меню в keep (и в keep_for_vacuum, и в _vacuum_safe).
+# • Убран импорт MSK_TZ из core.utils (его там нет).
+# • Добавлена локальная зона LOCAL_TZ (settings.TIMEZONE или Europe/Moscow).
 # • Остальная логика блока без изменений.
 import logging
 from contextlib import suppress
@@ -1767,7 +1768,16 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.state import state
-from core.utils import truncate
+from core.utils import truncate, vacuum_private as ssot_vacuum_private, keep_for_vacuum as ssot_keep_for_vacuum
+
+# локальная таймзона для сортировки дат (без зависимости от core.utils)
+from pytz import timezone as _tz
+try:
+    from core.config import settings as _cfg_tz  # type: ignore
+    _TZ_NAME: str = (getattr(_cfg_tz, "TIMEZONE", None) or "Europe/Moscow")
+except Exception:
+    _TZ_NAME = "Europe/Moscow"
+LOCAL_TZ = _tz(_TZ_NAME)
 
 logger = logging.getLogger(__name__)
 
@@ -1787,26 +1797,32 @@ def set_my_games_dashboard(uid: int, message_id: int) -> None:
     (getattr(state, "my_games_dashboard", {}) or {}).update({int(uid): int(message_id)})
 
 def keep_for_vacuum(uid: int, *extra_msg_ids: int) -> List[int]:
-    """Сообщения, которые нужно сохранить при пылесосе (как в отчёте)."""
+    """
+    Сообщения, которые нужно сохранить при пылесосе.
+    Минимальные правки: объединяем локальный sticky с SSOT-списком.
+    """
     keep: List[int] = []
+
+    # 1) наш sticky дашборда «Мои игры»
     sticky = get_my_games_dashboard(int(uid))
-    if isinstance(sticky, int):
+    if isinstance(sticky, int) and sticky > 0:
         keep.append(sticky)
 
-    # ✅ также сохраняем сообщение главного меню (если известно)
+    # 2) SSOT-keep (включает меню, иные «липкие» id ядра)
     with suppress(Exception):
-        from core.menu import get_menu_message_id  # опционально; совместимо с ранними сборками
-        mmid = get_menu_message_id(int(uid))
-        if isinstance(mmid, int) and mmid > 0 and mmid not in keep:
-            keep.append(mmid)
+        for mid in ssot_keep_for_vacuum(int(uid), *keep):
+            if isinstance(mid, int) and mid > 0 and mid not in keep:
+                keep.append(mid)
 
+    # 3) дополнительные id от вызывающего кода
     for mid in extra_msg_ids:
         try:
             m2 = int(mid)
         except Exception:
             continue
-        if m2 not in keep:
+        if m2 > 0 and m2 not in keep:
             keep.append(m2)
+
     return keep
 
 # ── внешние хелперы из других блоков (типизированные заглушки) ─────
@@ -1852,28 +1868,20 @@ async def _vacuum_safe(uid: int, keep: Optional[List[Any]] = None, *, ignore_sti
     # приклеим sticky (если не игнорируется)
     if not ignore_sticky:
         for mid in keep_for_vacuum(int(uid)):
-            if mid not in keep_ids:
+            if mid not in keep_ids and isinstance(mid, int) and mid > 0:
                 keep_ids.append(mid)
-
-    # ✅ независимо от ignore_sticky — сохраняем сообщение главного меню
-    with suppress(Exception):
-        from core.menu import get_menu_message_id  # локальный импорт безопасен и не ломает прежние сборки
-        mmid = get_menu_message_id(int(uid))
-        if isinstance(mmid, int) and mmid > 0 and mmid not in keep_ids:
-            keep_ids.append(mmid)
 
     bot = Bot.get_current()
 
-    # основной путь — vacuum_private
+    # основной путь — SSOT vacuum_private
     with suppress(Exception):
-        from core.utils import vacuum_private as _vacuum  # type: ignore
         try:
-            await _vacuum(bot, int(uid), keep=keep_ids)   # (bot, uid, keep)
+            await ssot_vacuum_private(bot, int(uid), keep=keep_ids)   # (bot, uid, keep)
         except TypeError:
             try:
-                await _vacuum(int(uid), keep=keep_ids)    # (uid, keep)
+                await ssot_vacuum_private(int(uid), keep=keep_ids)    # (uid, keep)
             except TypeError:
-                await _vacuum(int(uid))                    # (uid,)
+                await ssot_vacuum_private(int(uid))                    # (uid,)
         # хвостовая чистка деталей
         with suppress(Exception):
             res2 = _vacuum_poll_details_blocks(int(uid))
@@ -1881,7 +1889,7 @@ async def _vacuum_safe(uid: int, keep: Optional[List[Any]] = None, *, ignore_sti
                 await res2
         return
 
-    # фолбэк — старый пылесос
+    # фолбэк — старый пылесос (на случай отсутствия SSOT-функции)
     with suppress(Exception):
         from core.utils import delete_previous_private_messages as _old  # type: ignore
         try:
@@ -1991,7 +1999,7 @@ async def _send_dashboard(uid: int, deals: List[Dict[str, Any]]) -> None:
     """
     bot = Bot.get_current()
 
-    # сортировка карточек: по времени (без сравнения naive/aware datetime)
+    # сортировка карточек: по времени (учитываем локальную таймзону)
     def _key(d: Dict[str, Any]) -> tuple:
         dt = _safe_event_dt(d)
         try:
@@ -2000,7 +2008,8 @@ async def _send_dashboard(uid: int, deals: List[Dict[str, Any]]) -> None:
             elif getattr(dt, "tzinfo", None):
                 ts = dt.timestamp()
             else:
-                ts = dt.replace(tzinfo=MSK_TZ).timestamp()
+                # для naive datetime корректно «локализуем» через pytz
+                ts = LOCAL_TZ.localize(dt).timestamp()
         except Exception:
             ts = float("inf")
         return (dt is None, ts)
@@ -2298,7 +2307,6 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
             (getattr(state, "last_user_messages", {}) or {}).__setitem__(u, new_lum)  # type: ignore[index]
 
     # Никаких исключений наружу — функция «тихая».
-
 
 
 # ════════════════════════════════════════════════════════════════════
