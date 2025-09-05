@@ -1,12 +1,13 @@
-"""main.py — точка входа MasterBot 15.22
+"""main.py — точка входа MasterBot 15.23
 ────────────────────────────────────────────────────────────────────────────
-• Пер-пользовательный мьютекс: события одного uid обрабатываются последовательно.
+• Пер-пользовательский мьютекс: события одного uid обрабатываются последовательно.
 • «Слоты» сообщений в ЛС: status + dashboard (редактируем вместо размножения).
 • Pre-vacuum один раз на апдейт; меню не удаляем.
 • NormalizeButtons — нормализация текстов кнопок (пробелы/регистры/ё↔е/эмодзи),
   чтобы «📊 Отчёт по опросу» стабильно матчился и открывал дашборд.
-• Anti-flicker: больше не удаляем входящее сообщение пользователя с кнопкой,
-  и не редактируем слот/меню, если содержимое не меняется.
+• Anti-flicker: не редактируем слот/меню, если содержимое не меняется.
+• NEW: Чистый экран — входящие сообщения в ЛС удаляются; на произвольный текст
+  показываем подсказку и тут же стираем её.
 """
 
 from __future__ import annotations
@@ -34,13 +35,15 @@ from pytz import timezone
 
 from core.config import settings
 from core.db import init_db
-from core.menu import get_main_menu
+from core.menu import get_main_menu, send_root_menu_singleton
 from core.state import state
-from core.utils import delete_previous_private_messages
+from core.utils import dm_singleton_send  # NEW: один-единственный блок в ЛС
+from core.utils import vacuum_private as ssot_vacuum_private, keep_for_vacuum as ssot_keep_for_vacuum
 from handlers import setup as setup_handlers
 from handlers.guide import group_keyboard, router as guide_router
 from handlers.profile import profile_handler
 from handlers.polls_lifecycle import _vacuum_old_messages  # фоновый пылесос ЛС
+from handlers import guide  # NEW: приватное/групповое меню
 
 # side-routers
 from handlers.confirmations import router as _r1  # noqa: F401
@@ -101,27 +104,6 @@ def _register_sent(chat_id: int, message_id: int, kind: str = "text") -> None:
     except Exception:
         pass
 
-def _known_menu_ids(uid: int) -> set[int]:
-    keep: set[int] = set()
-    for attr in ("menu_message_id", "last_menu_message_id", "menu_messages"):
-        val = getattr(state, attr, None)
-        if isinstance(val, dict):
-            mid = val.get(uid) or val.get(str(uid))
-            if isinstance(mid, int):
-                keep.add(mid)
-            elif isinstance(mid, (list, tuple)):
-                keep |= {int(x) for x in mid if isinstance(x, int)}
-        elif isinstance(val, int):
-            keep.add(val)
-    # слоты не считаем «меню»
-    for slot_name in ("status_message_id", "dashboard_message_id"):
-        slot = getattr(state, slot_name, {})
-        if isinstance(slot, dict):
-            mid = slot.get(uid)
-            if isinstance(mid, int):
-                keep.discard(mid)
-    return keep
-
 def _protected_detail_ids(uid: int) -> set[int]:
     """
     Собирает ВСЕ message_id карточек деталей для данного uid, независимо от формата хранения:
@@ -132,8 +114,8 @@ def _protected_detail_ids(uid: int) -> set[int]:
     ids: set[int] = set()
     try:
         blocks = getattr(state, "detail_blocks", {}) or {}
-        # новая схема ключей
         if isinstance(blocks, dict):
+            # новая схема ключей
             for k, mids in list(blocks.items()):
                 try:
                     if isinstance(k, tuple) and len(k) == 2 and int(k[0]) == int(uid):
@@ -158,9 +140,8 @@ def _protected_detail_ids(uid: int) -> set[int]:
 
 async def _vacuum_tracked_private(uid: int) -> None:
     """
-    Чистит все отправленные ботом сообщения в личке, КРОМЕ:
-    • известных message_id меню;
-    • карточек деталей (detail-view) — защищены _protected_detail_ids(uid).
+    Чистит все отправленные ботом сообщения в личке, КРОМЕ карточек деталей (detail-view).
+    Главное меню/стикеры сохраняются через SSOT keep (см. вызовы ниже).
     """
     try:
         bot = Bot.get_current()
@@ -168,7 +149,7 @@ async def _vacuum_tracked_private(uid: int) -> None:
         if not isinstance(store, dict):
             return
         items = list(store.get(int(uid), []) or [])
-        keep_ids = _known_menu_ids(uid) | _protected_detail_ids(uid)
+        keep_ids = _protected_detail_ids(uid)
         new_items: List[Tuple[int, float, str]] = []
         for mid, ts, kind in items:
             if int(mid) in keep_ids:
@@ -236,12 +217,11 @@ def _normalize_text(s: str) -> str:
             return canon
     return s
 
-# 👇 НОВОЕ: хелпер, чтобы различать человеческую подпись и машинный payload
+# 👇 различение payload'ов
 _PAYLOADISH_RE = re.compile(r"[{}[\]=:|]|->|^poll:|^swap:|^act:|^cmd:|^detail:", re.IGNORECASE)
 _ASCII_TOKEN_RE = re.compile(r"^[A-Za-z0-9_:;=|,./{}\[\]\-+@#%]+$")
 
 def _looks_like_payload(s: str) -> bool:
-    # Имеет структурные символы / префиксы, либо токен без пробелов и кириллицы
     if _PAYLOADISH_RE.search(s):
         return True
     if _ASCII_TOKEN_RE.match(s):
@@ -252,16 +232,13 @@ class NormalizeButtons(BaseMiddleware):
     async def __call__(self, handler, event: TelegramObject, data: Dict[str, Any]):
         try:
             if isinstance(event, Message) and isinstance(event.text, str):
-                # ТОЛЬКО текст пользователя — нормализуем агрессивно
                 norm = _normalize_text(event.text)
                 if norm != event.text:
                     logger.debug("[normalize] '%s' -> '%s'", event.text, norm)
                     event.text = norm  # type: ignore[attr-defined]
 
             elif isinstance(event, CallbackQuery) and isinstance(event.data, str):
-                # ⚠️ ВНИМАНИЕ: не трогаем машинные payload'ы
                 if _looks_like_payload(event.data):
-                    # оставляем как есть — это данные для роутера/хэндлера
                     pass
                 else:
                     norm = _normalize_text(event.data)
@@ -272,7 +249,6 @@ class NormalizeButtons(BaseMiddleware):
         except Exception as e:
             logger.debug("[normalize] skip: %s", e)
         return await handler(event, data)
-
 
 # ── middleware: пер-пользовательский мьютекс ────────────────────────
 _USER_LOCKS: Dict[int, asyncio.Lock] = {}
@@ -323,7 +299,6 @@ class VacuumBeforeRender(BaseMiddleware):
                 setattr(state, "_render_done", done)
 
             if isinstance(event, Message) and event.from_user:
-                # ⚠️ Не удаляем входящее сообщение пользователя в ЛС — устраняет мигание.
                 target_uids.append(event.from_user.id); _mark(event.from_user.id)
             elif isinstance(event, CallbackQuery) and event.from_user:
                 target_uids.append(event.from_user.id); _mark(event.from_user.id)
@@ -346,16 +321,21 @@ class VacuumBeforeRender(BaseMiddleware):
                     if done.get(uid) == tokens.get(uid):
                         continue
 
-                # ГЛАВНОЕ: защищаем detail-view от удаления
-                keep_ids = list(_known_menu_ids(uid) | _protected_detail_ids(uid))
+                # SSOT-keep (меню/липкие из ядра) + защищённые детали
+                keep_ids = list(set(ssot_keep_for_vacuum(uid)) | _protected_detail_ids(uid))
                 try:
-                    # новая сигнатура ядра: delete_previous_private_messages(bot, uid, keep=[...])
-                    await delete_previous_private_messages(Bot.get_current(), uid, keep=keep_ids)  # type: ignore[arg-type]
-                except TypeError:
-                    # легаси-ядро без keep — минимальный режим
-                    await delete_previous_private_messages(uid)
+                    # Используем SSOT-вакуум (понимает разные сигнатуры)
+                    try:
+                        await ssot_vacuum_private(Bot.get_current(), uid, keep=keep_ids)  # type: ignore[arg-type]
+                    except TypeError:
+                        try:
+                            await ssot_vacuum_private(uid, keep=keep_ids)  # type: ignore[arg-type]
+                        except TypeError:
+                            await ssot_vacuum_private(uid)  # type: ignore[arg-type]
+                except Exception:
+                    # мягкий фолбэк только на собственные отправленные сообщения
+                    await _vacuum_tracked_private(uid)
 
-                # tracked-пылесос учитывает detail-ids сам
                 await _vacuum_tracked_private(uid)
 
                 done = getattr(state, "_render_done", {}) or {}
@@ -365,6 +345,22 @@ class VacuumBeforeRender(BaseMiddleware):
             logger.debug("[vacuum-mw] skip: %s", e)
 
         return await handler(event, data)
+
+# ███ [1.7] CLEAN DM MIDDLEWARE — авто-удаление входящих сообщений в ЛС
+# ────────────────────────────────────────────────────────────────────
+# Версия 1.0 · 2025-08-28
+class _CleanPrivateMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: TelegramObject, data: Dict[str, Any]):
+        result = await handler(event, data)
+        try:
+            if isinstance(event, Message) and event.chat and event.chat.type == "private":
+                bot: Bot | None = data.get("bot")
+                if bot:
+                    with contextlib.suppress(Exception):
+                        await bot.delete_message(chat_id=event.chat.id, message_id=event.message_id)
+        except Exception as e:
+            logger.debug("[clean-dm] skip delete: %r", e)
+        return result
 
 # ── startup ─────────────────────────────────────────────────────────
 async def on_startup() -> None:
@@ -383,13 +379,6 @@ async def on_startup() -> None:
     logger.info("[startup] DB initialized, Leader-ID=%d", settings.LEADER_ID)
 
 # ── /start ──────────────────────────────────────────────────────────
-def _ensure_menu_state() -> Dict[int, int]:
-    cur = getattr(state, "menu_message_id", None)
-    if isinstance(cur, dict):
-        return cur
-    setattr(state, "menu_message_id", {})
-    return state.menu_message_id  # type: ignore[return-value]
-
 def _ensure_menu_fp_state() -> Dict[int, str]:
     """Кэшим «отпечаток» последней раскладки меню на юзера, чтобы
     не дергать editMessageReplyMarkup без реального изменения клавиатуры."""
@@ -402,7 +391,6 @@ def _ensure_menu_fp_state() -> Dict[int, str]:
 def _kb_fingerprint(kb: Any) -> str:
     """Стабильный отпечаток клавиатуры для сравнения."""
     try:
-        # aiogram v3 объекты — pydantic-модели
         if hasattr(kb, "model_dump_json"):
             return kb.model_dump_json(by_alias=True, exclude_none=True, sort_keys=True)  # type: ignore[no-any-return]
         if hasattr(kb, "model_dump"):
@@ -410,36 +398,30 @@ def _kb_fingerprint(kb: Any) -> str:
             return _json.dumps(kb.model_dump(by_alias=True, exclude_none=True), sort_keys=True, ensure_ascii=False)
     except Exception:
         pass
-    # как fallback — repr
     return repr(kb)
 
 async def _send_main_menu(uid: int) -> None:
+    """
+    Показывает/обновляет главное меню в личке.
+    Минимальная правка: используем SSOT-хелпер send_root_menu_singleton.
+    """
     kb = await get_main_menu(uid)
-    bot = Bot.get_current()
     if not kb:
-        msg = await bot.send_message(uid, "⛔ У вас пока нет доступа к функциям бота.")
+        # нет прав/ролей — показываем одно системное сообщение как единственный блок
+        msg = await dm_singleton_send(uid, "⛔ У вас пока нет доступа к функциям бота.")
         _register_sent(int(uid), int(msg.message_id), "text")
         return
 
-    menu_map = _ensure_menu_state()
+    # анти-фликер по клавиатуре (сохраняем fingerprint локально; сам показ — через SSOT)
     fp_map = _ensure_menu_fp_state()
     new_fp = _kb_fingerprint(kb)
-    mid = menu_map.get(uid)
-
-    # Anti-flicker: если клавиатура идентичная — не дергаем editMessageReplyMarkup
-    if isinstance(mid, int) and fp_map.get(uid) == new_fp:
+    if fp_map.get(uid) == new_fp:
+        # всё равно попросим SSOT убедиться, что меню есть (оно умно редактирует/создаёт)
+        await send_root_menu_singleton(uid, kb)  # ← передаём kb
         return
 
-    if isinstance(mid, int):
-        with contextlib.suppress(Exception):
-            await bot.edit_message_reply_markup(uid, mid, reply_markup=kb)
-            fp_map[uid] = new_fp
-            return
-
-    msg = await bot.send_message(uid, "Меню", reply_markup=kb)
-    menu_map[uid] = int(msg.message_id)
+    await send_root_menu_singleton(uid, kb)  # ← передаём kb
     fp_map[uid] = new_fp
-    _register_sent(int(uid), int(msg.message_id), "text")
 
 async def group_start(message: Message) -> None:
     await message.answer(
@@ -455,9 +437,23 @@ async def private_start(message: Message) -> None:
 
 async def legacy_profile_start(message: Message) -> None:
     if (message.text or "").strip().lower() == "/start profile":
-        await delete_previous_private_messages(message.from_user.id)
+        # SSOT-вакуум сам сохранит меню; show profile → back to menu
         await profile_handler(message)
         await _send_main_menu(message.from_user.id)
+
+# ███ [13.99] FALLBACK: «Воспользуйтесь командами главного меню» + авто-стирка
+# ────────────────────────────────────────────────────────────────────
+from aiogram import Router
+fallback_router = Router(name="fallback-clean")
+
+@fallback_router.message(F.chat.type == "private")
+async def _fallback_clean(message: Message, bot: Bot) -> None:
+    tip = await message.answer("Воспользуйтесь командами главного меню")
+    # короткая пауза, чтобы пользователь увидел подсказку
+    await asyncio.sleep(1.2)
+    with contextlib.suppress(Exception):
+        await bot.delete_message(chat_id=message.chat.id, message_id=tip.message_id)
+    # Само пользовательское сообщение удалит _CleanPrivateMiddleware
 
 # ── main ────────────────────────────────────────────────────────────
 async def main() -> None:
@@ -479,14 +475,19 @@ async def main() -> None:
         if already:
             return
 
-        # Защищаем меню и detail-view
-        keep_ids = list(_known_menu_ids(cid) | _protected_detail_ids(cid))
+        # SSOT keep + защищённые детали
+        keep_ids = list(set(ssot_keep_for_vacuum(cid)) | _protected_detail_ids(cid))
         try:
-            await delete_previous_private_messages(Bot.get_current(), cid, keep=keep_ids)  # type: ignore[arg-type]
-        except TypeError:
-            await delete_previous_private_messages(cid)
+            try:
+                await ssot_vacuum_private(Bot.get_current(), cid, keep=keep_ids)  # type: ignore[arg-type]
+            except TypeError:
+                try:
+                    await ssot_vacuum_private(cid, keep=keep_ids)  # type: ignore[arg-type]
+                except TypeError:
+                    await ssot_vacuum_private(cid)  # type: ignore[arg-type]
+        except Exception:
+            await _vacuum_tracked_private(cid)
 
-        # detail-view не трогаем (_vacuum_detail_blocks — no-op)
         await _vacuum_tracked_private(cid)
 
         if isinstance(done, dict) and isinstance(tokens, dict):
@@ -518,7 +519,6 @@ async def main() -> None:
         last_text = last_text_map.get(cid)
 
         if isinstance(mid, int) and last_text == text:
-            # текст не изменился — не трогаем текст; поправим только разметку (если нужно).
             try:
                 return await bot.edit_message_reply_markup(
                     chat_id=cid,
@@ -526,7 +526,7 @@ async def main() -> None:
                     reply_markup=kwargs.get("reply_markup"),
                 )
             except Exception:
-                pass  # если нечего редактировать — молча продолжаем
+                pass
 
         if isinstance(mid, int):
             try:
@@ -534,7 +534,7 @@ async def main() -> None:
                 last_text_map[cid] = text
                 return msg
             except Exception:
-                pass  # если не удалось — отправим новое
+                pass
 
         msg = await bot._orig_send_message(chat_id, text, **kwargs)  # type: ignore[attr-defined]
         try:
@@ -612,6 +612,8 @@ async def main() -> None:
     dp.update.middleware(NormalizeButtons())
     dp.update.middleware(VacuumBeforeRender())
     dp.update.middleware(UpdateLogger())
+    # удаление входящих сообщений — после работы хендлеров (только Message)
+    dp.message.middleware(_CleanPrivateMiddleware())
 
     dp.message.register(group_start, CommandStart(), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
     dp.message.register(private_start, CommandStart(), F.chat.type == ChatType.PRIVATE)
@@ -619,6 +621,7 @@ async def main() -> None:
 
     setup_handlers(dp)
     dp.include_router(guide_router)
+    dp.include_router(fallback_router)  # последний — как ловушка произвольных текстов в ЛС
     logger.info("[setup] routers registered: %d", len(getattr(dp, "sub_routers", [])))
 
     # scheduler
@@ -643,7 +646,7 @@ async def _test() -> None:
     import core.db as _db
     _db.get_user_info = _fake  # type: ignore
     kb = await get_main_menu(1)
-    assert kb and len(kb.keyboard) > 0
+    assert kb and len(kb.keyboard) > 0  # type: ignore[attr-defined]
     _db.get_user_info = _orig_get_user_info  # type: ignore
     print("main.py smoke-test OK")
 
