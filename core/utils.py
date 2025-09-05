@@ -494,10 +494,8 @@ async def vacuum_private(uid: int, keep: Optional[Sequence[int]] = None) -> None
 
     ВАЖНО:
       • Сообщение главного меню бережём автоматически (state.menu_message_id).
-      • БЕРЕЖЁМ ДАШБОРД «МОИ ИГРЫ» (липкий):
-          state.my_games_sticky[uid] (через keep_for_vacuum)
-        Это устраняет затирание дашборда и позволяет тихо заменять кнопки
-        «Подтвердить» → «Замена» и синхронно менять детали.
+      • БЕРЕЖЁМ ДАШБОРД «МОИ ИГРЫ» (липкий): state.my_games_sticky[uid] (через keep_for_vacuum).
+      • БЕРЕЖЁМ ЛИЧНЫЙ ДАШБОРД ОТЧЁТА ЛИДЕРА ОПРОСА (если открыт и не подавлено).
       • Поддержка хранения detail_blocks по ключам uid И (uid, deal_id).
     """
     from core.state import state as _state  # гарантируем актуальный объект
@@ -524,6 +522,23 @@ async def vacuum_private(uid: int, keep: Optional[Sequence[int]] = None) -> None
             keep_set.add(val)
 
     _add_keep_from("menu_message_id")
+
+    # ——— SSOT: бережём дашборд отчёта лидера опроса (если не подавлено) ———
+    try:
+        cur_leader = getattr(_state, "current_poll_leader", None)
+        report_mid = getattr(_state, "personal_report_message_id", None)
+        suppress_keep = bool(getattr(_state, "suppress_report_keep", False))
+        if (
+            not suppress_keep
+            and isinstance(cur_leader, int) and int(cur_leader) == int(uid)
+            and isinstance(report_mid, int) and report_mid > 0
+        ):
+            keep_set.add(int(report_mid))
+            logger.debug("[vacuum] keep leader report uid=%s mid=%s", uid, report_mid)
+        elif suppress_keep:
+            logger.debug("[vacuum] skip keep leader report uid=%s (suppress flag)", uid)
+    except Exception:
+        pass
 
     bot = None
     try:
@@ -602,6 +617,10 @@ async def vacuum_private(uid: int, keep: Optional[Sequence[int]] = None) -> None
             setattr(_state, "personal_report_message_id", None)
 
     logger.debug("[vacuum] uid=%s keep=%s", uid, sorted(list(keep_set)))
+
+# История изменений:
+# 2025-09-05 — SSOT: vacuum_private бережёт отчёт лидера + suppress_report_keep
+
 
 # ███ [7] LEGACY-ВРАППЕР ПЫЛЕСОСА (совместимость)
 # --------------------------------------------------------------------
