@@ -344,7 +344,7 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
 
     can_confirm = (role in {"main", "assist", "admin"}) and ((status_id == bron_id) or prelim) and (not confirmed)
     # «Замена» после подтверждения или при статусе «Завершение сделки»
-    can_swap = (role in {"main", "assist", "admin"}) and (confirmed or status_id == ok_id)
+    can_swap = (role in {"main", "assist", "admin"}) and (status_id == ok_id)
 
     # Доступность «Отчёта»
     report_ready = False
@@ -1184,14 +1184,7 @@ async def announce_if_all_confirmed(deal_id: int) -> None:
 
 # ════════════════════════════════════════════════════════════════════
 # [3.4] Дашборд «Мои игры» — мягкий редрав и кнопки действий
-# Версия 3.4.5 · 2025-08-28
-# ────────────────────────────────────────────────────────────────────
-# ИЗМЕНЕНО:
-# • _build_dashboard_kb больше не зависит от внешних хелперов
-#   make_my_games_confirm_btn_for_row/make_my_games_swap_btn_for_row.
-#   Кнопки строятся «на месте» на основе SSOT (locked_distribution),
-#   локальной отметки и статусов — как в стабильной версии выше.
-# • Сохранены заглушки для Pylance и мягкий редрав без циклических импортов.
+# Версия 3.4.6 · 2025-09-05 (фикс: «✅ Подтверждено» до SUCCESS; «Замена» только на SUCCESS)
 # ════════════════════════════════════════════════════════════════════
 import logging
 from contextlib import suppress
@@ -1345,9 +1338,14 @@ def _build_dashboard_kb(uid: int, deals_sorted: List[Dict]) -> InlineKeyboardMar
         confirmed = (_has_confirmation_tag(d, uid) if callable(_has_confirmation_tag) else False) or _is_locally_confirmed_for_redraw(did, uid)  # type: ignore
         role = _assigned_role_from_state(uid, did) if callable(_assigned_role_from_state) else None
 
-        # строка действия
-        if confirmed or sid == OK_ID:
-            kb.row(InlineKeyboardButton(text="🔁 Замена", callback_data=f"{globals().get('SWAP_PREFIX','mygame_swap_')}{did}"))
+        # строка действия (фикс логики)
+        if sid == OK_ID:
+            kb.row(InlineKeyboardButton(
+                text="🔁 Замена",
+                callback_data=f"{globals().get('SWAP_PREFIX','mygame_swap_')}{did}"
+            ))
+        elif confirmed:
+            kb.row(InlineKeyboardButton(text="✅ Подтверждено", callback_data="mygame_noop"))
         elif role in {"main", "assist", "admin"} and (sid == BRON_ID or status == "Предвар."):
             kb.row(InlineKeyboardButton(
                 text="✅ Подтвердить",
@@ -1752,15 +1750,31 @@ def _my_games(uid: int, deals: List[Dict]) -> List[Dict]:
     """Совместимость со старыми модулями (handlers.profile)."""
     return _visible_deals_for_user(uid, deals)
 
+
+
+
+
+# ════════════════════════════════════════════════════════════════════
 # ███ [5] DASHBOARD / DETAILS — липкий дашборд + пылесос как в отчёте
-# Версия 5.7.6 · 2025-09-05
-# Изменения в этой правке:
-# • Убран импорт MSK_TZ из core.utils (его там нет).
-# • Добавлена локальная зона LOCAL_TZ (settings.TIMEZONE или Europe/Moscow).
-# • Остальная логика блока без изменений.
+# ════════════════════════════════════════════════════════════════════
+# Версия 5.10.1 · 2025-09-06 (hotfix-3)
+# Задачи/поведение:
+# 1) При входе в «Мои игры» — репорт-дашборд опроса полностью исчезает (не «уезжает вверх»):
+#    • агрессивная зачистка реестров репорта/деталей перед отрисовкой;
+#    • подавление keep leader report (если поддерживается ядром) во всех вакуумах из «Моих игр».
+# 2) «Тихие» замены кнопок:
+#    • после подтверждения — «✅ Подтверждено», без удаления дашборда;
+#    • после SUCCESS — «🔁 Замена» в дашборде и «🙋 Попросить замену» в деталях;
+#    • если sticky внезапно пропал — тихо пересоздаём из кэша и продолжаем.
+#
+# Минимальные правки по сравнению с 5.10.0:
+# • Глобально и локально гарантируем включение sticky в keep (патч keep_for_vacuum + локальный keep_for_vacuum).
+# • Вакууум из «Моих игр» всегда выполняется с подавлением leader report (безоткатно на короткий интервал).
+# • _vacuum_poll_details_blocks агрессивно чистит все известные/эвристические хранилища репорта (включая leader).
+# • Добавлено безопасное определение _cu (core.utils) для использования в подавлении и в эвристике.
 import logging
 from contextlib import suppress
-from typing import Any, Dict, List, Optional, TYPE_CHECKING, Callable, cast
+from typing import Any, Dict, List, Optional, TYPE_CHECKING, Callable, cast, Set, Tuple
 from datetime import datetime
 
 from aiogram import Bot, types
@@ -1781,6 +1795,42 @@ LOCAL_TZ = _tz(_TZ_NAME)
 
 logger = logging.getLogger(__name__)
 
+# ── безопасное обращение к core.utils (для подавления leader report и эвристик) ──
+_cu = None
+with suppress(Exception):
+    import core.utils as _cu  # type: ignore
+
+# ── Глобальный патч SSOT keep_for_vacuum: стараемся хранить наш sticky везде ──
+try:
+    if _cu and not getattr(state, "_mygames_keep_patch_installed", False):
+        _orig_keep = _cu.keep_for_vacuum  # type: ignore[attr-defined]
+
+        def _keep_wrapper(uid: int, *extra: int):
+            keep_extra: List[int] = list(extra)
+            sticky = None
+            with suppress(Exception):
+                sticky = get_my_games_dashboard(int(uid))
+            if isinstance(sticky, int) and sticky > 0 and sticky not in keep_extra:
+                keep_extra.append(int(sticky))
+            try:
+                res = _orig_keep(int(uid), *keep_extra)
+                sig = "(uid, *extra)"
+            except TypeError:
+                res = _orig_keep(int(uid))  # type: ignore[misc]
+                sig = "(uid)"
+                if isinstance(sticky, int) and sticky > 0 and sticky not in res:
+                    res.append(int(sticky))
+            if isinstance(sticky, int) and sticky > 0 and sticky not in res:
+                res.append(int(sticky))
+            logger.debug("[my_games.keep_patch] uid=%s sig=%s extra=%s -> keep=%s", uid, sig, keep_extra, res)
+            return res
+
+        _cu.keep_for_vacuum = _keep_wrapper  # type: ignore[assignment]
+        state._mygames_keep_patch_installed = True  # type: ignore[attr-defined]
+        logger.info("[my_games.keep_patch] core.utils.keep_for_vacuum patched globally")
+except Exception as e:
+    logger.warning("[my_games.keep_patch] cannot patch core.utils.keep_for_vacuum: %s", e)
+
 # ── sticky-реестр дашборда ──────────────────────────────────────────
 if not hasattr(state, "my_games_dashboard"):
     # uid -> message_id
@@ -1797,24 +1847,18 @@ def set_my_games_dashboard(uid: int, message_id: int) -> None:
     (getattr(state, "my_games_dashboard", {}) or {}).update({int(uid): int(message_id)})
 
 def keep_for_vacuum(uid: int, *extra_msg_ids: int) -> List[int]:
-    """
-    Сообщения, которые нужно сохранить при пылесосе.
-    Минимальные правки: объединяем локальный sticky с SSOT-списком.
-    """
+    """Локальный keep: sticky «Мои игры» + SSOT + явные доп. id."""
     keep: List[int] = []
 
-    # 1) наш sticky дашборда «Мои игры»
     sticky = get_my_games_dashboard(int(uid))
     if isinstance(sticky, int) and sticky > 0:
         keep.append(sticky)
 
-    # 2) SSOT-keep (включает меню, иные «липкие» id ядра)
     with suppress(Exception):
         for mid in ssot_keep_for_vacuum(int(uid), *keep):
             if isinstance(mid, int) and mid > 0 and mid not in keep:
                 keep.append(mid)
 
-    # 3) дополнительные id от вызывающего кода
     for mid in extra_msg_ids:
         try:
             m2 = int(mid)
@@ -1823,7 +1867,26 @@ def keep_for_vacuum(uid: int, *extra_msg_ids: int) -> List[int]:
         if m2 > 0 and m2 not in keep:
             keep.append(m2)
 
+    logger.debug("[my_games.vacuum] keep_for_vacuum(uid=%s) -> keep_ids=%s", uid, keep)
     return keep
+
+# ── локальный флаг подтверждения для «тихой» перекраски ─────────────
+if not hasattr(state, "mygames_local_confirm"):
+    # ключ: (uid, deal_id) -> bool
+    state.mygames_local_confirm: Dict[Tuple[int, int], bool] = {}  # type: ignore[attr-defined]
+
+def _set_locally_confirmed(uid: int, deal_id: int, flag: bool = True) -> None:
+    try:
+        state.mygames_local_confirm[(int(uid), int(deal_id))] = bool(flag)
+        logger.debug("[my_games.local] set confirmed uid=%s deal=%s -> %s", uid, deal_id, flag)
+    except Exception as e:
+        logger.debug("[my_games.local] set confirmed failed: %s", e)
+
+def _mg_local_confirmed(uid: int, deal_id: int) -> bool:
+    try:
+        return bool((getattr(state, "mygames_local_confirm", {}) or {}).get((int(uid), int(deal_id))))
+    except Exception:
+        return False
 
 # ── внешние хелперы из других блоков (типизированные заглушки) ─────
 if TYPE_CHECKING:
@@ -1841,23 +1904,45 @@ else:
     make_my_games_confirm_btn_for_row = cast(Callable[[Dict[str, Any], int], Optional[InlineKeyboardButton]], globals().get("make_my_games_confirm_btn_for_row"))  # type: ignore
     make_my_games_swap_btn_for_row   = cast(Callable[[Dict[str, Any], int], Optional[InlineKeyboardButton]], globals().get("make_my_games_swap_btn_for_row"))    # type: ignore
 
-# ── общий пылесос ЛС (сохраняет sticky) ─────────────────────────────
+# ── подавление keep leader report в ядре (если поддерживается) ──────
+class _SuppressLeaderReport:
+    def __init__(self, uid: int):
+        self.uid = int(uid)
+
+    async def __aenter__(self):
+        # пытаемся включить все известные рубильники
+        if _cu:
+            with suppress(Exception):
+                setattr(_cu, "SUPPRESS_KEEP_LEADER_REPORT", True)   # глобально
+            with suppress(Exception):
+                s = getattr(_cu, "suppress_keep_leader_report_uids", None)
+                if isinstance(s, set):
+                    s.add(self.uid)
+        return self
+
+    async def __aexit__(self, *exc):
+        # откат не делаем — ядро обычно снимает флаги само, это снижает гонки
+        return False
+
+# ── общий пылесос ЛС (сохраняет sticky «Мои игры») ──────────────────
 async def _vacuum_safe(uid: int, keep: Optional[List[Any]] = None, *, ignore_sticky: bool = False) -> None:
     """
     Пылесос ЛС для «Моих игр».
     • Сохраняет sticky-дашборд (если ignore_sticky=False).
-    • Чистит хвосты деталей отчёта перед/после вакуума.
-    • Использует core.utils.vacuum_private с поддержкой разных сигнатур.
+    • Чистит хвосты деталей/репорта перед/после вакуума.
+    • Использует core.utils.vacuum_private с поддержкой suppress-флагов.
     """
     from aiogram import types as _types
-    # предварительно уберём детали
+    logger.debug("[my_games.vacuum] start: uid=%s ignore_sticky=%s raw_keep=%s", uid, ignore_sticky, keep)
+
+    # предварительно уберём детали/репорт-хвосты
     with suppress(Exception):
         res = _vacuum_poll_details_blocks(int(uid))
         if hasattr(res, "__await__"):
             await res
+        logger.debug("[my_games.vacuum] pre-clean poll_details/report done for uid=%s", uid)
 
     keep_ids: List[int] = []
-    # нормализуем входные keep
     for k in keep or []:
         with suppress(Exception):
             if isinstance(k, _types.Message):
@@ -1865,7 +1950,6 @@ async def _vacuum_safe(uid: int, keep: Optional[List[Any]] = None, *, ignore_sti
             elif isinstance(k, int):
                 keep_ids.append(int(k))
 
-    # приклеим sticky (если не игнорируется)
     if not ignore_sticky:
         for mid in keep_for_vacuum(int(uid)):
             if mid not in keep_ids and isinstance(mid, int) and mid > 0:
@@ -1873,51 +1957,64 @@ async def _vacuum_safe(uid: int, keep: Optional[List[Any]] = None, *, ignore_sti
 
     bot = Bot.get_current()
 
-    # основной путь — SSOT vacuum_private
-    with suppress(Exception):
-        try:
-            await ssot_vacuum_private(bot, int(uid), keep=keep_ids)   # (bot, uid, keep)
-        except TypeError:
-            try:
-                await ssot_vacuum_private(int(uid), keep=keep_ids)    # (uid, keep)
-            except TypeError:
-                await ssot_vacuum_private(int(uid))                    # (uid,)
-        # хвостовая чистка деталей
+    async with _SuppressLeaderReport(int(uid)):
         with suppress(Exception):
-            res2 = _vacuum_poll_details_blocks(int(uid))
-            if hasattr(res2, "__await__"):
-                await res2
-        return
+            logger.info("[my_games.vacuum] executing vacuum for uid=%s; keep_ids=%s", uid, keep_ids)
+            try:
+                await ssot_vacuum_private(bot, int(uid), keep=keep_ids, suppress=True, suppress_leader_report=True)  # type: ignore[call-arg]
+                logger.debug("[my_games.vacuum] ssot_vacuum_private OK (bot, uid, keep, suppress=*)")
+            except TypeError:
+                try:
+                    await ssot_vacuum_private(int(uid), keep=keep_ids, suppress=True)  # type: ignore[call-arg]
+                    logger.debug("[my_games.vacuum] ssot_vacuum_private OK (uid, keep, suppress=*)")
+                except TypeError:
+                    try:
+                        await ssot_vacuum_private(int(uid), keep=keep_ids)
+                        logger.debug("[my_games.vacuum] ssot_vacuum_private OK (uid, keep)")
+                    except TypeError:
+                        await ssot_vacuum_private(int(uid))
+                        logger.debug("[my_games.vacuum] ssot_vacuum_private OK (uid,)")
 
-    # фолбэк — старый пылесос (на случай отсутствия SSOT-функции)
+            with suppress(Exception):
+                res2 = _vacuum_poll_details_blocks(int(uid))
+                if hasattr(res2, "__await__"):
+                    await res2
+                logger.debug("[my_games.vacuum] post-clean poll_details/report done for uid=%s", uid)
+            return
+
+    # фолбэк — старый пылесос
     with suppress(Exception):
         from core.utils import delete_previous_private_messages as _old  # type: ignore
+        logger.info("[my_games.vacuum] fallback to legacy delete_previous_private_messages for uid=%s", uid)
         try:
             await _old(bot, int(uid), keep=keep_ids)
+            logger.debug("[my_games.vacuum] legacy vacuum OK (bot, uid, keep)")
         except TypeError:
             try:
                 await _old(int(uid), keep=keep_ids)
+                logger.debug("[my_games.vacuum] legacy vacuum OK (uid, keep)")
             except TypeError:
                 await _old(int(uid))
+                logger.debug("[my_games.vacuum] legacy vacuum OK (uid,)")
+
         with suppress(Exception):
             res3 = _vacuum_poll_details_blocks(int(uid))
             if hasattr(res3, "__await__"):
                 await res3
+            logger.debug("[my_games.vacuum] post-clean poll_details/report done (legacy) for uid=%s", uid)
 
 # ── построение клавиатуры дашборда (v2) ─────────────────────────────
 def _build_dashboard_kb_v2(uid: int, deals_sorted: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
     """
-    ВНИМАНИЕ: кнопки «✅ Подтвердить»/«🔁 Замена» строятся ЛОКАЛЬНО по SSOT,
-    без внешних make_my_games_* (см. [3.4] для идентичной логики).
-    Это гарантирует наличие нужных кнопок в дашборде.
+    Кнопки «✅ Подтвердить»/«🔁 Замена» строятся локально по SSOT:
+    • «✅ Подтверждено» — до SUCCESS (по тегу/локальному флагу);
+    • «🔁 Замена» — только на SUCCESS.
     """
     from core.config import settings as _cfg
-
     BRON_ID: str   = str(getattr(_cfg, "BRON_STATUS_ID", ""))
     OK_ID: str     = str(getattr(_cfg, "SUCCESSFUL_STATUS_ID", ""))
     PRELIM_ID: str = str(getattr(_cfg, "PRELIM_STATUS_ID", getattr(_cfg, "PRELIMINARY_STATUS_ID", "")) or "")
 
-    # доступ к вспомогательным функциям из модуля (для Pylance — через cast/globals)
     _has_confirmation_tag = cast(Callable[[Dict[str, Any], int], bool], globals().get("_has_confirmation_tag"))  # type: ignore
     _assigned_role_from_state = cast(Callable[[int, int], Optional[str]], globals().get("_assigned_role_from_state"))  # type: ignore
     _is_locally_confirmed_for_redraw = cast(Callable[[int, int], bool], globals().get("_is_locally_confirmed_for_redraw"))  # type: ignore
@@ -1944,30 +2041,36 @@ def _build_dashboard_kb_v2(uid: int, deals_sorted: List[Dict[str, Any]]) -> Inli
             callback_data=f"{globals().get('DETAILS_PREFIX','mygame_details_')}{did}",
         )
 
-        # состояние подтверждения (теги CRM + локальная отметка)
-        confirmed = False
-        if callable(_has_confirmation_tag):
-            confirmed = _has_confirmation_tag(d, uid)
+        # состояние подтверждения: локальный флаг → CRM-теги → локальная отметка [3.4]
+        confirmed = _mg_local_confirmed(uid, did)
+        if not confirmed and callable(_has_confirmation_tag):
+            with suppress(Exception):
+                confirmed = bool(_has_confirmation_tag(d, uid))
         if not confirmed and callable(_is_locally_confirmed_for_redraw):
             with suppress(Exception):
                 confirmed = bool(_is_locally_confirmed_for_redraw(did, uid))
 
-        # роль по зафиксированному распределению
+        # роль из зафиксированного распределения
         role: Optional[str] = None
         if callable(_assigned_role_from_state):
             with suppress(Exception):
                 role = _assigned_role_from_state(uid, did)
 
         # строка действия
-        if confirmed or sid == OK_ID:
-            kb.row(InlineKeyboardButton(text="🔁 Замена", callback_data=f"{globals().get('SWAP_PREFIX','mygame_swap_')}{did}"))
+        if sid == OK_ID:
+            kb.row(InlineKeyboardButton(
+                text="🔁 Замена",
+                callback_data=f"{globals().get('SWAP_PREFIX','mygame_swap_')}{did}"
+            ))
+        elif confirmed:
+            kb.row(InlineKeyboardButton(text="✅ Подтверждено", callback_data="mygame_noop"))
         elif role in {"main", "assist", "admin"} and (sid == BRON_ID or status == "Предвар."):
             kb.row(InlineKeyboardButton(
                 text="✅ Подтвердить",
                 callback_data=f"{globals().get('CONFIRM_PREFIX','confirm_role_')}{did}_{role}",
             ))
 
-        # «Отчёт» — отдельной строкой при наступлении даты/времени
+        # «Отчёт» — отдельной строкой при наступлении доступности
         if callable(_report_available_for):
             with suppress(Exception):
                 if _report_available_for(did):
@@ -1984,22 +2087,28 @@ async def update_my_games_buttons_only(uid: int, markup: InlineKeyboardMarkup | 
         return None
     with suppress(Exception):
         await Bot.get_current().edit_message_reply_markup(chat_id=int(uid), message_id=int(mid), reply_markup=markup)
-        await _vacuum_safe(int(uid), keep=[mid])  # заодно подметём хвосты, сохранив дашборд
+        await _vacuum_safe(int(uid), keep=[mid])  # мягкий подмет: сохранить sticky, убрать хвосты/репорт
         return int(mid)
-    # если не удалось — сбрасывать sticky не будем; следующая перерисовка создаст новый
     return None
 
 # ── основной вывод/обновление дашборда ──────────────────────────────
 async def _send_dashboard(uid: int, deals: List[Dict[str, Any]]) -> None:
     """
-    Отрисовывает (или обновляет) список игр:
-    • если sticky уже есть — редактируем текст и клавиатуру (без удаления сообщения);
-    • если нет — отправляем новое и сохраняем sticky id;
-    • пылесосим ЛС, оставляя sticky и убирая детали/старые хвосты.
+    Отрисовывает (или обновляет) список игр.
+    Гарантии:
+    • Перед отрисовкой агрессивно стираем дашборд отчёта опроса.
+    • При редактировании — не удаляем sticky; при отсутствии — создаём новый.
     """
     bot = Bot.get_current()
+    logger.info("[my_games] send_dashboard: uid=%s deals_in=%s", uid, len(deals or []))
 
-    # сортировка карточек: по времени (учитываем локальную таймзону)
+    # (1) Сначала подчистим репорт-дашборд/детали, чтобы он не «уехал вверх»
+    with suppress(Exception):
+        res = _vacuum_poll_details_blocks(int(uid))
+        if hasattr(res, "__await__"):
+            await res
+
+    # (2) Сортировка карточек по дате/времени
     def _key(d: Dict[str, Any]) -> tuple:
         dt = _safe_event_dt(d)
         try:
@@ -2008,26 +2117,28 @@ async def _send_dashboard(uid: int, deals: List[Dict[str, Any]]) -> None:
             elif getattr(dt, "tzinfo", None):
                 ts = dt.timestamp()
             else:
-                # для naive datetime корректно «локализуем» через pytz
                 ts = LOCAL_TZ.localize(dt).timestamp()
         except Exception:
             ts = float("inf")
         return (dt is None, ts)
 
     deals_sorted = sorted(list(deals or []), key=_key)
+    logger.debug("[my_games] send_dashboard: sorted_count=%s", len(deals_sorted))
 
-    # Построение клавиатуры: предпочтительно через [3.4] (_build_dashboard_kb),
-    # чтобы коллбэки соответствовали актуальной логике подтверждений; фолбэк — v2.
+    # Клавиатура
     build_kb = globals().get("_build_dashboard_kb")
     if callable(build_kb):
+        logger.debug("[my_games] send_dashboard: keyboard via _build_dashboard_kb")
         markup = build_kb(int(uid), deals_sorted)  # type: ignore[misc]
     else:
+        logger.debug("[my_games] send_dashboard: keyboard via _build_dashboard_kb_v2")
         markup = _build_dashboard_kb_v2(int(uid), deals_sorted)
 
     text = "🎲 *Мои игры:*"
 
-    # пробуем обновить существующий sticky
+    # (3) Попытка тихого обновления существующего sticky
     mid = get_my_games_dashboard(int(uid))
+    logger.debug("[my_games] send_dashboard: current_sticky=%s", mid)
     if isinstance(mid, int) and mid > 0:
         edited_ok = False
         with suppress(Exception):
@@ -2038,42 +2149,37 @@ async def _send_dashboard(uid: int, deals: List[Dict[str, Any]]) -> None:
                 parse_mode="Markdown",
                 reply_markup=markup,
             )
-            # зафиксируем actual message id (Telegram может вернуть Message)
             mid = int(getattr(msg, "message_id", mid))
             set_my_games_dashboard(int(uid), int(mid))
             edited_ok = True
         if edited_ok:
-            # мягкий вакуум с сохранением sticky
-            await _vacuum_safe(int(uid), keep=[mid])
-            # обновим кэши для быстрых редравов/деталей
+            await _vacuum_safe(int(uid), keep=[mid])  # мягкий вакуум
             (getattr(state, "games_by_user", {}) or {}).setdefault(int(uid), [])
             state.games_by_user[int(uid)] = deals_sorted
             (getattr(state, "last_user_messages", {}) or {}).setdefault(int(uid), [])
-            # сохраняем пустой header (sticky используется как источник истины)
             state.last_user_messages[int(uid)] = []
+            logger.info("[my_games] sticky updated: uid=%s mid=%s", uid, mid)
             return
 
-    # если sticky нет или редактирование не удалось — отправим новое
+    # (4) Sticky нет — создаём
     sent = await bot.send_message(int(uid), text, parse_mode="Markdown", reply_markup=markup)
     mid = int(sent.message_id)
     set_my_games_dashboard(int(uid), int(mid))
+    logger.info("[my_games] sticky created: uid=%s mid=%s", uid, mid)
 
-    # пылесос с сохранением нового sticky
+    # (5) После создания — подметём, сохраняя sticky
     await _vacuum_safe(int(uid), keep=[mid])
 
-    # кэши для быстрого редрава/деталей
+    # Кэши для быстрого редрава/деталей
     (getattr(state, "games_by_user", {}) or {}).setdefault(int(uid), [])
     state.games_by_user[int(uid)] = deals_sorted
     (getattr(state, "last_user_messages", {}) or {}).setdefault(int(uid), [])
     state.last_user_messages[int(uid)] = [sent]
 
-# ── детали из списка (без накопления хвостов) ───────────────────────
+# ── детали (fallback, без накопления хвостов) ───────────────────────
 async def _send_details(uid: int, deal: Dict[str, Any]) -> None:
     """
-    Открывает карточку деталей «Мои игры».
-    • Перед показом НЕ вызываем локальный vacuum: предварительную уборку sticky/хвостов
-      выполняет сам show_my_game_details (см. [2.1]).
-    • Основной рендер делаем через show_my_game_details(fake_cb) (см. блок [2.1]).
+    Детали «Моих игр». Основной рендер — через show_my_game_details(fake_cb), если доступен.
     """
     bot = Bot.get_current()
     deal_id = int(deal.get("id") or 0)
@@ -2104,42 +2210,49 @@ async def _send_details(uid: int, deal: Dict[str, Any]) -> None:
     time_s = str(deal.get("event_time") or "—")
     status_name = str(deal.get("status_name") or "—")
     text = f"ℹ️ {truncate(_safe_title(deal), 40)}\n📅 {date_s} · 🕒 {time_s}\n📌 Статус: {status_name}"
+
+    # SUCCESS => «Попросить замену»
+    from core.config import settings as _cfg
+    OK_ID: str = str(getattr(_cfg, "SUCCESSFUL_STATUS_ID", ""))
+    sid = _safe_status_id(deal)
     kb = InlineKeyboardBuilder()
-    kb.button(text="⬅️ Назад к списку", callback_data="mygames_back")
+    if OK_ID and sid == OK_ID:
+        kb.button(text="🙋 Попросить замену", callback_data=f"{globals().get('SWAP_PREFIX','mygame_swap_')}{deal_id}")
+        kb.row(InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="mygames_back"))
+    else:
+        kb.button(text="⬅️ Назад к списку", callback_data="mygames_back")
+
     await bot.send_message(int(uid), text, reply_markup=kb.as_markup())
 
 
 
-
-
-# [5.2] CROSS-MODULE VACUUM — удаление и обнуление реестров poll_details
+# [5.2] CROSS-MODULE VACUUM — удаление и обнуление реестров poll/report
 from contextlib import suppress
 from typing import Any, Dict, Set
 
 async def _vacuum_poll_details_blocks(uid: int) -> None:
     """
-    Жёсткая очистка «деталей отчёта опроса» у пользователя:
-      • если есть публичный API в handlers.poll_details — используем его (источник истины/SSOT);
-      • иначе — best-effort: находим все известные и эвристически подходящие реестры в `state`,
-        удаляем связанные с пользователем сообщения и вычищаем записи (включая sticky),
-        чтобы не происходил повторный редрав и «закольцовка».
+    Жёсткая очистка «деталей/дашборда отчёта опроса» у пользователя:
+      • если есть публичный API в handlers.poll_details — используем его;
+      • иначе — best-effort по state и core.utils: собираем известные/эвристические
+        реестры, удаляем связанные с пользователем сообщения, чистим записи, в т.ч.
+        «leader report».
     Никогда не пробрасывает исключения наружу.
     """
     from aiogram import Bot
     bot = Bot.get_current()
     u = int(uid)
 
-    # 0) Попытка воспользоваться официальным API модуля деталей (если он есть).
+    # 0) Официальный API (если есть)
     with suppress(Exception):
         from handlers.poll_details import forget_all_details_for_user  # type: ignore
         if callable(forget_all_details_for_user):
             await forget_all_details_for_user(u, bot=bot)  # type: ignore[arg-type]
-            return
+            logger.debug("[my_games.vacuum] poll_details: used official API for uid=%s", u)
+            # продолжаем best-effort, чтобы убрать leader-report, если API его не трогает
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Вспомогательные утилиты: рекурсивный сбор message_id и чистка по uid.
-    # ─────────────────────────────────────────────────────────────────────────
-    def _as_int(v: Any) -> int | None:
+    # ── утилиты ──────────────────────────────────────────────────────
+    def _as_int(v: Any) -> Optional[int]:
         try:
             if isinstance(v, int):
                 return int(v)
@@ -2150,7 +2263,6 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
         return None
 
     def _collect_msg_ids(obj: Any, acc: Set[int]) -> None:
-        """Рекурсивно собрать все int-подобные значения (как message_id)."""
         if obj is None:
             return
         if isinstance(obj, int):
@@ -2170,10 +2282,6 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
             return
 
     def _collect_for_uid(obj: Any, user_key: int | str, acc: Set[int]) -> None:
-        """
-        Вытащить сообщения, относящиеся к конкретному uid:
-          • если dict — берём obj[uid] / obj[str(uid)], иначе ищем глубже.
-        """
         if obj is None:
             return
         if isinstance(obj, dict):
@@ -2188,7 +2296,6 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
                 _collect_for_uid(v, user_key, acc)
 
     def _purge_uid_entries(obj: Any, user_key: int | str) -> None:
-        """Рекурсивно удалить записи по uid из dict'ов (obj[uid] / obj[str(uid)])."""
         if isinstance(obj, dict):
             obj.pop(user_key, None)
             obj.pop(str(user_key), None)
@@ -2198,99 +2305,99 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
             for v in obj:
                 _purge_uid_entries(v, user_key)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # 1) Известные «реестры деталей» (названия, встречавшиеся в разных ветках).
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── 1) Известные и эвристические «реестры» в state ───────────────
     candidate_names = [
-        # классика из модуля poll_details
-        "poll_details_blocks", "poll_detail_blocks",   # списки message_id по сделкам
-        "poll_details_index",  "poll_detail_index",    # map ключей 'header/main/...' -> mid
-        "pd_blocks", "pd_index",                       # сокращения
-        # расширенные варианты, виденные в отчётах по опросу
+        # poll details / report details
+        "poll_details_blocks", "poll_detail_blocks",
+        "poll_details_index",  "poll_detail_index",
+        "pd_blocks", "pd_index",
         "report_details_blocks", "report_detail_blocks",
         "report_details_index",  "report_detail_index",
         "report_registry", "report_blocks_map", "report_msgs", "report_messages",
         "report_header", "report_rows", "report_footer",
-        # совместимость с «анонимными» деталями
         "detail_blocks", "details_blocks",
         "detail_index",  "details_index",
-        # возможные sticky-слоты «дашборда отчёта»
+        # «дашборды» отчёта
         "report_dashboard", "report_sticky", "poll_report_dashboard", "polls_report_sticky",
+        # возможные лидеры/сообщения лид-репорта
+        "leader_report", "leader_report_mid", "leader_report_message", "leader_report_messages",
+        "leader_report_by_uid", "leader_reports", "report_leader_dashboard", "report_leader_sticky",
+        "current_leader_report", "current_report_message", "notify_report_message",
     ]
-
     registries: Dict[str, Any] = {}
-
-    # Явный сбор известных имён…
     for name in candidate_names:
         with suppress(Exception):
             if hasattr(state, name):
                 registries[name] = getattr(state, name)
 
-    # …и эвристика: любой атрибут state, в имени которого есть
-    # ('report' или 'poll') И ('detail'/'dashboard'/'block'/'index'/'msg'/'message'/'registry')
     with suppress(Exception):
         for name in dir(state):
             low = name.lower()
             if ("report" in low or "poll" in low) and any(
-                key in low for key in ("detail", "dashboard", "block", "index", "msg", "message", "registry")
+                key in low for key in ("detail", "dashboard", "block", "index", "msg", "message", "registry", "leader", "sticky")
             ):
                 if name not in registries:
                     with suppress(Exception):
                         registries[name] = getattr(state, name)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # 2) Собираем message_id, удаляем сообщения пользователя и чистим реестры.
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── 2) Похожие «реестры» в core.utils (часто там хранится leader report) ──
+    registries_cu: Dict[str, Any] = {}
+    if _cu:
+        with suppress(Exception):
+            for name in dir(_cu):
+                low = name.lower()
+                if ("report" in low or "poll" in low) and any(
+                    key in low for key in ("leader", "dashboard", "sticky", "msg", "message")
+                ):
+                    with suppress(Exception):
+                        registries_cu[name] = getattr(_cu, name)
+
+    # ── 3) Собираем message_id и стираем ─────────────────────────────
     ids: Set[int] = set()
 
-    # 2.1 собрать все message_id для данного uid
-    for name, reg in list(registries.items()):
+    for _, reg in list(registries.items()):
         with suppress(Exception):
             if isinstance(reg, dict):
-                # прямой доступ по uid/str(uid)
                 node = reg.get(u) or reg.get(str(u))
                 if node is not None:
                     _collect_msg_ids(node, ids)
                 else:
-                    # рекурсивный поиск вложенных узлов, относящихся к uid
                     _collect_for_uid(reg, u, ids)
             else:
-                # иногда sticky-слоты/списки лежат не под uid; соберём всё, а затем сотрём ключи uid ниже
                 _collect_msg_ids(reg, ids)
 
-    # 2.2 удалить найденные сообщения (мягко, без исключений)
+    for _, reg in list(registries_cu.items()):
+        with suppress(Exception):
+            if isinstance(reg, dict):
+                node = reg.get(u) or reg.get(str(u))
+                if node is not None:
+                    _collect_msg_ids(node, ids)
+                else:
+                    _collect_for_uid(reg, u, ids)
+            else:
+                _collect_msg_ids(reg, ids)
+
     for mid in sorted(ids):
         with suppress(Exception):
             await bot.delete_message(chat_id=u, message_id=int(mid))
 
-    # 2.3 вычистить записи по uid во всех известных/эвристических реестрах
-    for name, reg in list(registries.items()):
+    # зачистить записи по uid
+    for reg in list(registries.values()):
         with suppress(Exception):
             if isinstance(reg, dict):
-                # основной случай
-                reg.pop(u, None)
-                reg.pop(str(u), None)
+                reg.pop(u, None); reg.pop(str(u), None)
                 _purge_uid_entries(reg, u)
             elif isinstance(reg, list):
-                # списки обычно содержат dict'ы — подчистим вложенно
                 for v in reg:
                     _purge_uid_entries(v, u)
 
-    # 2.4 специально: попытка убрать «sticky» дашборда отчёта,
-    #     если он хранится как map uid->message_id в одном из известных имён
-    for sticky_name in ("report_dashboard", "report_sticky", "poll_report_dashboard", "polls_report_sticky"):
+    for reg in list(registries_cu.values()):
         with suppress(Exception):
-            sticky_map = getattr(state, sticky_name, None)
-            if isinstance(sticky_map, dict):
-                mid = sticky_map.pop(u, None) or sticky_map.pop(str(u), None)
-                if mid:
-                    x = _as_int(mid)
-                    if x is not None:
-                        with suppress(Exception):
-                            await bot.delete_message(chat_id=u, message_id=x)
+            if isinstance(reg, dict):
+                reg.pop(u, None); reg.pop(str(u), None)
+                _purge_uid_entries(reg, u)
 
-    # 2.5 финальный проход: если модуль деталей сохранял «последнее сообщение отчёта»
-    #     непосредственно в last_user_messages — удалим те, что совпадают с удалёнными id.
+    # зачистка last_user_messages от удалённых id
     with suppress(Exception):
         lum = (getattr(state, "last_user_messages", {}) or {}).get(u) or []
         if isinstance(lum, list) and lum:
@@ -2305,8 +2412,8 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
                     continue
                 new_lum.append(msg)
             (getattr(state, "last_user_messages", {}) or {}).__setitem__(u, new_lum)  # type: ignore[index]
-
-    # Никаких исключений наружу — функция «тихая».
+    # тихо выходим
+    return
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2314,17 +2421,11 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
 # ════════════════════════════════════════════════════════════════════
 async def redraw_my_games(uid: int) -> None:
     """
-    Перерисовывает дашборд «Мои игры» пользователю.
-
-    Быстрый путь:
-    • если пользователь уже находится в контексте 'my_games' и доступен мягкий редрав,
-      используем _soft_redraw_my_games (без обращения к CRM), чтобы избежать лишних
-      сетевых вызовов и визуальных «прыжков».
-
-    Полный путь:
-    • во всех остальных случаях запрашиваем список сделок из CRM и строим стандартный дашборд.
+    Перерисовывает дашборд «Мои игры».
+    • Если уже в контексте 'my_games' и есть мягкий редрав — используем его.
+    • Иначе — тянем сделки, ПЕРЕД отрисовкой стираем репорт-дашборд, далее рисуем sticky.
     """
-    # ── быстрый путь: мягкий редрав, если мы уже в контексте «Моих игр»
+    # быстрый путь
     try:
         ctx = (getattr(state, "ui_context", {}) or {}).get(int(uid))
         soft_redraw = globals().get("_soft_redraw_my_games")
@@ -2332,15 +2433,17 @@ async def redraw_my_games(uid: int) -> None:
             await soft_redraw(uid)  # type: ignore[misc]
             return
     except Exception:
-        # Любые ошибки в быстрой ветке не фатальны — продолжаем полным путём.
         pass
 
-    # ── полный путь через CRM
+    # полный путь
     try:
         all_deals = await get_amocrm_deals()
     except Exception as e:
         logger.error("[my_games:redraw] get_amocrm_deals failed: %s", e)
-        await _vacuum_safe(uid)
+        # даже при ошибке — подчистим репорт-дашборд, чтобы он не «липнул»
+        with suppress(Exception):
+            await _vacuum_poll_details_blocks(int(uid))
+        await _vacuum_safe(uid)  # мягкая уборка
         await Bot.get_current().send_message(uid, "⚠️ Не удалось получить список игр.")
         return
 
@@ -2348,8 +2451,85 @@ async def redraw_my_games(uid: int) -> None:
     if deals:
         await _send_dashboard(uid, deals)
     else:
+        with suppress(Exception):
+            await _vacuum_poll_details_blocks(int(uid))
         await _vacuum_safe(uid)
         await Bot.get_current().send_message(uid, "😔 Назначенных игр пока нет.")
+
+# ────────────────────────────────────────────────────────────────────
+# [6.x] QUIET PATCH: после подтверждения (handlers.confirmations вызывает)
+async def mygames_after_confirm_ui_patch(uid: int, deal_id: int) -> bool:
+    """
+    После успешного подтверждения — тихо помечаем строку «✅ Подтверждено»
+    и обновляем ТОЛЬКО клавиатуру sticky-дашборда. Если sticky внезапно удалён,
+    пересоздаём дашборд из кэша и всё равно возвращаем ok.
+    """
+    with suppress(Exception):
+        _set_locally_confirmed(int(uid), int(deal_id), True)
+
+    deals_sorted = (getattr(state, "games_by_user", {}) or {}).get(int(uid)) or []
+    if not deals_sorted:
+        logger.debug("[my_games.patch] after_confirm: no cached deals for uid=%s", uid)
+        return False
+
+    mid = get_my_games_dashboard(int(uid))
+    if not mid or mid <= 0:
+        logger.debug("[my_games.patch] after_confirm: sticky missing, silently re-create")
+        with suppress(Exception):
+            await _send_dashboard(int(uid), deals_sorted)  # создаст sticky со «✅ Подтверждено»
+        return True
+
+    build_kb = globals().get("_build_dashboard_kb")
+    if callable(build_kb):
+        markup = build_kb(int(uid), deals_sorted)  # type: ignore[misc]
+    else:
+        markup = globals().get("_build_dashboard_kb_v2")(int(uid), deals_sorted)  # type: ignore[misc]
+
+    mid2 = await globals().get("update_my_games_buttons_only")(int(uid), markup)  # type: ignore[misc]
+    ok = bool(mid2)
+    logger.info("[my_games.patch] after_confirm: uid=%s deal=%s mid=%s ok=%s", uid, deal_id, mid2, ok)
+    return ok
+
+# QUIET PATCH: после SUCCESS (вся команда подтвердила, сделка → SUCCESS)
+async def mygames_after_success_ui_patch(uid: int, deal_id: int) -> bool:
+    """
+    Тихо переключает строку сделки в «🔁 Замена» после SUCCESS
+    и снимает локальную отметку подтверждения (если была).
+    """
+    from core.config import settings as _cfg
+    OK_ID: str = str(getattr(_cfg, "SUCCESSFUL_STATUS_ID", ""))
+
+    deals_sorted: List[Dict[str, Any]] = (getattr(state, "games_by_user", {}) or {}).get(int(uid)) or []
+    for d in deals_sorted:
+        if int(d.get("id") or 0) == int(deal_id):
+            d["status_id"] = OK_ID or d.get("status_id")
+            d["status_name"] = "Завершена"
+            break
+
+    with suppress(Exception):
+        (getattr(state, "mygames_local_confirm", {}) or {}).pop((int(uid), int(deal_id)), None)
+
+    if not deals_sorted:
+        return False
+
+    mid = get_my_games_dashboard(int(uid))
+    if not mid or mid <= 0:
+        logger.debug("[my_games.patch] after_success: sticky missing, silently re-create")
+        with suppress(Exception):
+            await _send_dashboard(int(uid), deals_sorted)  # создаст sticky с «🔁 Замена»
+        return True
+
+    build_kb = globals().get("_build_dashboard_kb")
+    if callable(build_kb):
+        markup = build_kb(int(uid), deals_sorted)  # type: ignore[misc]
+    else:
+        markup = globals().get("_build_dashboard_kb_v2")(int(uid), deals_sorted)  # type: ignore[misc]
+
+    mid2 = await globals().get("update_my_games_buttons_only")(int(uid), markup)  # type: ignore[misc]
+    ok = bool(mid2)
+    logger.info("[my_games.patch] after_success: uid=%s deal=%s mid=%s ok=%s", uid, deal_id, mid2, ok)
+    return ok
+
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2379,8 +2559,20 @@ async def my_games_handler(message: types.Message) -> None:
     except Exception:
         pass
 
-    # Чистим предыдущую группу сообщений (меню не трогаем)
-    await _vacuum_safe(uid)
+    # Чистим предыдущую группу сообщений:
+    #  • отчёт/детали — СТИРАЕМ (suppress_report_keep=True),
+    #  • главное меню — БЕРЕЖЁМ (добавляем в keep вручную).
+    prev_suppress = bool(getattr(state, "suppress_report_keep", False))
+    setattr(state, "suppress_report_keep", True)
+    try:
+        keep_ids = []
+        with contextlib.suppress(Exception):
+            menu_mid = get_menu_message_id(uid)
+            if isinstance(menu_mid, int) and menu_mid > 0:
+                keep_ids.append(menu_mid)
+        await _vacuum_safe(uid, keep=keep_ids)
+    finally:
+        setattr(state, "suppress_report_keep", prev_suppress)
 
     try:
         deals_all = await get_amocrm_deals()
@@ -2465,7 +2657,6 @@ async def _open_my_game_details_cb(callback: types.CallbackQuery) -> None:
         logger.warning("[my_games] open details failed (fallback): %s", e)
 
 
-
 @router.callback_query(lambda c: c.data == "mygames_back")
 async def cb_back(callback: types.CallbackQuery) -> None:
     """Вернуться к списку «Мои игры»."""
@@ -2482,7 +2673,18 @@ async def cb_back(callback: types.CallbackQuery) -> None:
         return
 
     # Если кэша нет — запрашиваем и действуем как в handler'е, критично: трекаем «игр нет»
-    await _vacuum_safe(uid)
+    prev_suppress = bool(getattr(state, "suppress_report_keep", False))
+    setattr(state, "suppress_report_keep", True)
+    try:
+        keep_ids = []
+        with contextlib.suppress(Exception):
+            menu_mid = get_menu_message_id(uid)
+            if isinstance(menu_mid, int) and menu_mid > 0:
+                keep_ids.append(menu_mid)
+        await _vacuum_safe(uid, keep=keep_ids)
+    finally:
+        setattr(state, "suppress_report_keep", prev_suppress)
+
     try:
         deals_all = await get_amocrm_deals()
         deals = _visible_deals_for_user(uid, deals_all)
@@ -2519,6 +2721,7 @@ async def cb_ack_misc(callback: types.CallbackQuery) -> None:
     except Exception:
         pass
     await callback.answer()
+
 
 
 # [7.2] HANDLER: SWAP («Замена»/«Попросить замену») — полноценная реализация

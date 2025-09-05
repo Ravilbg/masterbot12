@@ -229,63 +229,60 @@ def _collect_user_detail_entries(uid: int) -> Tuple[List[int], List[Tuple[int, i
     return mids, tuple_keys_to_pop
 
 
+# ────────────────────────────────────────────────────────────────────
+# перед показом отчёта: сохраняем текущий отчёт, чистим только детали
+# ────────────────────────────────────────────────────────────────────
 async def _pre_render_vacuum(uid: int) -> None:
     """
     Перед показом отчёта очищаем ТОЛЬКО:
       • все detail-сообщения пользователя (и их реестр/индексы),
-      • предыдущий инстанс отчёта (если есть).
+      • сохраняем текущий инстанс отчёта (если есть) и не трогаем его.
     Главное меню и дашборд «Мои игры» сохраняем.
     """
     bot = Bot.get_current()
 
-    # 0) Удаляем прошлый отчёт (если есть локальный id)
+    # 0) НЕ удаляем прошлый отчёт — бережно сохраним его id в whitelist
+    keep_ids: List[int] = []
     prev_report_id = getattr(state, "personal_report_message_id", None)
     if isinstance(prev_report_id, int) and prev_report_id > 0:
-        with contextlib.suppress(Exception):
-            await bot.delete_message(chat_id=uid, message_id=prev_report_id)
-        setattr(state, "personal_report_message_id", None)
-        logger.debug("[report:vacuum] previous report removed uid=%s mid=%s", uid, prev_report_id)
+        keep_ids.append(prev_report_id)
+        logger.debug("[report:vacuum] keep current report uid=%s mid=%s", uid, prev_report_id)
 
     # 1) Удаляем все зарегистрированные detail-сообщения пользователя (оба формата ключей)
     try:
         mids_to_delete, tuple_keys = _collect_user_detail_entries(uid)
 
-        # удалить сами сообщения
+        # удалить сами detail-сообщения
         if mids_to_delete:
             logger.debug("[report:vacuum] delete details uid=%s mids=%s", uid, mids_to_delete)
             for mid in mids_to_delete:
                 with contextlib.suppress(TelegramBadRequest, Exception):
                     await bot.delete_message(chat_id=uid, message_id=mid)
 
-        # очистить старый формат detail_blocks[uid]
+        # очистить старый формат detail_blocks[uid] и SSOT-ключи (uid, deal_id)
         db = getattr(state, "detail_blocks", None)
         if isinstance(db, dict):
             if uid in db and isinstance(db.get(uid), dict):  # type: ignore[index]
                 db.pop(uid, None)  # старый формат
-            # и SSOT-ключи (uid, deal_id)
             for k in tuple_keys:
                 db.pop(k, None)  # type: ignore[index]
             logger.debug("[report:vacuum] registry cleared for uid=%s (formats: old+tuple)", uid)
 
-        # подчистить detail_index — тоже поддерживаем оба формата
+        # подчистить detail_index (оба формата)
         idx = getattr(state, "detail_index", None)
         if isinstance(idx, dict):
-            # SSOT
             for k in list(idx.keys()):
                 if isinstance(k, tuple) and len(k) == 2:
                     with contextlib.suppress(Exception):
                         if int(k[0]) == int(uid):
                             idx.pop(k, None)
-            # на случай старого формата detail_index[uid] = {...}
             if uid in idx:
                 idx.pop(uid, None)  # type: ignore[index]
     except Exception as e:
         logger.debug("[report:vacuum] detail removal skipped uid=%s: %s", uid, e)
 
-    # 2) Бережная чистка «хвостов»: сохраняем главное меню и активный дашборд «Мои игры»
-    keep_ids: List[int] = []
-
-    # 2.1 — сохранить меню (если есть резолвер id)
+    # 2) Бережная чистка «хвостов»: сохраняем меню, «Мои игры» и текущий отчёт
+    # 2.1 — меню
     menu_mid: Optional[int] = None
     with contextlib.suppress(Exception):
         from core.menu import get_menu_message_id  # lazy import
@@ -293,7 +290,7 @@ async def _pre_render_vacuum(uid: int) -> None:
     if isinstance(menu_mid, int):
         keep_ids.append(menu_mid)
 
-    # 2.2 — сохранить возможные карточки «Мои игры»
+    # 2.2 — карточки «Мои игры»
     try:
         games_bucket: Dict[int, Any] = getattr(state, "games_by_user", {}) or {}
         if isinstance(games_bucket, dict) and uid in games_bucket:
@@ -307,10 +304,11 @@ async def _pre_render_vacuum(uid: int) -> None:
     except Exception:
         pass
 
-    # 2.3 — запустить SSOT-вакуум с белым списком
+    # 2.3 — SSOT-вакуум c белым списком (включая текущий отчёт)
     with contextlib.suppress(Exception):
         await vacuum_private(uid, keep=keep_ids)  # type: ignore[misc]
         logger.debug("[report:vacuum] vacuum_private(uid, keep=%s) ok uid=%s", keep_ids, uid)
+
 
 
 # ────────────────────────────────────────────────────────────────────

@@ -253,6 +253,7 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot, *, force_approved: bo
 
     ВАЖНО:
     • Перед показом — жёсткий пылесос (оставляем только новый блок).
+      (на время пылесоса подавляем сохранение дашборда отчёта лидера)
     • После отправки — фиксируем реестр сообщений через _set_block(...),
       а также ЛИНКУЕМ блок в last_user_messages, чтобы глобальные вакуумы могли корректно его убирать.
     """
@@ -268,8 +269,16 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot, *, force_approved: bo
     except Exception:
         pass
 
-    # 0) Пылесос перед рендером
-    await _vacuum(uid, bot=bot, keep=[])
+    # 0) Пылесос перед рендером (временно разрешаем снести дашборд отчёта)
+    from core.state import state as _state
+    _prev_flag = bool(getattr(_state, "suppress_report_keep", False))
+    setattr(_state, "suppress_report_keep", True)
+    logger.debug("[details:vacuum] uid=%s deal=%s suppress_report_keep=True", uid, deal_id)
+    try:
+        await _vacuum(uid, bot=bot, keep=[])
+    finally:
+        setattr(_state, "suppress_report_keep", _prev_flag)
+        logger.debug("[details:vacuum] uid=%s deal=%s suppress_report_keep=%s(restored)", uid, deal_id, _prev_flag)
 
     # 1) Проверяем, что сделка есть в текущем опросе
     deal = next((d for d in (state.current_poll_deals or []) if int(d.get("id") or 0) == int(deal_id)), None)
@@ -320,6 +329,8 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot, *, force_approved: bo
             uid, deal_id, [getattr(m, "message_id", None) for m in msgs]
         )
 
+# История изменений:
+# 2025-09-05 — FIX: временно подавляем сохранение отчёта лидера при рендере деталей (suppress_report_keep)
 
 
 # ███ [2.1] RENDER & REFRESH
@@ -1853,12 +1864,13 @@ from aiogram import types, Bot
 from aiogram.exceptions import TelegramBadRequest
 
 from core.state import state
-from core.utils import vacuum_private  # SSOT
 
 logger = logging.getLogger(__name__)
 
+
 def _reg_key(uid: int, deal_id: int) -> Tuple[int, int]:
     return (int(uid), int(deal_id))
+
 
 def _collect_keep_ids(uid: int) -> List[int]:
     """Собираем те же keep-id, что при входе в дашборд: главное меню + «Мои игры»."""
@@ -1973,16 +1985,35 @@ async def _vacuum_details_like_dashboard(uid: int) -> None:
     """
     Делает РОВНО тот же пылесос, что и при переходе в дашборд:
     • сначала «забывает» детали (через публичный API выше),
-    • затем вызывает SSOT-вакуум с keep (меню/«Мои игры»), ignore_sticky=True.
+    • затем вызывает вакуум с keep (меню/«Мои игры»), ignore_sticky=True при наличии поддержки.
     """
     # 1) удалить детали и очистить реестры
     await forget_all_details_for_user(int(uid))
 
     # 2) общий «дашбордный» пылесос
     keep = _collect_keep_ids(int(uid))
-    with contextlib.suppress(Exception):
-        await vacuum_private(int(uid), keep=keep, ignore_sticky=True)  # ← как в дашборде
-        logger.debug("[details:back] dashboard-like vacuum keep=%s uid=%s", keep, uid)
+    # Используем безопасный вызов: если есть современный vacuum_private — применим его с ignore_sticky,
+    # иначеfallback на локальный _vacuum (объявлен выше в модуле).
+    try:
+        _vp = globals().get("_vacuum_private", None)
+        if _vp:
+            with contextlib.suppress(TypeError):
+                await _vp(int(uid), keep=keep, ignore_sticky=True)  # новый API
+                logger.debug("[details:back] dashboard-like vacuum (new) keep=%s uid=%s", keep, uid)
+                return
+            with contextlib.suppress(Exception):
+                await _vp(int(uid), keep=keep)  # старый API без ignore_sticky
+                logger.debug("[details:back] dashboard-like vacuum (old) keep=%s uid=%s", keep, uid)
+                return
+    except Exception:
+        pass
+
+    # фолбэк: локальная обёртка _vacuum без ignore_sticky
+    try:
+        await globals()["__dict__"]["_vacuum"](int(uid), keep=keep)  # type: ignore[func-returns-value]
+        logger.debug("[details:back] dashboard-like vacuum (fallback) keep=%s uid=%s", keep, uid)
+    except Exception:
+        logger.debug("[details:back] vacuum fallback failed uid=%s", uid)
 
 
 # поддерживаем твой текущий callback-ключ «Назад»
@@ -2006,6 +2037,8 @@ async def _on_back_to_list(callback: types.CallbackQuery) -> None:
 # • 2025-08-28 — «Назад» вызывает тот же SSOT-вакуум, что и кнопки дашборда; дополнительно чистим detail_* реестры.
 # • 2025-08-31 — добавлен публичный API forget_all_details_for_user(uid, bot=None);
 #                _vacuum_details_like_dashboard теперь использует этот API перед общим vacuum.
+# • 2025-09-05 — FIX: убран прямой import vacuum_private и добавлен безопасный вызов с поддержкой старого/нового API
+#                и фолбэком на локальную обёртку _vacuum — чтобы не падать там, где vacuum_private отсутствует.
 
 
 

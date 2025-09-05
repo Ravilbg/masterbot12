@@ -978,19 +978,12 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
     except Exception:
         logger.debug("[confirm] details refresh skipped")
 
+    # Тихая перекраска дашборда сразу после подтверждения → «✅ Подтверждено»
     applied_ui = False
-    try:
-        ui_ctx = (getattr(state, "ui_context", {}) or {}).get(uid)
-        if ui_ctx == "my_games":
-            try:
-                from handlers.my_games import mygames_after_confirm_ui_patch as _mg_after  # type: ignore
-                if callable(_mg_after):
-                    await _mg_after(uid, deal_id, role, msg=getattr(callback, "message", None))
-                    applied_ui = True
-            except Exception:
-                pass
-    except Exception:
-        pass
+    with contextlib.suppress(Exception):
+        from handlers.my_games import mygames_after_confirm_ui_patch as _mg_after  # type: ignore
+        await _mg_after(uid, deal_id)
+        applied_ui = True
 
     if not applied_ui:
         kb = _mark_confirmed_on_message_kb(callback, deal_id, role)
@@ -1028,6 +1021,11 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
 
     with contextlib.suppress(Exception):
         await _maybe_move_to_success(deal_id)
+
+    # Повторная тихая перекраска после возможного перевода в SUCCESS → «🔁 Замена»
+    with contextlib.suppress(Exception):
+        from handlers.my_games import mygames_after_confirm_ui_patch as _mg_after  # type: ignore
+        await _mg_after(uid, deal_id)
 
     with contextlib.suppress(Exception):
         await _safe_answer(callback, "Готово ✅")
