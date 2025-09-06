@@ -1757,21 +1757,19 @@ def _my_games(uid: int, deals: List[Dict]) -> List[Dict]:
 # ════════════════════════════════════════════════════════════════════
 # ███ [5] DASHBOARD / DETAILS — липкий дашборд + пылесос как в отчёте
 # ════════════════════════════════════════════════════════════════════
-# Версия 5.10.1 · 2025-09-06 (hotfix-3)
-# Задачи/поведение:
-# 1) При входе в «Мои игры» — репорт-дашборд опроса полностью исчезает (не «уезжает вверх»):
-#    • агрессивная зачистка реестров репорта/деталей перед отрисовкой;
-#    • подавление keep leader report (если поддерживается ядром) во всех вакуумах из «Моих игр».
-# 2) «Тихие» замены кнопок:
-#    • после подтверждения — «✅ Подтверждено», без удаления дашборда;
-#    • после SUCCESS — «🔁 Замена» в дашборде и «🙋 Попросить замену» в деталях;
-#    • если sticky внезапно пропал — тихо пересоздаём из кэша и продолжаем.
-#
-# Минимальные правки по сравнению с 5.10.0:
-# • Глобально и локально гарантируем включение sticky в keep (патч keep_for_vacuum + локальный keep_for_vacuum).
-# • Вакууум из «Моих игр» всегда выполняется с подавлением leader report (безоткатно на короткий интервал).
-# • _vacuum_poll_details_blocks агрессивно чистит все известные/эвристические хранилища репорта (включая leader).
-# • Добавлено безопасное определение _cu (core.utils) для использования в подавлении и в эвристике.
+# Версия 5.11.2 · 2025-09-06 (quiet-confirm + menu-safe, no-redraw, global vacuum keep)
+# Что изменено:
+# • При нажатии «✅ Подтвердить» дашборд НЕ удаляется — выполняется тихая перекраска
+#   кнопки на «✅ Подтверждено» (до перевода сделки в SUCCESS).
+# • После SUCCESS (Завершение сделки) в дашборде показывается «🔁 Замена», а в деталях — «🙋 Попросить замену».
+# • Сообщение ГЛАВНОГО МЕНЮ не удаляется ни при каких обстоятельствах:
+#   – добавлено в глобальный и локальный keep_for_vacuum;
+#   – _vacuum_safe всегда включает его в keep;
+#   – _vacuum_poll_details_blocks исключает его из удаления.
+# • ГЛОБАЛЬНО: пропатчен core.utils.vacuum_private — к любому keep он ДОБАВЛЯЕТ sticky «Мои игры»
+#   и сообщение ГЛАВНОГО МЕНЮ (даже если вызывающий модуль их не передал).
+# • «Без редрава»: в mygames_after_confirm_ui_patch/mysuccess_ui_patch никогда не пересоздаём sticky;
+#   только edit_message_reply_markup. Восстановление sticky — через эвристику в update_my_games_buttons_only().
 import logging
 from contextlib import suppress
 from typing import Any, Dict, List, Optional, TYPE_CHECKING, Callable, cast, Set, Tuple
@@ -1783,6 +1781,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.state import state
 from core.utils import truncate, vacuum_private as ssot_vacuum_private, keep_for_vacuum as ssot_keep_for_vacuum
+from core.menu import get_menu_message_id  # ⚠️ сохраняем главное меню
 
 # локальная таймзона для сортировки дат (без зависимости от core.utils)
 from pytz import timezone as _tz
@@ -1800,36 +1799,128 @@ _cu = None
 with suppress(Exception):
     import core.utils as _cu  # type: ignore
 
-# ── Глобальный патч SSOT keep_for_vacuum: стараемся хранить наш sticky везде ──
+# ── Глобальный патч SSOT keep_for_vacuum: sticky «Мои игры» + ГЛАВНОЕ МЕНЮ ──
 try:
     if _cu and not getattr(state, "_mygames_keep_patch_installed", False):
         _orig_keep = _cu.keep_for_vacuum  # type: ignore[attr-defined]
 
         def _keep_wrapper(uid: int, *extra: int):
             keep_extra: List[int] = list(extra)
+
+            # 1) sticky «Мои игры»
             sticky = None
             with suppress(Exception):
                 sticky = get_my_games_dashboard(int(uid))
             if isinstance(sticky, int) and sticky > 0 and sticky not in keep_extra:
                 keep_extra.append(int(sticky))
+
+            # 2) главное меню
+            menu_mid = None
+            with suppress(Exception):
+                menu_mid = get_menu_message_id(int(uid))
+            if isinstance(menu_mid, int) and menu_mid > 0 and menu_mid not in keep_extra:
+                keep_extra.append(int(menu_mid))
+
             try:
                 res = _orig_keep(int(uid), *keep_extra)
                 sig = "(uid, *extra)"
             except TypeError:
                 res = _orig_keep(int(uid))  # type: ignore[misc]
                 sig = "(uid)"
+                # если оригинал не принял *extra — вручную добавим sticky и меню
                 if isinstance(sticky, int) and sticky > 0 and sticky not in res:
                     res.append(int(sticky))
+                if isinstance(menu_mid, int) and menu_mid > 0 and menu_mid not in res:
+                    res.append(int(menu_mid))
+
+            # финальная страховка
             if isinstance(sticky, int) and sticky > 0 and sticky not in res:
                 res.append(int(sticky))
-            logger.debug("[my_games.keep_patch] uid=%s sig=%s extra=%s -> keep=%s", uid, sig, keep_extra, res)
+            if isinstance(menu_mid, int) and menu_mid > 0 and menu_mid not in res:
+                res.append(int(menu_mid))
+
+            logger.debug("[my_games.keep_patch] uid=%s sig=%s -> keep=%s", uid, sig, res)
             return res
 
         _cu.keep_for_vacuum = _keep_wrapper  # type: ignore[assignment]
         state._mygames_keep_patch_installed = True  # type: ignore[attr-defined]
-        logger.info("[my_games.keep_patch] core.utils.keep_for_vacuum patched globally")
+        logger.info("[my_games.keep_patch] core.utils.keep_for_vacuum patched (sticky+menu)")
 except Exception as e:
     logger.warning("[my_games.keep_patch] cannot patch core.utils.keep_for_vacuum: %s", e)
+
+# ── Глобальный патч vacuum_private: добавляем sticky+меню в keep любого вызова ──
+try:
+    if _cu and not getattr(state, "_mygames_vacuum_patch_installed", False):
+        _orig_vacuum = _cu.vacuum_private  # type: ignore[attr-defined]
+
+        def _as_mid_list(v: Any) -> List[int]:
+            mids: List[int] = []
+            if v is None:
+                return mids
+            try:
+                if isinstance(v, (list, tuple, set)):
+                    for x in v:
+                        if isinstance(x, types.Message):
+                            mids.append(int(getattr(x, "message_id", 0)))
+                        elif isinstance(x, int):
+                            mids.append(int(x))
+                elif isinstance(v, types.Message):
+                    mids.append(int(getattr(v, "message_id", 0)))
+                elif isinstance(v, int):
+                    mids.append(int(v))
+            except Exception:
+                pass
+            return [m for m in mids if isinstance(m, int) and m > 0]
+
+        def _extract_uid(args: tuple, kwargs: dict) -> Optional[int]:
+            # варианты: (uid, ...), (bot, uid, ...), kwargs['uid']
+            try:
+                if "uid" in kwargs and isinstance(kwargs["uid"], int):
+                    return int(kwargs["uid"])
+            except Exception:
+                pass
+            try:
+                if len(args) >= 1 and isinstance(args[0], int):
+                    return int(args[0])
+                if len(args) >= 2 and isinstance(args[1], int):
+                    return int(args[1])
+            except Exception:
+                pass
+            return None
+
+        async def _vacuum_wrapper(*args, **kwargs):
+            uid = _extract_uid(args, kwargs)
+            keep_in = _as_mid_list(kwargs.get("keep"))
+
+            # добавим sticky + главное меню
+            if isinstance(uid, int):
+                with suppress(Exception):
+                    sticky = get_my_games_dashboard(int(uid))
+                    if isinstance(sticky, int) and sticky > 0 and sticky not in keep_in:
+                        keep_in.append(int(sticky))
+                with suppress(Exception):
+                    menu_mid = get_menu_message_id(int(uid))
+                    if isinstance(menu_mid, int) and menu_mid > 0 and menu_mid not in keep_in:
+                        keep_in.append(int(menu_mid))
+
+            if keep_in:
+                kwargs["keep"] = list(dict.fromkeys(keep_in))  # de-dup, сохраняем порядок
+
+            # вызов оригинального API (совместимость по сигнатурам)
+            try:
+                return await _orig_vacuum(*args, **kwargs)
+            except TypeError:
+                # некоторые версии не знают suppress_leader_report
+                if "suppress_leader_report" in kwargs:
+                    _ = kwargs.pop("suppress_leader_report", None)
+                    return await _orig_vacuum(*args, **kwargs)
+                raise
+
+        _cu.vacuum_private = _vacuum_wrapper  # type: ignore[assignment]
+        state._mygames_vacuum_patch_installed = True  # type: ignore[attr-defined]
+        logger.info("[my_games.keep_patch] core.utils.vacuum_private patched (inject sticky+menu into keep)")
+except Exception as e:
+    logger.warning("[my_games.keep_patch] cannot patch core.utils.vacuum_private: %s", e)
 
 # ── sticky-реестр дашборда ──────────────────────────────────────────
 if not hasattr(state, "my_games_dashboard"):
@@ -1847,18 +1938,27 @@ def set_my_games_dashboard(uid: int, message_id: int) -> None:
     (getattr(state, "my_games_dashboard", {}) or {}).update({int(uid): int(message_id)})
 
 def keep_for_vacuum(uid: int, *extra_msg_ids: int) -> List[int]:
-    """Локальный keep: sticky «Мои игры» + SSOT + явные доп. id."""
+    """Локальный keep: sticky «Мои игры» + ГЛАВНОЕ МЕНЮ + SSOT + явные доп. id."""
     keep: List[int] = []
 
+    # sticky
     sticky = get_my_games_dashboard(int(uid))
     if isinstance(sticky, int) and sticky > 0:
         keep.append(sticky)
 
+    # главное меню
+    with suppress(Exception):
+        menu_mid = get_menu_message_id(int(uid))
+        if isinstance(menu_mid, int) and menu_mid > 0 and menu_mid not in keep:
+            keep.append(int(menu_mid))
+
+    # SSOT-keep
     with suppress(Exception):
         for mid in ssot_keep_for_vacuum(int(uid), *keep):
             if isinstance(mid, int) and mid > 0 and mid not in keep:
                 keep.append(mid)
 
+    # явные extra
     for mid in extra_msg_ids:
         try:
             m2 = int(mid)
@@ -1924,10 +2024,11 @@ class _SuppressLeaderReport:
         # откат не делаем — ядро обычно снимает флаги само, это снижает гонки
         return False
 
-# ── общий пылесос ЛС (сохраняет sticky «Мои игры») ──────────────────
+# ── общий пылесос ЛС (сохраняет sticky «Мои игры» и ГЛАВНОЕ МЕНЮ) ──
 async def _vacuum_safe(uid: int, keep: Optional[List[Any]] = None, *, ignore_sticky: bool = False) -> None:
     """
     Пылесос ЛС для «Моих игр».
+    • ВСЕГДА сохраняет сообщение ГЛАВНОГО МЕНЮ.
     • Сохраняет sticky-дашборд (если ignore_sticky=False).
     • Чистит хвосты деталей/репорта перед/после вакуума.
     • Использует core.utils.vacuum_private с поддержкой suppress-флагов.
@@ -1949,6 +2050,12 @@ async def _vacuum_safe(uid: int, keep: Optional[List[Any]] = None, *, ignore_sti
                 keep_ids.append(int(k.message_id))
             elif isinstance(k, int):
                 keep_ids.append(int(k))
+
+    # главное меню — ВСЕГДА
+    with suppress(Exception):
+        menu_mid = get_menu_message_id(int(uid))
+        if isinstance(menu_mid, int) and menu_mid > 0 and menu_mid not in keep_ids:
+            keep_ids.append(int(menu_mid))
 
     if not ignore_sticky:
         for mid in keep_for_vacuum(int(uid)):
@@ -2041,7 +2148,7 @@ def _build_dashboard_kb_v2(uid: int, deals_sorted: List[Dict[str, Any]]) -> Inli
             callback_data=f"{globals().get('DETAILS_PREFIX','mygame_details_')}{did}",
         )
 
-        # состояние подтверждения: локальный флаг → CRM-теги → локальная отметка [3.4]
+        # состояние подтверждения: локальный флаг → CRM-теги → локальная отметка
         confirmed = _mg_local_confirmed(uid, did)
         if not confirmed and callable(_has_confirmation_tag):
             with suppress(Exception):
@@ -2081,10 +2188,34 @@ def _build_dashboard_kb_v2(uid: int, deals_sorted: List[Dict[str, Any]]) -> Inli
 
 # ── «тихая» перекраска только кнопок текущего дашборда ──────────────
 async def update_my_games_buttons_only(uid: int, markup: InlineKeyboardMarkup | None) -> Optional[int]:
+    """
+    Тихая перекраска инлайн-клавиатуры sticky-дашборда.
+    Если слот sticky потерян, пытаемся восстановить его из state.last_user_messages
+    по эвристике текста «Мои игры». Никаких редравов текста и пересозданий.
+    """
     mid = get_my_games_dashboard(int(uid))
+
+    # попытка восстановить sticky из реестра последних сообщений
+    if not isinstance(mid, int) or mid <= 0:
+        with suppress(Exception):
+            lum = (getattr(state, "last_user_messages", {}) or {}).get(int(uid)) or []
+            for msg in reversed(lum):
+                try:
+                    txt = (getattr(msg, "text", None) or getattr(msg, "caption", "") or "").strip()
+                    if txt.startswith("🎲") and "Мои игры" in txt:
+                        candidate = int(getattr(msg, "message_id", 0))
+                        if candidate > 0:
+                            set_my_games_dashboard(int(uid), candidate)
+                            mid = candidate
+                            logger.debug("[my_games] buttons-only: recovered sticky mid=%s for uid=%s", mid, uid)
+                            break
+                except Exception:
+                    continue
+
     if not isinstance(mid, int) or mid <= 0:
         logger.debug("[my_games] buttons-only: no sticky slot for uid=%s", uid)
         return None
+
     with suppress(Exception):
         await Bot.get_current().edit_message_reply_markup(chat_id=int(uid), message_id=int(mid), reply_markup=markup)
         await _vacuum_safe(int(uid), keep=[mid])  # мягкий подмет: сохранить sticky, убрать хвосты/репорт
@@ -2167,7 +2298,7 @@ async def _send_dashboard(uid: int, deals: List[Dict[str, Any]]) -> None:
     set_my_games_dashboard(int(uid), int(mid))
     logger.info("[my_games] sticky created: uid=%s mid=%s", uid, mid)
 
-    # (5) После создания — подметём, сохраняя sticky
+    # (5) После создания — подметём, сохраняя sticky и меню
     await _vacuum_safe(int(uid), keep=[mid])
 
     # Кэши для быстрого редрава/деталей
@@ -2224,20 +2355,14 @@ async def _send_details(uid: int, deal: Dict[str, Any]) -> None:
 
     await bot.send_message(int(uid), text, reply_markup=kb.as_markup())
 
-
-
-# [5.2] CROSS-MODULE VACUUM — удаление и обнуление реестров poll/report
+# [5.2] CROSS-MODULE VACUUM — удаление и обнуление реестров poll/report (модиф.: меню не трогаем)
 from contextlib import suppress
 from typing import Any, Dict, Set
 
 async def _vacuum_poll_details_blocks(uid: int) -> None:
     """
-    Жёсткая очистка «деталей/дашборда отчёта опроса» у пользователя:
-      • если есть публичный API в handlers.poll_details — используем его;
-      • иначе — best-effort по state и core.utils: собираем известные/эвристические
-        реестры, удаляем связанные с пользователем сообщения, чистим записи, в т.ч.
-        «leader report».
-    Никогда не пробрасывает исключения наружу.
+    Жёсткая очистка «деталей/дашборда отчёта опроса» у пользователя.
+    ВАЖНО: сообщение ГЛАВНОГО МЕНЮ никогда не удаляем.
     """
     from aiogram import Bot
     bot = Bot.get_current()
@@ -2352,7 +2477,7 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
                     with suppress(Exception):
                         registries_cu[name] = getattr(_cu, name)
 
-    # ── 3) Собираем message_id и стираем ─────────────────────────────
+    # ── 3) Собираем message_id и стираем (кроме ГЛАВНОГО МЕНЮ) ───────
     ids: Set[int] = set()
 
     for _, reg in list(registries.items()):
@@ -2376,6 +2501,12 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
                     _collect_for_uid(reg, u, ids)
             else:
                 _collect_msg_ids(reg, ids)
+
+    # не удаляем главное меню
+    with suppress(Exception):
+        menu_mid = get_menu_message_id(int(u))
+        if isinstance(menu_mid, int) and menu_mid > 0 and menu_mid in ids:
+            ids.discard(int(menu_mid))
 
     for mid in sorted(ids):
         with suppress(Exception):
@@ -2415,6 +2546,72 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
     # тихо выходим
     return
 
+# ────────────────────────────────────────────────────────────────────
+# [5.3] QUIET PATCH API — вызывается из handlers.confirmations / pipelines
+#      (не удалять sticky; только перекрасить кнопки на дашборде)
+# ────────────────────────────────────────────────────────────────────
+
+async def mygames_after_confirm_ui_patch(uid: int, deal_id: int) -> bool:
+    """
+    После успешного подтверждения:
+    • Помечаем локально (до прихода CRM-тегов).
+    • ТИХО обновляем ТОЛЬКО клавиатуру sticky-дашборда (без удаления сообщения).
+    • Без редрава: не пересоздаём sticky; если слот потерян — пытаемся восстановить
+      в update_my_games_buttons_only(), иначе возвращаем False.
+    """
+    with suppress(Exception):
+        _set_locally_confirmed(int(uid), int(deal_id), True)
+
+    deals_sorted = (getattr(state, "games_by_user", {}) or {}).get(int(uid)) or []
+    if not deals_sorted:
+        logger.debug("[my_games.patch] after_confirm: no cached deals for uid=%s", uid)
+        return False
+
+    build_kb = globals().get("_build_dashboard_kb")
+    if callable(build_kb):
+        markup = build_kb(int(uid), deals_sorted)  # type: ignore[misc]
+    else:
+        markup = _build_dashboard_kb_v2(int(uid), deals_sorted)
+
+    mid2 = await update_my_games_buttons_only(int(uid), markup)
+    ok = bool(mid2)
+    logger.info("[my_games.patch] after_confirm: uid=%s deal=%s mid=%s ok=%s", uid, deal_id, mid2, ok)
+    return ok
+
+
+async def mygames_after_success_ui_patch(uid: int, deal_id: int) -> bool:
+    """
+    После перевода сделки в SUCCESS:
+    • Переключаем строку на «🔁 Замена».
+    • Снимаем локальную отметку «✅ Подтверждено» (если была).
+    • Тихо обновляем ТОЛЬКО клавиатуру sticky-дашборда, без редрава текста/сообщения.
+    """
+    from core.config import settings as _cfg
+    OK_ID: str = str(getattr(_cfg, "SUCCESSFUL_STATUS_ID", ""))
+
+    deals_sorted: List[Dict[str, Any]] = (getattr(state, "games_by_user", {}) or {}).get(int(uid)) or []
+    for d in deals_sorted:
+        if int(d.get("id") or 0) == int(deal_id):
+            d["status_id"] = OK_ID or d.get("status_id")
+            d["status_name"] = "Завершение сделки"
+            break
+
+    with suppress(Exception):
+        (getattr(state, "mygames_local_confirm", {}) or {}).pop((int(uid), int(deal_id)), None)
+
+    if not deals_sorted:
+        return False
+
+    build_kb = globals().get("_build_dashboard_kb")
+    if callable(build_kb):
+        markup = build_kb(int(uid), deals_sorted)  # type: ignore[misc]
+    else:
+        markup = _build_dashboard_kb_v2(int(uid), deals_sorted)
+
+    mid2 = await update_my_games_buttons_only(int(uid), markup)
+    ok = bool(mid2)
+    logger.info("[my_games.patch] after_success: uid=%s deal=%s mid=%s ok=%s", uid, deal_id, mid2, ok)
+    return ok
 
 # ════════════════════════════════════════════════════════════════════
 # [6] PUBLIC API
