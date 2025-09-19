@@ -16,7 +16,7 @@ import contextlib
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from aiogram import Bot, Router, types
 from aiogram.filters import Command
@@ -26,6 +26,7 @@ from pytz import timezone
 
 from core.config import settings
 from core.db import get_user_info
+from core.menu import get_main_menu, get_menu_message_id, remember_menu_message
 from core.state import state
 from core.utils import delete_previous_private_messages
 from services.amocrm import get_amocrm_deals
@@ -60,31 +61,24 @@ def _truncate(text: str, limit: int = 100) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-async def _refresh_menu(user_id: int) -> None:
-    from core.menu import get_main_menu
+async def _refresh_menu(user_id: int, *, bot: Optional[Bot] = None) -> Optional[int]:
+    kb_candidate = get_main_menu(user_id)
+    kb = await kb_candidate if hasattr(kb_candidate, '__await__') else kb_candidate
+    if not kb:
+        return None
 
-    try:
-        kb = await get_main_menu(user_id)
-        if not kb:
-            return
+    _bot = bot or Bot.get_current()
+    current_mid = get_menu_message_id(user_id)
+    if isinstance(current_mid, int) and current_mid > 0:
+        with contextlib.suppress(Exception):
+            await _bot.delete_message(chat_id=user_id, message_id=current_mid)
 
-        bot = Bot.get_current()
-        old_id = getattr(state, "menu_message_id", None)
+    sent = await _bot.send_message(chat_id=user_id, text='⁠', reply_markup=kb)
+    remember_menu_message(user_id, sent)
+    with contextlib.suppress(Exception):
+        await _bot.pin_chat_message(chat_id=user_id, message_id=sent.message_id, disable_notification=True)
+    return int(sent.message_id)
 
-        if old_id:
-            with contextlib.suppress(Exception):
-                await bot.delete_message(chat_id=user_id, message_id=old_id)
-            state.menu_message_id = None
-
-        for txt in ("\u2060", "."):
-            try:
-                sent = await bot.send_message(user_id, txt, reply_markup=kb)
-                state.menu_message_id = sent.message_id
-                return
-            except Exception:
-                continue
-    except Exception as e:
-        logger.error("[games] _refresh_menu: %s", e, exc_info=True)
 
 # ███ [4.0] CORE LIST/DETAILS LOGIC
 # --------------------------------------------------------------------

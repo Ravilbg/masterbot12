@@ -1,18 +1,18 @@
-# handlers/confirmations.py
-# ─────────────────────────────────────────────────────────────────────────────
+﻿# handlers/confirmations.py
+# -----------------------------------------------------------------------------
 """
 Подтверждения участия ведущими.
 
 Версия v15.9 · 2025-08-24
-──────────────────────────────────────────────────────────────────────────────
+------------------------------------------------------------------------------
 • SSOT: short_name/to_uid_list/normalize_roles/resolve_notify_chat_id из core.utils.
 • «✅ Подтвердить» ставит персональный тег в AmoCRM (add-only, без перезаписи).
 • Надёжное определение роли и состава из locked_distribution (списки и слоты).
-• ВАЖНО: Формат тегов строго берётся из locked_distribution → «Имя Ф.1/2/Адм/Стаж».
+• ВАЖНО: Формат тегов строго берётся из locked_distribution > «Имя Ф.1/2/Адм/Стаж».
   (Берём подпись до «|uid», при отсутствии суффикса — аккуратно добавляем.)
 • Локальная отметка кнопки на «✅ Подтверждено» без «прыжков» UI.
-• Уведомление в общий чат: «✅ Участие подтверждено: Имя Ф. — 🎭 Роль на „Название“ ДД.ММ ЧЧ:ММ».
-• Проверка полноты подтверждений: CRM-теги → локальный кэш (fallback).
+• Уведомление в общий чат: «? Участие подтверждено: Имя Ф. — 🎭 Роль на „Название“ ДД.ММ ЧЧ:ММ».
+• Проверка полноты подтверждений: CRM-теги > локальный кэш (fallback).
 • Автоперевод в статус «Завершение сделки» — ТОЛЬКО из «Бронь», если все роли подтверждены.
 • Совместимость с aiogram 3.x и Pylance (строгие типы).
 • ФИКС: после подтверждения из «Мои игры» НЕ открываем детали отчёта; редрав только у зрителей деталей.
@@ -20,10 +20,11 @@
 
 from __future__ import annotations
 
-# ███ [0] IMPORTS & CONSTANTS
+# --- [0] IMPORTS & CONSTANTS
 # --------------------------------------------------------------------
 import contextlib
 import logging
+import time
 from contextlib import suppress
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -33,6 +34,12 @@ from aiogram.exceptions import TelegramBadRequest
 
 from core.config import settings
 from core.state import state
+try:
+    from services.ratings import record_event  # type: ignore
+except Exception:
+    async def record_event(*_: Any, **__: Any) -> None:
+        return None
+
 from core.utils import (
     short_name,              # SSOT: «Имя Ф.»
     to_uid_list,             # SSOT: парсинг uid
@@ -54,7 +61,8 @@ logger = logging.getLogger(__name__)
 router = Router(name="confirmations")
 
 # Префикс для inline-кнопок подтверждения (используется в my_games)
-CONFIRM_PREFIX = "confirm_role_"
+CONFIRM_PREFIX = "confirm_participation_"
+LEGACY_CONFIRM_PREFIX = "confirm_role_"
 
 # Статусы из настроек
 BRON_STATUS_ID        = str(getattr(settings, "BRON_STATUS_ID", "") or "")
@@ -68,7 +76,7 @@ PRELIM_STATUS_ID      = str(getattr(settings, "PRELIM_STATUS_ID", getattr(settin
 # 2025-08-24 — ФИКС: убран автопереход в детали из «Мои игры», редрав только у зрителей деталей
 
 
-# ███ [0.1] SAFE HELPERS
+# --- [0.1] SAFE HELPERS
 # --------------------------------------------------------------------
 async def _safe_answer(callback: CallbackQuery, text: str, *, show_alert: bool = False) -> None:
     """Безопасный ответ на callback.answer: игнорируем «query is too old / invalid»."""
@@ -82,7 +90,7 @@ async def _safe_answer(callback: CallbackQuery, text: str, *, show_alert: bool =
             raise
 
 
-# ███ [1] ROLE/ASSIGNMENT HELPERS
+# --- [1] ROLE/ASSIGNMENT HELPERS
 # --------------------------------------------------------------------
 def _role_alias(key: str) -> str:
     """Нормализует ключ в одно из {'main','assist','admin','trainee'}."""
@@ -142,9 +150,9 @@ def _deal_title_from_state(deal_id: int) -> str:
 
 def _mark_confirmed_on_message_kb(callback: CallbackQuery, deal_id: int, role: str) -> InlineKeyboardMarkup | None:
     """
-    ТИХАЯ замена кнопки «Подтвердить» → «🔁 Замена» в текущем сообщении.
+    ТИХАЯ замена кнопки «Подтвердить» > «🔁 Замена» в текущем сообщении.
     Поддерживает два формата исходных кнопок:
-      • confirm_role_{deal_id}_{role}
+      • confirm_participation_{deal_id}_{role}
       • mygames_confirm_{deal_id}
     Новый callback: mygames_swap_{deal_id}
     """
@@ -227,7 +235,7 @@ async def _slot_key_for_user(deal_id: int, uid: int) -> Optional[str]:
     return None
 
 
-# ███ [2] AMOCRM HELPERS (add-only теги и перевод статуса)
+# --- [2] AMOCRM HELPERS (add-only теги и перевод статуса)
 # --------------------------------------------------------
 _TEAM_SUFFIXES: Set[str] = {".1", ".2", ".Адм", ".Стаж"}
 
@@ -260,13 +268,13 @@ async def _amo_add_tag(lead_id: int, tag: str, *, slot_key: Optional[str] = None
         return False
 
 
-# ███ [2.1] HUMAN LABELS (ИМЯ ДЛЯ ТЕГА) — ИЗ locked_distribution
+# --- [2.1] HUMAN LABELS (ИМЯ ДЛЯ ТЕГА) — ИЗ locked_distribution
 # --------------------------------------------------------------------
 def _ensure_suffix(label: str, role: str) -> str:
     """
     Если подпись уже вида «Имя Ф.1/2/Адм/Стаж» — оставляем.
     Иначе аккуратно добавляем суффикс: если label оканчивается на «.», то «+SUF»,
-    иначе «.+SUF». Пример: «Анна М.» + 1 → «Анна М.1».
+    иначе «.+SUF». Пример: «Анна М.» + 1 > «Анна М.1».
     """
     label = (label or "").strip()
     if not label:
@@ -341,7 +349,7 @@ def _label_for_user_from_locked(deal_id: int, uid: int, role: str) -> Optional[s
     return None
 
 
-# ███ [3] CONFIRMATION CHECK — CRM→LOCAL fallback
+# --- [3] CONFIRMATION CHECK — CRM>LOCAL fallback
 # --------------------------------------------------------------------
 async def _crm_confirmation_tags(deal_id: int) -> Set[str]:
     """Теги CRM по сделке (Set[str]). На ошибки/204 возвращаем пустое множество."""
@@ -397,11 +405,11 @@ async def _all_required_confirmed(deal_id: int) -> bool:
             return False
     return True
 
-# История изменений [3]: 2025-08-18 — CRM→LOCAL фолбэк (SSOT)
+# История изменений [3]: 2025-08-18 — CRM>LOCAL фолбэк (SSOT)
 #                       2025-08-19 — expected теги составляются из locked_distribution
 
 
-# ███ [3.1] STATUS READERS — определение статуса сделки (BRON/PRELIM/другое)
+# --- [3.1] STATUS READERS — определение статуса сделки (BRON/PRELIM/другое)
 # --------------------------------------------------------------------
 async def _read_status_info(deal_id: int) -> Tuple[Optional[str], str]:
     """
@@ -450,7 +458,7 @@ def _is_bron(sid: Optional[str], name_lower: str) -> bool:
         return True
     return name_lower == "бронь"
 
-# ███ [3.2] ALL-CONFIRMED ANNOUNCE — SSOT title/date/time/team
+# --- [3.2] ALL-CONFIRMED ANNOUNCE — SSOT title/date/time/team
 # --------------------------------------------------------------------
 from typing import Any, Dict, List, Optional, Tuple
 from contextlib import suppress
@@ -460,7 +468,7 @@ from core.state import state  # глобальный state нужен хелпе
 def _deal_title(d: Dict[str, Any]) -> str:
     """
     SSOT для заголовка игры:
-      game_name → name → f"Сделка #{id}"
+      game_name > name > f"Сделка #{id}"
     Идентично логике из handlers/polls_lifecycle.py.
     """
     try:
@@ -470,8 +478,8 @@ def _deal_title(d: Dict[str, Any]) -> str:
 
 def _normalize_time_str(raw: Optional[str]) -> str:
     """
-    Нормализует строку времени к 'HH:MM'. Примеры: '18.00'→'18:00', '930'→'09:30', '9'→'09:00'.
-    Пустое/мусор → ''.
+    Нормализует строку времени к 'HH:MM'. Примеры: '18.00'>'18:00', '930'>'09:30', '9'>'09:00'.
+    Пустое/мусор > ''.
     """
     s = (raw or "").strip()
     if not s:
@@ -522,9 +530,9 @@ def _team_slots_for_announce(deal_id: int) -> Dict[str, Any]:
 def _date_time_for_announce(deal_id: int) -> Tuple[str, str]:
     """
     Возвращает (date_s, time_s) строго из кастомных полей CRM:
-      • event_date, event_time (time → HH:MM, '.'→':');
+      • event_date, event_time (time > HH:MM, '.'>':');
       • фолбэк — время из event_datetime, если оно не '00:00'.
-    Источники: state.current_poll_deals → state.deals_index.
+    Источники: state.current_poll_deals > state.deals_index.
     """
     date_s, time_s = "", ""
 
@@ -556,8 +564,8 @@ def _date_time_for_announce(deal_id: int) -> Tuple[str, str]:
 async def _resolve_title_for_announce(deal_id: int) -> str:
     """
     Возвращает корректный заголовок для анонса:
-      1) state.current_poll_deals → _deal_title
-      2) state.deals_index → _deal_title
+      1) state.current_poll_deals > _deal_title
+      2) state.deals_index > _deal_title
       3) AmoCRM: пытаемся достать game_name из custom_fields_values; если нет — используем name.
       4) Фолбэк: «Сделка #id»
     """
@@ -611,7 +619,7 @@ async def _announce_all_confirmed(deal_id: int) -> None:
     """
     Единоразово шлёт в общий чат:
       «✅ Вся команда подтвердила участие.»
-      «🎮 «<Заголовок>» — ДД.ММ.ГГГГ ЧЧ:ММ»
+      «📅 «<Заголовок>» — ДД.ММ.ГГГГ ЧЧ:ММ»
       <буллет-список состава>
     Идемпотентность на процесс: не более одного анонса на deal_id.
     """
@@ -640,7 +648,7 @@ async def _announce_all_confirmed(deal_id: int) -> None:
     # заголовок/дата/время
     title = await _resolve_title_for_announce(did)
     date_s, time_s = _date_time_for_announce(did)
-    head = f"🎮 «{title}»"
+    head = f"📅 «{title}»"
     tail = " ".join(x for x in (date_s, time_s) if x)
     if tail:
         head = f"{head} — {tail}"
@@ -656,7 +664,7 @@ async def _announce_all_confirmed(deal_id: int) -> None:
         return
 
     # текст
-    parts: List[str] = ["✅ Вся команда подтвердила участие."]
+    parts: List[str] = ["? Вся команда подтвердила участие."]
     if head:
         parts.append(head)
     if lines:
@@ -670,22 +678,29 @@ async def _announce_all_confirmed(deal_id: int) -> None:
     announced.add(did)
 
 # История изменений:
-#   • 2025-09-02 — выровнено под SSOT: title=game_name→name→fallback; время из custom fields; Pylance ok.
+#   • 2025-09-02 — выровнено под SSOT: title=game_name>name>fallback; время из custom fields; Pylance ok.
 
 
 
-# ███ [4.0] CALLBACK: CONFIRM ROLE — универсальный вход из деталей и других мест
+# --- [4.0] CALLBACK: CONFIRM ROLE — универсальный вход из деталей и других мест
 # --------------------------------------------------------------------
 @router.callback_query(lambda c: c.data and c.data.startswith(CONFIRM_PREFIX))
 async def confirm_role_handler(callback: CallbackQuery) -> None:
     """
     Поддерживает оба формата:
-      • confirm_role_{deal_id}_{role}
-      • confirm_role_{deal_id}
+      • confirm_participation_{deal_id}_{role}
+      • confirm_participation_{deal_id}
+      • legacy: confirm_role_{deal_id}_{role}
     Во втором случае роль определяется по зафиксированному составу.
     """
     data = str(callback.data or "")
-    tail = data[len(CONFIRM_PREFIX):]
+    if data.startswith(CONFIRM_PREFIX):
+        tail = data[len(CONFIRM_PREFIX):]
+    elif data.startswith(LEGACY_CONFIRM_PREFIX):
+        tail = data[len(LEGACY_CONFIRM_PREFIX):]
+    else:
+        await _safe_answer(callback, "⚠️ Ошибочные данные кнопки.", show_alert=True)
+        return
 
     parts = tail.split("_")
     try:
@@ -700,12 +715,12 @@ async def confirm_role_handler(callback: CallbackQuery) -> None:
         role = await _role_of_user_in_locked(uid, deal_id)
 
     if role not in {"main", "assist", "admin", "trainee"}:
-        await _safe_answer(callback, "⛔ Роль не найдена или не назначена на вас.", show_alert=True)
+        await _safe_answer(callback, "⚠️ Роль не найдена или не назначена на вас.", show_alert=True)
         return
 
     await _perform_confirm(callback, deal_id, role)
 
-# ███ [4.1] CORE HELPERS — идемпотентность + единый источник правды 
+# --- [4.1] CORE HELPERS — идемпотентность + единый источник правды 
 # --------------------------------------------------------------------
 async def _role_of_user_in_locked(uid: int, deal_id: int) -> Optional[str]:
     """main/assist/admin/trainee/None — по зафиксированному составу (поддержка слотов без «|uid»)."""
@@ -726,7 +741,7 @@ async def _role_of_user_in_locked(uid: int, deal_id: int) -> Optional[str]:
 async def _maybe_move_to_success(deal_id: int) -> None:
     """
     Переводит сделку в «Завершение сделки» ТОЛЬКО если:
-      • все требуемые роли подтвердили участие (CRM→LOCAL);
+      • все требуемые роли подтвердили участие (CRM>LOCAL);
       • текущий статус сделки — «Бронь».
     Для «Предварительной заявки» и любого другого статуса — статус НЕ меняем.
     Уведомление «вся команда подтвердила» всегда отправляет handlers.my_games.announce_if_all_confirmed.
@@ -848,7 +863,7 @@ async def _maybe_move_to_success(deal_id: int) -> None:
         if _is_prelim(sid, name):
             return
 
-        # «Бронь» → «Завершение сделки»
+        # «Бронь» > «Завершение сделки»
         if _is_bron(sid, name) and SUCCESSFUL_STATUS_ID:
             with contextlib.suppress(Exception):
                 await update_deal_status(int(deal_id), str(SUCCESSFUL_STATUS_ID))
@@ -862,7 +877,7 @@ async def _maybe_move_to_success(deal_id: int) -> None:
                     pass
                 # ВАЖНО: games_by_user НЕ трогаем (пусть остаётся в «Моих играх»)
                 logger.info("[confirm] deal %d moved to SUCCESS (%s)", deal_id, SUCCESSFUL_STATUS_ID)
-                # ⬇ NEW (2025-08-31): скрыть из отчёта и ПЕРЕНЕСТИ «замки» в finished_* вместо удаления
+                # ? NEW (2025-08-31): скрыть из отчёта и ПЕРЕНЕСТИ «замки» в finished_* вместо удаления
                 try:
                     from handlers.polls_lifecycle import hide_deal_from_report, finish_if_all_deals_completed  # type: ignore
                     with contextlib.suppress(Exception):
@@ -933,9 +948,10 @@ async def _maybe_move_to_success(deal_id: int) -> None:
 
 async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> None:
     uid = int(callback.from_user.id)
+    now_ts = int(time.time())
     user_role = await _role_of_user_in_locked(uid, deal_id)
     if user_role != role:
-        await _safe_answer(callback, "⛔ Вы не назначены на эту роль.", show_alert=True)
+        await _safe_answer(callback, "⚠️ Вы не назначены на эту роль.", show_alert=True)
         return
 
     state.__dict__.setdefault("pending_confirmations", {})
@@ -970,6 +986,72 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
     (pc["confirmed"].setdefault(role, set())).add(uid)  # type: ignore[index]
     state.confirmed.setdefault(deal_id, set()).add(uid)
 
+    pending_map = pc.get("pending")
+    if isinstance(pending_map, dict):
+        role_pending = pending_map.get(role)
+        if isinstance(role_pending, set):
+            role_pending.discard(uid)
+            if not role_pending:
+                pending_map.pop(role, None)
+        if not pending_map:
+            pc.pop("pending", None)
+    pending_uids = pc.get("pending_uids")
+    if isinstance(pending_uids, set):
+        pending_uids.discard(int(uid))
+        if not pending_uids:
+            pc.pop("pending_uids", None)
+    try:
+        pc_entry = state.pending_confirmations.get(deal_id, {}) if isinstance(getattr(state, "pending_confirmations", {}), dict) else {}
+        assign_map = pc_entry.get("assign_ts", {}) if isinstance(pc_entry, dict) else {}
+        assigned_at = assign_map.get(int(uid)) or assign_map.get(str(uid)) or now_ts
+        await record_event(
+            uid,
+            "confirm",
+            {"deal_id": str(deal_id), "t_assign": int(assigned_at)},
+            deal_id=str(deal_id),
+        )
+        urgent_award = getattr(state, "urgent_swap_award", {})
+        if isinstance(urgent_award, dict):
+            award_uid = urgent_award.get(int(deal_id)) or urgent_award.get(str(deal_id))
+            if award_uid and int(award_uid) == uid:
+                await record_event(
+                    uid,
+                    "urgent_replacement",
+                    {"deal_id": str(deal_id), "reason": "urgent_swap"},
+                    deal_id=str(deal_id),
+                )
+                urgent_award.pop(int(deal_id), None)
+                urgent_award.pop(str(deal_id), None)
+    except Exception as exc:
+        logger.debug("[rating] confirm hook failed: %s", exc)
+
+
+    swaps = getattr(state, "swap_requests", {}) or {}
+    swap_entry = swaps.get(deal_id) or swaps.get(str(deal_id))
+    if isinstance(swaps, dict) and isinstance(swap_entry, dict):
+        try:
+            if int(swap_entry.get("accepted_by") or 0) == uid:
+                swaps.pop(deal_id, None)
+                swaps.pop(str(deal_id), None)
+            else:
+                swap_entry["awaiting_confirmation"] = False
+                swap_entry["confirmed_at"] = now_ts
+                swaps[int(deal_id)] = swap_entry
+        except Exception:
+            logger.debug("[confirm] swap cleanup skipped")
+        finally:
+            state.swap_requests = swaps  # type: ignore[attr-defined]
+
+    replacements = getattr(state, "swap_replacements", {}) or {}
+    repl_entry = replacements.get(deal_id) or replacements.get(str(deal_id))
+    if isinstance(repl_entry, dict):
+        with contextlib.suppress(Exception):
+            if int(repl_entry.get("candidate") or 0) == uid:
+                repl_entry["confirmed"] = True
+                repl_entry["confirmed_at"] = now_ts
+                replacements[int(deal_id)] = repl_entry
+                state.swap_replacements = replacements  # type: ignore[attr-defined]
+
     try:
         if refresh_deal_details:
             opened = getattr(state, "detail_blocks", {}).get(uid, {})
@@ -978,7 +1060,7 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
     except Exception:
         logger.debug("[confirm] details refresh skipped")
 
-    # Тихая перекраска дашборда сразу после подтверждения → «✅ Подтверждено»
+    # Тихая перекраска дашборда сразу после подтверждения > «✅ Подтверждено»
     applied_ui = False
     with contextlib.suppress(Exception):
         from handlers.my_games import mygames_after_confirm_ui_patch as _mg_after  # type: ignore
@@ -1005,12 +1087,17 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
                 when = f"{d_s} {t_s}".strip()
 
                 role_human_map = {"main": "Ведущий", "assist": "Помощник", "admin": "Админ", "trainee": "Стажёр"}
-                role_emoji_map = {"main": "🎭", "assist": "🤝", "admin": "🛡️", "trainee": "🧪"}
+                role_emoji_map = {"main": "🎤", "assist": "🤝", "admin": "🛡️", "trainee": "👷"}
                 role_human = role_human_map.get(role, "Участник")
-                r = role_emoji_map.get(role, "🎯")
+                r = role_emoji_map.get(role, "👤")
 
-                base = f"✅ Участие подтверждено: {human} — {r} {role_human} на «{title}»"
-                text = f"{base} {when}." if when else f"{base}."
+                base = f"{human} подтвердил выход на игру «{title}»"
+                if when:
+                    base = f"{base} {when}"
+                detail = f"{r} {role_human}".strip()
+                if detail:
+                    base = f"{base}. {detail}"
+                text = base if base.endswith('.') else f"{base}."
                 notified: Set[Tuple[int, int, str]] = state.__dict__.setdefault("_confirm_notified", set())  # type: ignore[assignment]
                 key = (int(deal_id), int(uid), str(role))
                 if key not in notified:
@@ -1022,7 +1109,7 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
     with contextlib.suppress(Exception):
         await _maybe_move_to_success(deal_id)
 
-    # Повторная тихая перекраска после возможного перевода в SUCCESS → «🔁 Замена»
+    # Повторная тихая перекраска после возможного перевода в SUCCESS > «🔁 Замена»
     with contextlib.suppress(Exception):
         from handlers.my_games import mygames_after_confirm_ui_patch as _mg_after  # type: ignore
         await _mg_after(uid, deal_id)
@@ -1036,7 +1123,7 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
 
 
 
-# ███ [4.2] CALLBACK: CONFIRM FROM «Мои игры»
+# --- [4.2] CALLBACK: CONFIRM FROM «Мои игры»
 # --------------------------------------------------------------------
 @router.callback_query(lambda c: c.data and c.data.startswith("mygames_confirm_"))
 async def confirm_from_mygames_handler(callback: CallbackQuery) -> None:
@@ -1083,7 +1170,7 @@ async def confirm_from_mygames_handler(callback: CallbackQuery) -> None:
 
 
 
-# ███ [99] SELF-TEST (минимальный)
+# --- [99] SELF-TEST (минимальный)
 # --------------------------------------------------------------------
 async def _test() -> None:
     # to_uid_list
@@ -1115,7 +1202,7 @@ async def _test() -> None:
     state.current_poll_deals = [{"id": 2, "status_id": int(BRON_STATUS_ID) if BRON_STATUS_ID else 12345}]
     state.deal_titles = {2: "Тестовая игра"}
 
-    print("handlers.confirmations ✅ tests passed")
+    print("handlers.confirmations ? tests passed")
 
 
 if __name__ == "__main__":
@@ -1128,3 +1215,5 @@ if __name__ == "__main__":
 # 2025-08-19 — проверки формата тегов из locked_distribution.
 # 2025-08-19 — _read_status_info и строгая логика перевода в SUCCESS (только из «Бронь»).
 # 2025-08-24 — предотвращён автопереход в детали при подтверждении из «Мои игры».
+# 2025-09-17 · модуль рейтинга: выровнено под SSOT.
+

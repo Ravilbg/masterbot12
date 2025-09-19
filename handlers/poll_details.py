@@ -36,6 +36,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from core.config import settings
 from core.state import state
 from core.utils import truncate, delete_previous_private_messages
+from core.utils import public_game_title
 try:
     # если есть современное ядро с вакуумом — используем
     from core.utils import vacuum_private as _vacuum_private  # type: ignore
@@ -1268,7 +1269,8 @@ async def _detail_header_lines(deal: Dict[str, Any]) -> List[str]:
     • Время берём как на кнопках: event_time (если задано) иначе из event_datetime;
     • Добавлены «🎁 Бонусы» из CRM (bonuses/bonus/extra_bonuses/extra_services).
     """
-    title = (deal.get("game_name") or deal.get("name") or f"Сделка #{deal.get('id')}").strip()
+    base_title = (deal.get("game_name") or deal.get("name") or f"Сделка #{deal.get('id')}").strip()
+    title = public_game_title(base_title)
     dt = deal.get("event_datetime")
 
     # дата
@@ -1762,20 +1764,25 @@ async def poll_swap_handler(callback: types.CallbackQuery) -> None:
         slot_target = "admin"
         displaced_uid = uid_of(dist.get("admin"))
     elif role_target == "main":
-        slot_target, displaced_uid = (_first_free("lead", need_main) or
-                                      (_existing_last("lead", need_main) or "lead1")), None
-        if slot_target and not slot_target.startswith("lead"):
-            # если свободного нет, берём last и считаем его занятым
+        free = _first_free("lead", need_main)
+        if free:
+            slot_target = free
+            displaced_uid = None
+        else:
             slot_target = _existing_last("lead", need_main) or "lead1"
             displaced_uid = uid_of(dist.get(slot_target))
     elif role_target == "assist":
-        slot_target, displaced_uid = (_first_free("assistant", need_assist) or
-                                      (_existing_last("assistant", need_assist) or "assistant1")), None
-        if slot_target and not slot_target.startswith("assistant"):
+        free = _first_free("assistant", need_assist)
+        if free:
+            slot_target = free
+            displaced_uid = None
+        else:
             slot_target = _existing_last("assistant", need_assist) or "assistant1"
             displaced_uid = uid_of(dist.get(slot_target))
     else:
         return await _fail("Некорректная целевая роль.", "bad_role")
+
+    fallback_slot_for_displaced: Optional[str] = None
 
     # ── 7) Нужна замена в прежней роли (умная рокировка)
     sticky_roles = {"main", "assist", "admin"}
@@ -1810,9 +1817,13 @@ async def poll_swap_handler(callback: types.CallbackQuery) -> None:
         else:
             free_for_displaced = None
 
-        if role_target != "admin" and not free_for_displaced:
+        if free_for_displaced:
+            fallback_slot_for_displaced = free_for_displaced
+        else:
             who = (getattr(state, "user_short", {}) or {}).get(displaced_uid) or (await _short_name(displaced_uid))
-            return await _fail(f"⚠️ Нет свободного слота для вытеснённого ({who}) — перенос отменён.", "no_slot_for_displaced")
+            logger.info(f"[swap] releasing displaced uid={displaced_uid} ({who}): no fallback slot for role={role_target}")
+            displaced_uid = None
+            fallback_slot_for_displaced = None
 
     # ── 9) Применение изменений
     for k, v in list(dist.items()):
@@ -1824,15 +1835,15 @@ async def poll_swap_handler(callback: types.CallbackQuery) -> None:
         dist[slot_old] = await _fmt(replacement_uid, role_old)
     if displaced_uid and replacement_uid != displaced_uid:
         if role_target == "main":
-            free = _first_free("lead", need_main)
+            free = fallback_slot_for_displaced or _first_free("lead", need_main)
             if free:
                 dist[free] = await _fmt(displaced_uid, "main")
         elif role_target == "assist":
-            free = _first_free("assistant", need_assist)
+            free = fallback_slot_for_displaced or _first_free("assistant", need_assist)
             if free:
                 dist[free] = await _fmt(displaced_uid, "assist")
         elif role_target == "admin" and await _fits(displaced_uid, "assist"):
-            free = _first_free("assistant", need_assist)
+            free = fallback_slot_for_displaced or _first_free("assistant", need_assist)
             if free:
                 dist[free] = await _fmt(displaced_uid, "assist")
 
@@ -1922,6 +1933,12 @@ async def forget_all_details_for_user(uid: int, bot: Optional[Bot] = None) -> No
 
     # 1) собрать и удалить все detail-сообщения текущего пользователя
     to_delete: List[int] = []
+
+    try:
+        from core.menu import get_menu_message_id  # lazy import
+    except Exception:
+        get_menu_message_id = lambda _uid: None  # type: ignore
+
     try:
         db: Dict[Tuple[int, int], List[int]] = getattr(state, "detail_blocks", {}) or {}
         keys_to_pop: List[Tuple[int, int]] = []
@@ -1936,6 +1953,9 @@ async def forget_all_details_for_user(uid: int, bot: Optional[Bot] = None) -> No
             elif isinstance(mids, int):
                 to_delete.append(int(m))
         # удаляем сообщения «деталей»
+        menu_mid = get_menu_message_id(uid)
+        if isinstance(menu_mid, int):
+            to_delete = [m for m in to_delete if m != menu_mid]
         for mid in to_delete:
             with contextlib.suppress(TelegramBadRequest, Exception):
                 await _bot.delete_message(chat_id=int(uid), message_id=int(mid))
@@ -2127,4 +2147,5 @@ if __name__ == "__main__":
 
 # История изменений:
 # • 2025-08-24 — v13.4: починен ручной SWAP, выровнено хранение «Имя Ф.|uid», стабилен пылесос в деталях,
+
 #                       совместимость с aiogram 3.x и SSOT, добавлены мягкие guard'ы и self-tests.

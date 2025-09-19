@@ -1,35 +1,40 @@
-# handlers/polls_distribution.py
-# ─────────────────────────────────────────────────────────────────────────────
+﻿# handlers/polls_distribution.py
+# -----------------------------------------------------------------------------
 """
 Ручное управление распределением (этап лидера).
 После «Утвердить» распределение фиксируется и запускается цикл подтверждений.
 
 Версия v14.9-cycle • 2025-08-12
-──────────────────────────────────────────────────────────────────────────────
+------------------------------------------------------------------------------
 • Единый коллбэк «Утвердить»: poll_approve_{deal_id}.
 • Источник правды по составу — state.distribution_cache / poll_details.distribution.
 • Автораспределение main/assist из ответов опроса + Светофор; офлайн-фолбэк.
 • Поддержка legacy-ключей main_leaders/assistants.
 • Уведомление уходит в POLLS_CHAT_ID / LEADERS_CHAT_ID / ADMIN_CHAT_ID.
-• В уведомлении рабочая кнопка «🎲 Личный кабинет» (deep-link /start=my_games).
+• В уведомлении рабочая кнопка «👤 Личный кабинет» (deep-link /start=my_games).
 • Идемпотентность «Утвердить»: повторный клик не дублирует фиксацию/уведомления.
 • Перерисовка «Мои игры» коалесцируется (один редрав на батч uid).
 """
 
 
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 # [0] IMPORTS
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Set, Tuple, Optional
 
 from aiogram import Router
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 from core.config import settings
+try:
+    from handlers.guide import PROFILE_BUTTON_TEXT  # type: ignore
+except Exception:  # pragma: no cover
+    PROFILE_BUTTON_TEXT = "👤 Личный кабинет"
 from core.state import state
 import handlers.polls_lifecycle as plc  # локальный импорт, чтобы избежать циклов
 
@@ -37,20 +42,63 @@ logger = logging.getLogger(__name__)
 router = Router(name="polls_distribution")
 
 # алиас на проверку готовности сделки (из lifecycle)
-_is_deal_ready = plc._is_deal_ready
+async def _is_deal_ready(deal_id: int) -> bool:
+    try:
+        direct = getattr(plc, "_is_deal_ready", None)
+        if callable(direct):
+            result = direct(int(deal_id))
+            if asyncio.iscoroutine(result):
+                result = await result
+            return bool(result)
+    except Exception:
+        logger.debug("[_is_deal_ready] direct shim failed for deal_id=%s", deal_id)
+
+    try:
+        deals = getattr(state, "current_poll_deals", []) or []
+        deal = next(d for d in deals if int(d.get("id") or 0) == int(deal_id))
+    except Exception:
+        return False
+
+    try:
+        ready, _ = plc._counts_ready_for_deal(deal)  # type: ignore[attr-defined]
+        return bool(ready)
+    except Exception:
+        logger.debug("[_is_deal_ready] fallback counts failed for deal_id=%s", deal_id)
+        return False
+
+
 
 # SSOT-резолвер уведомительного чата: awaitable-обёртка с безопасной передачей bot
 from core.utils import resolve_notify_chat_id as _ssot_resolve_notify_chat_id
 async def _resolve_notify_chat_id(bot: Any = None) -> Optional[int]:
     try:
-        # основная сигнатура (c bot)
-        return _ssot_resolve_notify_chat_id(bot)
-    except Exception:
+        result = _ssot_resolve_notify_chat_id(bot)
+    except TypeError:
         try:
-            # совместимость со старыми версиями (без bot)
-            return _ssot_resolve_notify_chat_id()
+            result = _ssot_resolve_notify_chat_id()
         except Exception:
+            logger.debug('[notify] resolve without bot failed', exc_info=True)
             return None
+    except Exception:
+        logger.debug('[notify] resolve with bot failed', exc_info=True)
+        return None
+
+    try:
+        if asyncio.iscoroutine(result):
+            result = await result
+    except Exception:
+        logger.debug('[notify] resolve coroutine failed', exc_info=True)
+        return None
+
+    try:
+        if result is None:
+            return None
+        if isinstance(result, int):
+            return result
+        return int(result)
+    except Exception:
+        logger.debug('[notify] unexpected chat id value: %r', result)
+        return None
 
 
 async def _try_sync_report() -> None:
@@ -64,9 +112,9 @@ async def _try_sync_report() -> None:
 
 # История изменений: [0] 2025-08-24 — убран прямой импорт services.gsheets; shim резолвера передаёт bot.
 
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 # [1.m] ПРИОРИТЕТЫ (AmoCRM): кэш месячных счётчиков по тегам
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 from typing import Dict
 
 async def _load_monthly_role_counters(force: bool = False) -> Dict[int, int]:
@@ -107,14 +155,14 @@ async def _get_monthly_counters() -> Dict[int, int]:
     return await _load_monthly_role_counters(force=False)
 
 
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 # [1] УТИЛИТЫ: нормализация, ЕДИНЫЙ КЭШ, commit в state, формат уведомлений
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 """
 Назначение:
 • ЕДИНЫЙ источник правды по составу — state.distribution_cache[str(deal_id)].
 • Мягкая миграция из зеркал (poll_details.distribution / poll_distribution) в единый кэш.
-• Инвариант «1 uid → 1 роль» (main > assist > admin) на чтение и запись.
+• Инвариант «1 uid > 1 роль» (main > assist > admin) на чтение и запись.
 • Сбор «слотов» под «Мои игры»: lead1/assistant1/admin/trainee «Имя Ф.<суффикс>|uid».
 • Запись утверждённого состава делает блок [1.k]; здесь — только нормализация/чтение.
 • НОВОЕ: приоритизация подбора кандидатов по «месячным счётчикам тегов» из AmoCRM.
@@ -136,9 +184,9 @@ except Exception:
 
 # SSOT-утилиты
 from core.utils import (
-    parse_uid,          # str "Имя Ф.|123" → 123
-    to_uid_list,        # Any → List[int]
-    normalize_roles,    # dict со слотами/ролями → {'main': [], 'assist': [], 'admin': []}
+    parse_uid,          # str "Имя Ф.|123" > 123
+    to_uid_list,        # Any > List[int]
+    normalize_roles,    # dict со слотами/ролями > {'main': [], 'assist': [], 'admin': []}
     team_bulleted_lines,
 )
 
@@ -174,7 +222,7 @@ def _ensure_state_structs() -> None:
 
 def _dedupe_roles(roles: Dict[str, List[int]]) -> Dict[str, List[int]]:
     """
-    Жёстко гарантирует инвариант «один uid → одна роль» в приоритете main > assist > admin.
+    Жёстко гарантирует инвариант «один uid > одна роль» в приоритете main > assist > admin.
     """
     seen: Set[int] = set()
     out: Dict[str, List[int]] = {"main": [], "assist": [], "admin": []}
@@ -248,10 +296,10 @@ def _dedupe_slots(slots: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-# ────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------
 # ЕДИНЫЙ КЭШ: только state.distribution_cache[str(deal_id)]
 # + мягкая миграция из зеркал при первом обращении
-# ────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------
 def _slots_from_roles_placeholder(roles: Dict[str, List[int]], *, keep_admin_many: bool = False) -> Dict[str, Any]:
     """
     Формирует слотовую карту из ролей с ПЛЕЙСХОЛДЕРАМИ имени:
@@ -400,7 +448,7 @@ def _role_cfg_local(game_name: str) -> Dict[str, int]:
 def _resolve_svetofor_func():
     """
     Находит функцию get_user_status_from_svetофор (async/sync). Возвращает call-able.
-    Приоритет: handlers.poll_details → services.gsheets. Если недоступно — безопасный фолбэк.
+    Приоритет: handlers.poll_details > services.gsheets. Если недоступно — безопасный фолбэк.
     """
     try:
         from handlers.poll_details import get_user_status_from_svetofor  # type: ignore
@@ -420,9 +468,9 @@ async def _derive_team_roles(deal_id: int) -> Dict[str, List[int]]:
     """
     Компонуем состав из ответов + Светофора, если кэши пусты.
     Инварианты/приоритеты:
-      • 1 uid → 1 роль (used-сет),
+      • 1 uid > 1 роль (used-сет),
       • RED/пустые статусы не попадают в core-ролях (main/assist),
-      • порядок выбора: Светофор (green < yellow) → месячный счётчик (меньше → выше) → uid.
+      • порядок выбора: Светофор (green < yellow) > месячный счётчик (меньше > выше) > uid.
     """
     _ensure_state_structs()
 
@@ -442,6 +490,12 @@ async def _derive_team_roles(deal_id: int) -> Dict[str, List[int]]:
     # светофор и месячные счётчики
     svetofor_fn = _resolve_svetofor_func()
     monthly = await _get_monthly_counters()
+    try:
+        from services.ratings import get_scores  # type: ignore
+    except Exception:
+        async def get_scores(_uids: List[int]) -> Dict[int, int]:  # type: ignore
+            return {int(u): 0 for u in _uids}
+
 
     # соберём пул откликнувшихся по этой сделке
     responses: Dict[str, Any] = getattr(state, "responses", {}) or {}
@@ -484,9 +538,16 @@ async def _derive_team_roles(deal_id: int) -> Dict[str, List[int]]:
         return 3
 
         # отсортированные кандидаты по приоритету
+    scores: Dict[int, int] = {}
+    if raw_pool:
+        try:
+            scores = await get_scores(list(raw_pool))
+        except Exception:
+            scores = {int(u): 0 for u in raw_pool}
+
     candidates = sorted(
         list(raw_pool),
-        key=lambda uid: (_sv_rank(sv_map.get(uid, "")), int(monthly.get(uid, 0)), int(uid)),
+        key=lambda uid: (-int(scores.get(uid, 0)), int(monthly.get(uid, 0)), int(uid)),
     )
 
     # ПРАВИЛЬНЫЕ пулы по «Светофору»:
@@ -547,9 +608,9 @@ async def _get_current_team(deal_id: int, invoker_uid: Optional[int] = None) -> 
     • Единый источник чтения — state.distribution_cache[str(deal_id)] (перед этим выполняется reconcile).
     • Если пусто — derive из ответов (_derive_team_roles) и материализуем в distribution_cache
       в слотовом виде с плейсхолдерами (имена подставятся на этапе форматирования/коммита).
-    • Инвариант «1 uid → 1 роль» соблюдается на каждом шаге.
+    • Инвариант «1 uid > 1 роль» соблюдается на каждом шаге.
     • Если пакет сделки требует администратора — добираем его по приоритету:
-      Светофор (green < yellow < red/—) → месячный счётчик (меньше — выше) → uid.
+      Светофор (green < yellow < red/—) > месячный счётчик (меньше — выше) > uid.
     """
     # 1) прочитать из единого кэша (с мягкой миграцией из зеркал)
     roles = _extract_distribution_from_cache(int(deal_id))
@@ -654,9 +715,9 @@ async def _get_current_team(deal_id: int, invoker_uid: Optional[int] = None) -> 
 # • 2025-08-24 — добавлена приоритизация по месячным счётчикам (AmoCRM) в _derive_team_roles/_get_current_team;
 #                инициализация state.monthly_role_counters в _ensure_state_structs; выровнено под SSOT.
 
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 # [1.t] Мини-тесты блока
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 def _test() -> None:
     _ensure_state_structs()
 
@@ -680,9 +741,9 @@ def _test() -> None:
 # • 2025-08-20 — выровнено под SSOT, удалены локальные дубли (_parse_uid/_as_user_list/_normalize_roles),
 #                добавлен адаптер «Светофора» без ошибок Pylance; инварианты и публичные имена сохранены.
 
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 # [1.1] КОАЛЕСЦИРОВАННЫЙ РЕДРАВ «МОИ ИГРЫ» — ОТКЛЮЧЕНО
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 def _queue_redraw_my_games(uids: Set[int], delay_sec: float = 0.15) -> None:
     """
     Раньше планировался один редрав «Мои игры» для пачки uid.
@@ -694,9 +755,9 @@ def _queue_redraw_my_games(uids: Set[int], delay_sec: float = 0.15) -> None:
 # История изменений: [1.1] 2025-08-20 — редрав отключён; вызовы оставлены как NOP.
 
 
-# ────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------
 # [1.x] ИМЕНА: короткое «Имя Ф.» и форматирование списков уведомления
-# ────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------
 from typing import Any, Dict, List
 from contextlib import suppress
 import re
@@ -709,7 +770,7 @@ from core.utils import (
 
 async def _short_name(uid: int) -> str:
     """
-    Обёртка над SSOT core.utils.short_name(uid) → строго «Имя Ф.»
+    Обёртка над SSOT core.utils.short_name(uid) > строго «Имя Ф.»
     (между именем и инициалом пробел, после инициала точка).
     """
     raw = await _ssot_short_name(uid)
@@ -720,11 +781,11 @@ async def _short_name(uid: int) -> str:
     if len(parts) == 2 and len(parts[1]) == 2 and parts[1].endswith("."):
         return s
 
-    # «Имя Ф» (без точки) → добавим точку
+    # «Имя Ф» (без точки) > добавим точку
     if len(parts) == 2 and len(parts[1]) == 1:
         return f"{parts[0]} {parts[1].upper()}."
 
-    # «Имя Фамилия [Отчество]» → «Имя Ф.»
+    # «Имя Фамилия [Отчество]» > «Имя Ф.»
     if len(parts) >= 2:
         first = parts[0]
         last_initial = parts[-1][:1].upper() if parts[-1] else ""
@@ -748,7 +809,7 @@ async def _short_name(uid: int) -> str:
 async def _fmt(uid_: int, role_key: str) -> str:
     """
     Формирует «Имя Ф.<суффикс>|uid» для записи в слоты.
-    Суффиксы: main→.1, assist→.2, admin→.Адм, trainee→.Стаж
+    Суффиксы: main>.1, assist>.2, admin>.Адм, trainee>.Стаж
     """
     name = await _short_name(uid_)
     suffix = {
@@ -767,12 +828,12 @@ async def _team_bulleted_lines(roles: Dict[str, List[int]], deal_id: int) -> Lis
     """
     slots: Dict[str, Any] = {}
 
-    # main → lead{i}
+    # main > lead{i}
     for i, uid in enumerate(roles.get("main", []) or [], start=1):
         nm = await _short_name(uid)  # строго «Имя Ф.»
         slots[f"lead{i}"] = f"{nm}|{uid}"
 
-    # assist → assistant{i}
+    # assist > assistant{i}
     for i, uid in enumerate(roles.get("assist", []) or [], start=1):
         nm = await _short_name(uid)
         slots[f"assistant{i}"] = f"{nm}|{uid}"
@@ -799,9 +860,9 @@ async def _team_bulleted_lines(roles: Dict[str, List[int]], deal_id: int) -> Lis
 
 
 
-# ────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------
 # [1.k] КНОПКИ/УВЕДОМЛЕНИЯ/КОММИТ СОСТАВА (без редравов «Мои игры»)
-# ────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------
 from contextlib import suppress
 from typing import Any, Dict, List, Optional, Set
 
@@ -842,12 +903,12 @@ async def _approval_announce_kb() -> InlineKeyboardMarkup:
         from core.state import state as _state
         uname = str(getattr(_settings, "BOT_USERNAME", "") or getattr(_state, "bot_username", "") or "bot")
     url = f"https://t.me/{uname}?start=my_games"
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎲 Личный кабинет", url=url)]])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=PROFILE_BUTTON_TEXT, url=url)]])
 
 
 def _mark_approved_on_message_kb(callback: "CallbackQuery", deal_id: int) -> Optional[InlineKeyboardMarkup]:
     """
-    Перекрашивает «Утвердить» → «✅ Утверждено» только в текущем сообщении.
+    Перекрашивает «Утвердить» > «✅ Утверждено» только в текущем сообщении.
     """
     try:
         msg = getattr(callback, "message", None)
@@ -871,7 +932,7 @@ def _mark_approved_on_message_kb(callback: "CallbackQuery", deal_id: int) -> Opt
 
 
 def _slot_uid_from_label(val: Any) -> Optional[int]:
-    """Принимает 'Имя Ф.|123' / int / None → возвращает uid или None."""
+    """Принимает 'Имя Ф.|123' / int / None > возвращает uid или None."""
     if isinstance(val, int):
         return val
     if isinstance(val, str):
@@ -894,12 +955,12 @@ async def _lines_from_slots(slots: Dict[str, Any]) -> List[str]:
         return ["• —"]
 
 
-# ── НОВОЕ: нормализация времени + шапка и финальный формат уведомления ─────
+# -- НОВОЕ: нормализация времени + шапка и финальный формат уведомления -----
 
 def _normalize_time_str(val: str) -> str:
     """
     Нормализует время до 'HH:MM'. Заменяет точки на двоеточия.
-    '900' → '09:00', '9:0' → '09:00'. Пустое значение возвращает ''.
+    '900' > '09:00', '9:0' > '09:00'. Пустое значение возвращает ''.
     """
     s = (val or "").strip().replace(".", ":")
     if not s:
@@ -985,7 +1046,7 @@ def _format_approval_notification(deal_id: int, slots: Dict[str, Any]) -> str:
 
     # Итоговый текст
     text = (
-        f"🎉 {header}\n"
+        f"📣 {header}\n"
         f"Состав команды на игру утвержден.\n"
         f"{{lines}}\n"
         f"Подтвердите свое участие в личном кабинете!"
@@ -998,10 +1059,10 @@ def _format_approval_notification(deal_id: int, slots: Dict[str, Any]) -> str:
 async def _commit_locked_distribution_to_state(deal_id: int, roles: Dict[str, List[int]]) -> Dict[str, Any]:
     """
     Фиксируем утверждённый состав:
-      locked_distribution[deal_id]                      ← «Имя Ф.<суффикс>|uid»
-      pending_confirmations[deal_id]['distribution']    ← то же
-      distribution_cache[str(deal_id)] / poll_details   ← то же
-      assigned_index[uid]                               ← deal_id
+      locked_distribution[deal_id]                      < «Имя Ф.<суффикс>|uid»
+      pending_confirmations[deal_id]['distribution']    < то же
+      distribution_cache[str(deal_id)] / poll_details   < то же
+      assigned_index[uid]                               < deal_id
 
     ВАЖНО: никаких редравов/переходов в «Мои игры».
     Возвращает зафиксированные slots.
@@ -1059,7 +1120,14 @@ async def _commit_locked_distribution_to_state(deal_id: int, roles: Dict[str, Li
 
     # запись во все точки правды
     _state.locked_distribution[deal_id] = dict(slots)
-    _state.pending_confirmations[deal_id] = {"distribution": dict(slots), "confirmed": set()}
+    pc_entry = {"distribution": dict(slots), "confirmed": set(), "assign_ts": {}}
+    _state.pending_confirmations[deal_id] = pc_entry
+    assign_map = pc_entry.setdefault("assign_ts", {})
+    assigned_at = int(time.time())
+    for value in slots.values():
+        uid = _slot_uid_from_label(value)
+        if uid is not None:
+            assign_map[int(uid)] = assigned_at
     _state.distribution_cache[str(deal_id)] = dict(slots)
     pd = _state.poll_details.setdefault(deal_id, {})
     pd["distribution"] = dict(slots)
@@ -1083,9 +1151,9 @@ async def _commit_locked_distribution_to_state(deal_id: int, roles: Dict[str, Li
 
 
 
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 # [1] INLINE-КЛАВИАТУРА (резерв под действия)
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 def distribution_actions_markup() -> InlineKeyboardMarkup:
     """Нижняя action-панель для отчёта лидеру (зарезервировано под будущее)."""
     return InlineKeyboardMarkup(inline_keyboard=[])
@@ -1093,9 +1161,9 @@ def distribution_actions_markup() -> InlineKeyboardMarkup:
 # История изменений: [1-inline] добавлен 2025-08-13, без логики (резерв)
 
 
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 # [2] УТВЕРЖДЕНИЕ СОСТАВА / LOCKED DISTRIBUTION — РЕЗЕРВ (без дубликатов)
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 """
 В этом блоке раньше повторно объявлялась `distribution_actions_markup()`,
 из-за чего происходило перекрытие реализации из секции [1] и появлялись
@@ -1112,9 +1180,9 @@ def distribution_actions_markup() -> InlineKeyboardMarkup:
 # намеренно пусто — всё, что связано с клавиатурами/утверждением,
 # находится в секциях [1], [1.k], [3], [4] и [5].
 
-# ════════════════════════════════════════════════════════════════════
-# [3] HANDLER: Утвердить одну игру (без автопереходов) — шапка 🎉 + двусторонний refresh
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
+# [3] HANDLER: Утвердить одну игру (без автопереходов) — шапка 📣 + двусторонний refresh
+# ====================================================================
 import inspect
 from contextlib import suppress
 from typing import Any, Optional, Dict, List
@@ -1123,9 +1191,9 @@ from typing import Any, Optional, Dict, List
 async def poll_approve_game_handler(callback: CallbackQuery) -> None:
     """
     Утверждение одной игры. Без автопереходов:
-    • перекраска кнопки «Утвердить» → «✅ Утверждено» в текущем сообщении,
+    • перекраска кнопки «Утвердить» > «✅ Утверждено» в текущем сообщении,
     • запись состава (включая admin, если он есть) в locked_distribution,
-    • чат-уведомление с согласованной шапкой 🎉 <Название> — DD.MM HH:MM <Пакет> <Бонусы/Нет бонусов>,
+    • чат-уведомление с согласованной шапкой 📣 <Название> — DD.MM HH:MM <Пакет> <Бонусы/Нет бонусов>,
     • мягкий refresh и отчёта, и деталей (если доступно).
     """
     # разбор callback
@@ -1157,7 +1225,7 @@ async def poll_approve_game_handler(callback: CallbackQuery) -> None:
     if callable(globals().get("_dedupe_roles")):
         roles = _dedupe_roles(roles)  # type: ignore[misc]
 
-    # фиксируем → slots
+    # фиксируем > slots
     try:
         slots: Dict[str, Any] = {}
         res = _commit_locked_distribution_to_state(int(deal_id), roles)
@@ -1183,10 +1251,12 @@ async def poll_approve_game_handler(callback: CallbackQuery) -> None:
             if chat_id is not None:
                 header = _approval_header_line(int(deal_id))
                 lines = await _lines_from_slots(slots)  # строго из зафиксированных слотов
+                joined_lines = "\n".join(lines)
+                body = f"{joined_lines}\n" if joined_lines else ""
                 text = (
-                    f"🎉 {header}\n"
+                    f"📣 {header}\n"
                     f"Состав команды на игру утвержден.\n"
-                    f"{'\n'.join(lines)}\n"
+                    f"{body}"
                     f"Подтвердите свое участие в личном кабинете!"
                 )
                 kb2 = await _approval_announce_kb()
@@ -1207,18 +1277,17 @@ async def poll_approve_game_handler(callback: CallbackQuery) -> None:
             await bot2.edit_message_reply_markup(chat_id=leader_id, message_id=msg_id, reply_markup=kb_report)
     with suppress(Exception):
         # реактивная перерисовка detail-view без «пылесоса», если доступна
-        from handlers.poll_details import refresh_deal_details  # type: ignore
-        await refresh_deal_details(int(deal_id))
+        await plc._refresh_detail_views({int(deal_id)}, refresh_all=False)  # type: ignore[attr-defined]
 
     logger.info("[approve] deal %s approved by %s; slots=%s", deal_id, callback.from_user.id, slots)
 
 # История изменений:
 #  • 2025-08-27 — канон-уведомление, список из slots (SSOT), двусторонний refresh (отчёт+детали), фиксы Pylance.
-#  • 2025-09-02 — сообщение приведено к утверждённому формату (шапка 🎉 + дата/время/пакет/бонусы, «!» в конце).
+#  • 2025-09-02 — сообщение приведено к утверждённому формату (шапка 📣 + дата/время/пакет/бонусы, «!» в конце).
 
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 # [4] HANDLER: Утвердить все готовые (батч) — канон-уведомление и slots-списки
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 from typing import List, Tuple, Optional  # локальные типы
 
 @router.callback_query(lambda c: c.data == "approve_all_ready")
@@ -1260,15 +1329,15 @@ async def poll_approve_all_ready_handler(callback: CallbackQuery) -> None:
             slots = await _commit_locked_distribution_to_state(did, roles)
             approved.append(did)
 
-            # каноническое чат-уведомление (НОВЫЙ формат: шапка 🎉 + дата/время/пакет/бонусы)
+            # каноническое чат-уведомление (НОВЫЙ формат: шапка 📣 + дата/время/пакет/бонусы)
             if bot and chat_id is not None:
                 try:
                     header = _approval_header_line(did)
                     lines = await _lines_from_slots(slots)
                     text = (
-                        f"🎉 {header}\n"
+                        f"📣 {header}\n"
                         f"Состав команды на игру утвержден.\n"
-                        f"{'\n'.join(lines)}\n"
+                        f"{body}"
                         f"Подтвердите свое участие в личном кабинете!"
                     )
                     kb2 = await _approval_announce_kb()
@@ -1300,11 +1369,11 @@ async def poll_approve_all_ready_handler(callback: CallbackQuery) -> None:
 
 # История изменений:
 # • 2025-08-27 — канон-уведомление, список из slots (SSOT), фиксы Pylance.
-# • 2025-09-02 — сообщение приведено к утверждённому формату (шапка 🎉 + дата/время/пакет/бонусы, «!» в конце).
+# • 2025-09-02 — сообщение приведено к утверждённому формату (шапка 📣 + дата/время/пакет/бонусы, «!» в конце).
 
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 # [5] ПРОЧИЕ HANDLERS: stop / back
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 @router.callback_query(lambda c: c.data and c.data.startswith("poll_stop_"))
 async def poll_stop_game_handler(callback: CallbackQuery) -> None:
     try:
@@ -1334,9 +1403,9 @@ async def poll_back_handler(callback: CallbackQuery) -> None:
 
 # История изменений: [5] обновлён 2025-08-13 — back вызывает _try_sync_report()
 
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 # [99] SELF-TEST
-# ════════════════════════════════════════════════════════════════════
+# ====================================================================
 async def _test() -> None:
     """Быстрые проверки нормализации и форматирования (без внешних сервисов)."""
     raw = {"main": [1, "Иван И.|101"], "assist": ["202"], "admin": ["bad", 303, "303", "Петр|404", ["505", ["Сергей|606"]]]}
@@ -1352,4 +1421,6 @@ if __name__ == "__main__":
     _l.basicConfig(level=_l.DEBUG)
     _a.run(_test())
 
-# История изменений: [99] добавлен 2025‑08‑13 — smoke‑тест нормализации
+# История изменений: [99] добавлен 2025-08-13 — smoke-тест нормализации
+
+# 2025-09-17 · SSOT: шим готовности, безопасный чат-рестолвер и refresh деталей.

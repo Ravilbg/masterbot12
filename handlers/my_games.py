@@ -1,5 +1,5 @@
-# handlers/my_games.py — дашборд «Мои игры»
-# ─────────────────────────────────────────────────────────────────────────────
+﻿# handlers/my_games.py — дашборд «Мои игры»
+# ──────────────────────────────────────────────────────────────────────────────
 """
 Версия 5.4 · 2025-08-18 (merge)
 
@@ -7,7 +7,7 @@
 • Сохранён весь рабочий функционал старой версии (видимость, кнопки, детали).
 • Пылесос сделан более совместимым: поддерживает разные сигнатуры ядра
   delete_previous_private_messages(...) и дополнительно подметает state.detail_blocks.
-• Обработчик «Замены» оставлен shim'ом (как в рабочей версии), чтобы не дублировать
+• Обработчик «Замены» оставлен shim’ом (как в рабочей версии), чтобы не дублировать
   логику из polls_lifecycle и не ловить гонки.
 
 Логика, формат, публичные API и тексты — без изменений.
@@ -25,22 +25,34 @@ import inspect
 import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Any
-from core.menu import get_menu_message_id  # NEW: не сносим сообщение главного меню
 
 from aiogram import Bot, Router, types
-from aiogram.filters import Command
+from aiogram.filters import Command  # оставляем для совместимости (могут быть связанные хендлеры)
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from pytz import timezone
 
 from core.config import settings
 from core.state import state
-from core.utils import truncate, delete_previous_private_messages, resolve_notify_chat_id  # SSOT-резолвер чата
+from core.utils import (
+    truncate,
+    delete_previous_private_messages,
+    resolve_notify_chat_id,   # SSOT-резолвер чата уведомлений
+    public_game_title,
+)
+from core.menu import get_menu_message_id  # NEW: не сносим сообщение главного меню
+
 from services.amocrm import (
     get_amocrm_deals,
-    update_amocrm_tags,   # для удаления подтверждающих тегов при замене (используется в чужом пайплайне)
-    update_deal_status,   # перевод сделки обратно в «Бронь» (используется в чужом пайплайне)
+    get_deal_by_id,
+    patch_lead,
+    update_amocrm_tags,   # для удаления подтверждающих тегов при замене (используется во внешнем пайплайне)
+    update_deal_status,   # перевод сделки обратно в «Бронь» (используется во внешнем пайплайне)
 )
+try:
+    from services.amocrm import _build_cf_patch  # type: ignore
+except Exception:
+    _build_cf_patch = None  # type: ignore
 
 # (детали из отчёта могут понадобиться в будущем; импорт оставляем совместимым)
 try:
@@ -50,11 +62,11 @@ except Exception:
 
 # Префикс подтверждения должен совпадать с handlers.confirmations.py
 try:
-    from handlers.confirmations import CONFIRM_PREFIX  # ожидается "confirm_role_"
+    from handlers.confirmations import CONFIRM_PREFIX  # ожидается "confirm_participation_"
 except Exception:  # fallback на ранних сборках
-    CONFIRM_PREFIX = "confirm_role_"
+    CONFIRM_PREFIX = "confirm_participation_"
 
-# (необязательно) получим ФИО из базы, если доступно — для "Имя Ф."
+# (необязательно) получим ФИО из базы, если доступно — для «Имя Ф.»
 try:
     from core.db import get_user_info  # type: ignore
 except Exception:  # pragma: no cover
@@ -64,18 +76,19 @@ logger = logging.getLogger(__name__)
 router = Router()
 MSK_TZ = timezone("Europe/Moscow")
 
-# ── спецсимволы ──────────────────────────────────────────────────────
+# ── спецсимволы ───────────────────────────────────────────────────────────────
 NBSP = "\u00A0"     # non-breaking space
 FE0F = "\uFE0F"     # emoji variation selector
 ZWNBSP = "\uFEFF"   # zero-width no-break space (BOM)
 
-# ── статус-ID ────────────────────────────────────────────────────────
+# ── статус-ID ─────────────────────────────────────────────────────────────────
 # «Бронь» — требуется подтверждение состава
 BRON_STATUS_ID: str = str(getattr(settings, "BRON_STATUS_ID", "18913933") or "18913933")
 # «Завершение сделки»
 OK_STATUS_ID: str = str(getattr(settings, "SUCCESSFUL_STATUS_ID", "0") or "0")
+WON_STATUS_ID: str = str(getattr(settings, "WON_STATUS_ID", "") or "")
 
-# ── callback-префиксы ────────────────────────────────────────────────
+# ── callback-префиксы ─────────────────────────────────────────────────────────
 DETAILS_PREFIX = "mygame_details_"
 REPORT_PREFIX  = "mygame_report_"
 SWAP_PREFIX    = "mygame_swap_"
@@ -89,12 +102,210 @@ PRELIM_STATUS_ID: str = str(
 # История изменений [1]:
 # 2025-08-19 — импортирован SSOT-резолвер resolve_notify_chat_id из core.utils; остальное без изменений.
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Pylance-safe shims for cross-module symbols (only typing + safe fallbacks)
+# Не меняет рантайм-поведение: если символ определён в globals(), используем его.
+# Иначе — даём минимальную безопасную реализацию/значение по умолчанию.
+# ──────────────────────────────────────────────────────────────────────────────
 
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Iterable, TYPE_CHECKING, cast
+from contextlib import suppress
 
+# ТЗ / окружение
+try:
+    from pytz import timezone as _tz
+    from core.config import settings
+    MSK_TZ = _tz(getattr(settings, "TIMEZONE", "Europe/Moscow"))
+except Exception:  # fail-safe
+    MSK_TZ = None  # type: ignore[assignment]
 
-# ════════════════════════════════════════════════════════════════════
+# Префиксы (оставляем текущие, но объявляем, чтобы не ругался линтер)
+DETAILS_PREFIX: str = cast(str, globals().get("DETAILS_PREFIX", "mygame_details_"))
+SWAP_PREFIX: str    = cast(str, globals().get("SWAP_PREFIX",    "mygame_swap_"))
+REPORT_PREFIX: str  = cast(str, globals().get("REPORT_PREFIX",  "mygame_report_"))
+RESPOND_PREFIX: str = cast(str, globals().get("RESPOND_PREFIX", "swap_accept_"))
+CONFIRM_PREFIX: str = cast(str, globals().get("CONFIRM_PREFIX", "confirm_participation_"))
+
+# Статусы (типобезопасно читаем)
+try:
+    BRON_STATUS_ID: str = str(getattr(settings, "BRON_STATUS_ID", "") or "")
+except Exception:
+    BRON_STATUS_ID = ""
+try:
+    OK_STATUS_ID: str = str(getattr(settings, "SUCCESSFUL_STATUS_ID", "") or "")
+except Exception:
+    OK_STATUS_ID = ""
+try:
+    PRELIM_STATUS_ID: str = str(
+        getattr(settings, "PRELIM_STATUS_ID", getattr(settings, "PRELIMINARY_STATUS_ID", "") or "") or ""
+    )
+except Exception:
+    PRELIM_STATUS_ID = ""
+
+# ── Типовые forward-declare для Pylance
+if TYPE_CHECKING:
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Message
+
+    async def _soft_redraw_my_games(uid: int) -> None: ...
+    def _is_locally_confirmed_for_redraw(deal_id: int, uid: int) -> bool: ...
+    def _assigned_role_from_state(uid: int, deal_id: int) -> Optional[str]: ...
+    def _safe_event_dt(deal: Dict[str, Any]) -> Optional["datetime"]: ...
+    def _safe_title(deal: Dict[str, Any]) -> str: ...
+    def _safe_status_id(deal: Dict[str, Any]) -> str: ...
+    def get_my_games_dashboard(uid: int) -> Optional[int]: ...
+    async def _vacuum_poll_details_blocks(uid: int) -> None: ...
+    async def get_amocrm_deals() -> List[Dict[str, Any]]: ...
+    async def show_my_game_details(cb: "CallbackQuery") -> None: ...
+    async def patch_lead(deal_id: int, payload: Dict[str, Any]) -> bool: ...
+    async def get_deal_by_id(deal_id: int) -> Optional[Dict[str, Any]]: ...
+    async def _build_cf_patch(src: Dict[str, Any]) -> Dict[str, Any]: ...
+    def _short_name(uid: int) -> str: ...
+    def team_bulleted_lines(slots: Dict[str, Any]) -> List[str]: ...
+    def get_menu_message_id(uid: int) -> Optional[int]: ...
+    WON_STATUS_ID: Optional[str]
+else:
+    # ── Runtime fallbacks (используем, только если реально нет в globals())
+    from datetime import datetime
+
+    def _fallback_is_locally_confirmed_for_redraw(deal_id: int, uid: int) -> bool:
+        # Используем локальную отметку, если блок [5] её завёл
+        try:
+            return bool((getattr(state, "mygames_local_confirm", {}) or {}).get((int(uid), int(deal_id))))
+        except Exception:
+            return False
+
+    _is_locally_confirmed_for_redraw = cast(
+        Callable[[int, int], bool],
+        globals().get("_is_locally_confirmed_for_redraw", _fallback_is_locally_confirmed_for_redraw),
+    )
+
+    _assigned_role_from_state = cast(
+        Callable[[int, int], Optional[str]],
+        globals().get("_assigned_role_from_state", lambda *_: None),
+    )
+
+    _safe_event_dt = cast(
+        Callable[[Dict[str, Any]], Optional[datetime]],
+        globals().get("_safe_event_dt", lambda *_: None),
+    )
+
+    _safe_title = cast(
+        Callable[[Dict[str, Any]], str],
+        globals().get("_safe_title", lambda d: str(d.get("name") or d.get("title") or d.get("game_name") or "")),
+    )
+
+    _safe_status_id = cast(
+        Callable[[Dict[str, Any]], str],
+        globals().get("_safe_status_id", lambda d: str(d.get("status_id") or "")),
+    )
+
+    _soft_redraw_my_games = cast(
+        Callable[[int], Any],
+        globals().get("_soft_redraw_my_games", lambda *_: None),
+    )
+
+    get_my_games_dashboard = cast(
+        Callable[[int], Optional[int]],
+        globals().get("get_my_games_dashboard", lambda *_: None),
+    )
+
+    _vacuum_poll_details_blocks = cast(
+        Callable[[int], Any],
+        globals().get("_vacuum_poll_details_blocks", lambda *_: None),
+    )
+
+    # Опциональные внешние символы — оставляем как есть, только чтобы анализатор не ругался
+    get_amocrm_deals = cast(Any, globals().get("get_amocrm_deals"))
+    show_my_game_details = cast(Any, globals().get("show_my_game_details"))
+    patch_lead = cast(Any, globals().get("patch_lead"))
+    get_deal_by_id = cast(Any, globals().get("get_deal_by_id"))
+    _build_cf_patch = cast(Any, globals().get("_build_cf_patch"))
+    _short_name = cast(Any, globals().get("_short_name", lambda uid: f"uid:{uid}"))
+    team_bulleted_lines = cast(Any, globals().get("team_bulleted_lines", lambda *_: []))
+    get_menu_message_id = cast(Any, globals().get("get_menu_message_id", lambda *_: None))
+    WON_STATUS_ID = globals().get("WON_STATUS_ID", None)
+
+# ── Утилита: извлечь UID'ы из разных представлений лейблов (Name|uid, список, set, и т.п.)
+def to_uid_list(value: Any) -> List[int]:
+    """
+    Превращает любое значение в список UID:
+      • "Имя Ф.|123" -> [123]
+      • ["Имя|1", "x|2"] -> [1, 2]
+      • 123 -> [123]
+      • {"lead1": "Имя|5"} -> [5]
+      • None/пусто -> []
+    """
+    out: List[int] = []
+
+    def _add(v: Any) -> None:
+        if v is None:
+            return
+        if isinstance(v, int):
+            out.append(int(v)); return
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return
+            # Если строка чисто число
+            with suppress(Exception):
+                if s.isdigit():
+                    out.append(int(s)); return
+            # Паттерн "label|uid"
+            if "|" in s:
+                with suppress(Exception):
+                    uid = int(s.rsplit("|", 1)[-1])
+                    out.append(uid)
+            return
+        if isinstance(v, (list, tuple, set)):
+            for x in v:
+                _add(x)
+            return
+        if isinstance(v, dict):
+            for x in v.values():
+                _add(x)
+            return
+
+    _add(value)
+    # уникализируем, сохраняя порядок
+    seen: Set[int] = set()
+    uniq: List[int] = []
+    for uid in out:
+        if uid not in seen:
+            seen.add(uid)
+            uniq.append(uid)
+    return uniq
+
+# ── Фолбэк: получить подпись пользователя в locked_distribution (label часть без uid)
+def _mg_label_for_user_from_locked(deal_id: int, uid: int) -> Optional[str]:
+    """
+    Возвращает label (часть до '|') для uid в state.locked_distribution[deal_id],
+    либо None, если не найдено. Нужен в проверках подтверждений/замены.
+    """
+    try:
+        locked = (getattr(state, "locked_distribution", {}) or {})
+        raw = locked.get(int(deal_id)) or locked.get(str(deal_id)) or {}
+        if not isinstance(raw, dict) or not raw:
+            return None
+        for k, v in raw.items():
+            if not isinstance(k, str):
+                continue
+            if k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"}:
+                values: Iterable[Any] = v if isinstance(v, (list, tuple, set)) else [v]
+                for item in values:
+                    s = str(item or "")
+                    if "|" in s:
+                        name, uid_str = s.rsplit("|", 1)
+                        with suppress(Exception):
+                            if int(uid_str) == int(uid):
+                                return name.strip()
+    except Exception:
+        pass
+    return None
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
 # [2] TEXT HELPERS
-# ════════════════════════════════════════════════════════════════════
+# ╚═══════════════════════════════════════════════════════════════════════════╝
 def _log_text(prefix: str, text: str | None) -> None:
     if logger.isEnabledFor(logging.INFO):
         cps = " ".join(f"U+{ord(c):04X}" for c in (text or ""))
@@ -123,8 +334,7 @@ def _is_my_games_btn(text: str | None) -> bool:
     return ok
 
 
-# ███ [2.1] SHOW MY-GAME DETAILS — CRM + утверждённый состав + «✅ Подтвердить»/«Замена»
-# --------------------------------------------------------------------
+# Вспомогательные парсеры тегов/слотов (используются в деталях)
 def _tag_uid(tag: Optional[str]) -> Optional[int]:
     """user_id из тега «Имя.Суффикс|123»."""
     if not tag or "|" not in str(tag):
@@ -170,21 +380,23 @@ def _is_locally_confirmed(deal_id: int, uid: int) -> bool:
     return False
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("mygame_details_"))
+# ███ [2.1] SHOW MY-GAME DETAILS — CRM + утверждённый состав + «✓ Подтвердить»/«Замена»
+# --------------------------------------------------------------------
+@router.callback_query(lambda c: c.data and c.data.startswith(DETAILS_PREFIX))
 async def show_my_game_details(callback: types.CallbackQuery) -> None:
     """
     Детали игры в «🎲 Мои игры»:
       • подробности из CRM (дата, время, место, пакет, игроки, статус);
       • утверждённый состав из locked_distribution (слоты lead*/assistant*/admin/trainee),
         с фолбэком на finished_locked_distribution и snapshot из distribution_cache;
-      • кнопка «✅ Подтвердить участие» — при статусе «Бронь» ИЛИ «Предварительная заявка», если назначен;
-      • кнопка «🔁 Замена» — после ЛИЧНОГО подтверждения пользователя (даже если вся команда ещё не подтвердила),
+      • кнопка «✓ Подтвердить участие» — при статусе «Бронь» ИЛИ «Предварительная заявка», если назначен;
+      • кнопка «🔁 Замена» — после личного подтверждения пользователя (даже если вся команда ещё не подтвердила),
         а также при статусе «Завершение сделки»;
       • кнопка «📝 Написать отчёт» — после наступления даты и времени игры.
       • повторно кнопку подтверждения не показываем, если подтверждение уже учтено локально/по тегам.
     """
     # — фильтр против автоперехода из дашборда — только details
-    if not str(callback.data).startswith("mygame_details_"):
+    if not str(callback.data).startswith(DETAILS_PREFIX):
         with contextlib.suppress(Exception):
             await callback.answer()
         return
@@ -233,6 +445,7 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
         }
 
     name = str(deal.get("game_name") or deal.get("name") or f"Сделка #{deal_id}")
+    name = public_game_title(name)
     event_dt = deal.get("event_datetime")
     date_s = event_dt.strftime("%d.%m.%Y") if hasattr(event_dt, "strftime") else str(deal.get("event_date") or "—")
 
@@ -257,7 +470,7 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
 
     # определяем «предварительную заявку» по ID или названию статуса
     status_name_raw = str(deal.get("status_name") or deal.get("status") or "").strip().lower()
-    prelim = (PRELIM_STATUS_ID and status_id == str(PRELIM_STATUS_ID)) or (status_name_raw in {"предварительная заявка", "предварительно", "предварит."})
+    prelim = (PRELIM_STATUS_ID and status_id == str(PRELIM_STATUS_ID)) or (status_name_raw in {"предварительная заявка", "предварительно", "предв."})
 
     status = str(
         deal.get("status_name")
@@ -291,13 +504,13 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
     admin_text = _tag_label(dist.get("admin")) or "—"
     trainee_text = _tag_label(dist.get("trainee"))  # может быть пустым
 
-    # ⬇️ собираем строки деталей с «активными» полями AmoCRM, кроме финансов
+    # ⛏️ собираем строки деталей с «активными» полями AmoCRM, кроме финансов
     lines = [
         f"🎮 *{name}*",
         f"📅 {date_s} · 🕒 {time_s}",
         f"📍 {place}",
         f"📦 Пакет: {pkg_raw}",
-        f"👥 Игроки: {players}",
+        f"🧑‍🤝‍🧑 Игроки: {players}",
     ]
     age = str(deal.get("age") or "").strip()
     if age:
@@ -312,10 +525,10 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
     if comment:
         lines.append(f"💬 Комментарий: {truncate(comment, 700)}")
 
-    lines.append(f"📌 Статус CRM: {status}")
+    lines.append(f"🗂 Статус CRM: {status}")
     lines.append("— — —")
-    lines.append(f"🧭 Ведущие: {mains_text}")
-    lines.append(f"🛟 Помощники: {assists_text}")
+    lines.append(f"🧑‍🎤 Ведущие: {mains_text}")
+    lines.append(f"🧑‍🤝‍🧑 Помощники: {assists_text}")
     lines.append(f"🛡️ Админ: {admin_text}")
     if trainee_text:
         lines.append(f"🎓 Стажёр: {trainee_text}")
@@ -333,7 +546,7 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
         role = None
     if role is None:
         try:
-            role = _assigned_role_from_state(uid, deal_id)  # legacy helper из файла
+            role = _assigned_role_from_state(uid, deal_id)  # legacy helper из файла (объявлен ниже)
         except Exception:
             role = None
 
@@ -343,8 +556,8 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
     confirmed = confirmed_by_tags or confirmed_local
 
     can_confirm = (role in {"main", "assist", "admin"}) and ((status_id == bron_id) or prelim) and (not confirmed)
-    # «Замена» после подтверждения или при статусе «Завершение сделки»
-    can_swap = (role in {"main", "assist", "admin"}) and (status_id == ok_id)
+    # «Замена» после личного подтверждения ИЛИ при статусе «Завершение сделки»
+    can_swap = (role in {"main", "assist", "admin"}) and (confirmed or (status_id == ok_id))
 
     # Доступность «Отчёта»
     report_ready = False
@@ -362,7 +575,7 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
         # подтверждение из «Моих игр» идёт через общий handlers.confirmations:
         second_rows.append([
             InlineKeyboardButton(
-                text="✅ Подтвердить участие",
+                text="✓ Подтвердить участие",
                 callback_data=f"{CONFIRM_PREFIX}{deal_id}_{role}"
             )
         ])
@@ -387,33 +600,20 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
         await callback.answer()
 
 # История изменений [2.1]:
-# • 2025-08-29 — Исправлено отображение времени: приоритет event_time (нормализация до HH:MM), 
+# • 2025-08-29 — Исправлено отображение времени: приоритет event_time (нормализация до HH:MM),
 #                затем — из event_datetime (игнор «00:00»), иначе «—». В остальном без изменений.
 # • 2025-08-31 — Выровнено под SSOT: «🔁 Замена» доступна после личного подтверждения или при SUCCESS;
 #                сохранён мягкий vacuum sticky; без изменений публичных API.
 # • 2025-09-02 — FIX: состав для деталей ищется в locked → finished_locked → distribution_cache (snapshot),
 #                роль для кнопок берётся через union-хелпер (если есть); выровнено под SSOT/фиксы Pylance.
-# • 2025-09-03 — ВАЖНЫЙ ФИКС: хэндлер матчится только на «mygame_details_…», чтобы не перехватывать
-#                колбэки «mygame_swap_…»; иначе кнопка «Замена» не срабатывала.
+# • 2025-09-03 — ВАЖНЫЙ ФИКС: хэндлер матчится только на «mygame_details_*», чтобы не перехватывать
+#                колбэки «mygame_swap_*»; иначе кнопка «Замена» не срабатывала.
 
 
-# ════════════════════════════════════════════════════════════════════
+# ╔═══════════════════════════════════════════════════════════════════════════╗
 # [2.2] ЗАМЕНА: кнопка «🔁 Замена» из «Мои игры»
 # Версия 2.3.0 · 2025-09-03 (SSOT: делегирование в polls_lifecycle; фиксы префиксов/роутера)
-# ────────────────────────────────────────────────────────────────────
-# Минимальные правки:
-# • Убрана локальная реализация замены и повторные префиксы — используем глобальные
-#   SWAP_PREFIX="mygame_swap_" и RESPOND_PREFIX="swap_accept_" из файла.
-# • НЕ переопределяем router (используем общий router модуля).
-# • Делегируем логику в централизованные обработчики из handlers.polls_lifecycle,
-#   чтобы не дублировать SSOT (удаление тегов, точечная чистка слотов, уведомления в чат и т.п.).
-
-from aiogram import types
-import contextlib
-import logging
-
-logger = logging.getLogger(__name__)
-
+# ╚═══════════════════════════════════════════════════════════════════════════╝
 @router.callback_query(lambda c: c.data and c.data.startswith(SWAP_PREFIX))
 async def mygame_swap_shim(callback: types.CallbackQuery) -> None:
     """Shim: обработка «🔁 Замена» делегируется в polls_lifecycle.swap_request_handler."""
@@ -424,6 +624,7 @@ async def mygame_swap_shim(callback: types.CallbackQuery) -> None:
         logger.error("[my_games.swap] delegate failed: %s", e)
         with contextlib.suppress(Exception):
             await callback.answer("⚠️ Не удалось запросить замену. Попробуйте ещё раз.", show_alert=True)
+
 
 @router.callback_query(lambda c: c.data and c.data.startswith(RESPOND_PREFIX))
 async def mygame_swap_accept_shim(callback: types.CallbackQuery) -> None:
@@ -440,10 +641,9 @@ async def mygame_swap_accept_shim(callback: types.CallbackQuery) -> None:
 # • 2025-09-03 — 2.3.0: выровнено под SSOT — делегирование в polls_lifecycle; убраны локальные префиксы/роутер.
 
 
-
-# ════════════════════════════════════════════════════════════════════
+# ╔═══════════════════════════════════════════════════════════════════════════╗
 # [3] DOMAIN HELPERS
-# ════════════════════════════════════════════════════════════════════
+# ╚═══════════════════════════════════════════════════════════════════════════╝
 def _safe_event_dt(deal: Dict) -> Optional[datetime]:
     dt = deal.get("event_datetime")
     return dt if isinstance(dt, datetime) else None
@@ -481,7 +681,7 @@ def _is_main_leader_legacy(uid: int, deal: Dict) -> bool:
 
 def _short_name(uid: int) -> str:
     """
-    Короткое имя "Имя Ф." (с точкой).
+    Короткое имя «Имя Ф.» (с точкой).
     Берём из core.db.get_user_info (если СИНХРОННАЯ функция) или state.users.
     """
     if callable(get_user_info) and not inspect.iscoroutinefunction(get_user_info):
@@ -516,16 +716,11 @@ def _expected_tags_for(uid: int) -> Set[str]:
     base = _short_name(uid)
     if not base:
         return set()
-    # новый формат (нормальный)
     tags: Set[str] = {f"{base}1", f"{base}2", f"{base}Адм"}
-    # старый формат (с точкой перед суффиксом)
     tags |= {f"{base}.1", f"{base}.2", f"{base}.Адм"}
-    # исторические вариации/опечатки
     tags |= {f"{base} .Адм", f"{base}. Адм", f"{base}.Ад", f"{base}. Ад"}
-    # «двойная точка» встречалась ранее («Имя Ф.» + «.1»)
     tags |= {f"{base}..1", f"{base}..2", f"{base}..Адм"}
     return tags
-
 
 
 def _has_confirmation_tag(deal: Dict, uid: int) -> bool:
@@ -624,7 +819,7 @@ def _is_user_assigned_current(uid: int, deal: Dict) -> bool:
 def _details_text(deal: Dict, confirmed: bool) -> str:
     dt = _safe_event_dt(deal)
     date_part = dt.strftime("%d.%m.%Y") if dt else "—"
-    status_txt = "✅ Подтверждено" if confirmed else "⏳ Ожидает подтверждения"
+    status_txt = "✓ Подтверждено" if confirmed else "🕗 Ожидает подтверждения"
     time_txt = deal.get("event_time", "—")
     package = deal.get("package", "—")
     players = deal.get("players", "—")
@@ -635,7 +830,7 @@ def _details_text(deal: Dict, confirmed: bool) -> str:
         f"📅 *Дата*: {date_part}\n"
         f"🕒 *Время*: {time_txt}\n"
         f"📦 *Пакет*: {package}\n"
-        f"👥 *Игроки*: {players}\n"
+        f"🧑‍🤝‍🧑 *Игроки*: {players}\n"
         f"🔖 *Статус*: {status_txt}\n"
         f"💬 *Комментарий*: {comment}"
     )
@@ -644,7 +839,7 @@ def _details_text(deal: Dict, confirmed: bool) -> str:
 def _bron_status_id() -> str:
     """Безопасный резолвер ID статуса «Бронь»."""
     try:
-        return str(BRON_STATUS_ID)  # noqa: F821
+        return str(BRON_STATUS_ID)
     except Exception:
         return str(getattr(settings, "BRON_STATUS_ID", ""))
 
@@ -652,7 +847,7 @@ def _bron_status_id() -> str:
 def _details_kb(uid: int, deal: Dict, confirmed: bool) -> InlineKeyboardMarkup:
     """
     Фолбэк-клавиатура (когда недоступна расширенная разметка).
-    Кнопка «✅ Подтвердить участие» активна только для статуса «Бронь»,
+    Кнопка «✓ Подтвердить участие» активна только для статуса «Бронь»,
     когда пользователь назначен по зафиксированному распределению и ещё не подтвердил.
     """
     kb = InlineKeyboardBuilder()
@@ -666,7 +861,7 @@ def _details_kb(uid: int, deal: Dict, confirmed: bool) -> InlineKeyboardMarkup:
 
     if can_confirm:
         kb.button(
-            text="✅ Подтвердить участие",
+            text="✓ Подтвердить участие",
             callback_data=f"{CONFIRM_PREFIX}{deal['id']}_{role}",
         )
 
@@ -686,9 +881,9 @@ def _details_kb(uid: int, deal: Dict, confirmed: bool) -> InlineKeyboardMarkup:
 # • 2025-08-20 — _short_name возвращает строго «Имя Ф.» (точка после инициалов).
 
 
-# ════════════════════════════════════════════════════════════════════
+# ╔═══════════════════════════════════════════════════════════════════════════╗
 # [3.1] SWAP HELPERS (используются внешними пайплайнами; оставляем)
-# ════════════════════════════════════════════════════════════════════
+# ╚═══════════════════════════════════════════════════════════════════════════╝
 def _find_deal_snapshot(deal_id: int) -> Dict[str, Any]:
     """
     Возвращает «снимок» сделки из возможных источников: games_by_user, current_poll_deals, CRM.
@@ -703,14 +898,15 @@ def _find_deal_snapshot(deal_id: int) -> Dict[str, Any]:
     d = next((x for x in (getattr(state, "current_poll_deals", []) or []) if int(x.get("id") or 0) == deal_id), None)
     if d:
         return d
-    # 3) CRM полный список
+    # 3) CRM полный список (как редкий путь)
     try:
-        all_deals = state._last_deals_cache  # возможен быстрый кэш, если уже тянули ранее
+        all_deals = state._last_deals_cache  # быстрый кэш, если уже тянули ранее
     except Exception:
         all_deals = None
     try:
         if not all_deals:
-            all_deals = asyncio.run(get_amocrm_deals())  # fallback sync-context (редкий путь)
+            # Fallback из синхронного контекста — допускается, если окружение позволяет.
+            all_deals = asyncio.run(get_amocrm_deals())
     except Exception:
         all_deals = []
     return next((x for x in (all_deals or []) if int(x.get("id") or 0) == deal_id), {})  # может быть пустой
@@ -770,83 +966,14 @@ def _filter_tags_without_user(tags: List[Dict[str, Any]] | List[Any], uid: int) 
     kill = _expected_tags_for(uid)
     return [n for n in names if n not in kill]
 
-# ════════════════════════════════════════════════════════════════════
+# ╔═══════════════════════════════════════════════════════════════════════════╗
 # [3.2] Мои игры — состояние подтверждения и кнопка
 # Версия 3.2.4 · 2025-08-28
-# Изменения:
-# • Подтверждение НЕ перехватывается этим модулем: формируем callback строго под handlers/confirmations.
-# • Кнопка «Замена» показывается только если пользователь уже подтвердил ИЛИ сделка в «Завершении».
-# • Фолбэк-проверки тегов/локальной отметки остались без изменений.
-# ════════════════════════════════════════════════════════════════════
-from contextlib import suppress
-from typing import Any, Dict, Iterable, Optional
-from aiogram.types import InlineKeyboardButton
-
-from core.state import state
-from core.utils import to_uid_list, normalize_roles
-
-# CRM-обёртка — используем, если доступна
-try:
-    from services import amocrm as _amo  # type: ignore
-except Exception:
-    _amo = None  # type: ignore
-
-
-def _mg_role_alias(key: str) -> str:
-    k = (key or "").lower()
-    if k.startswith("lead") or k == "main": return "main"
-    if k.startswith("assist"):              return "assist"
-    if "admin" in k:                        return "admin"
-    if "trainee" in k or "intern" in k or "стаж" in k: return "trainee"
-    return k
-
-
-def _mg_label_for_user_from_locked(deal_id: int, uid: int) -> Optional[str]:
-    """
-    Возвращает подпись из locked_distribution ДО '|uid' — строго как зафиксировано.
-    Предпочтительно используем слоты, где подпись уже с «.1/.2/.Адм/.Стаж».
-    """
-    raw = (getattr(state, "locked_distribution", {}) or {}).get(deal_id) \
-       or (getattr(state, "locked_distribution", {}) or {}).get(str(deal_id)) \
-       or {}
-
-    # слоты нового формата
-    if isinstance(raw, dict) and raw:
-        for slot, val in raw.items():
-            role = _mg_role_alias(slot)
-            seq: Iterable[Any] = val if isinstance(val, (list, tuple, set)) else [val]
-            for item in seq:
-                s = str(item or "").strip()
-                if not s:
-                    continue
-                try:
-                    uids = set(map(int, to_uid_list(s)))
-                except Exception:
-                    uids = set()
-                if int(uid) in uids:
-                    return s.split("|", 1)[0].strip()
-        return None
-
-    # ролевая форма (редкие ранние сборки) — восстановим подпись «Имя Ф.» из кэша «Имя|uid»
-    try:
-        roles = normalize_roles(raw)
-        for bucket in (roles.get("main") or []) + (roles.get("assist") or []) + (roles.get("admin") or []):
-            if int(bucket) == int(uid):
-                dc = (getattr(state, "distribution_cache", {}) or {}).get(str(deal_id), {})
-                if isinstance(dc, dict):
-                    for v in dc.values():
-                        vs = str(v or "")
-                        if vs.endswith(f"|{uid}"):
-                            return vs.split("|", 1)[0].strip()
-    except Exception:
-        pass
-    return None
-
-
+# ╚═══════════════════════════════════════════════════════════════════════════╝
 async def _mg_crm_confirmation_tags(deal_id: int) -> set[str]:
     """Командные теги из CRM по сделке (Set[str]); на ошибках — пустое множество."""
     tags: set[str] = set()
-    if not _amo:
+    if not _amo:  # _amo берём из services.amocrm, объявлено выше
         return tags
     with suppress(Exception):
         if hasattr(_amo, "get_deal_by_id"):
@@ -862,7 +989,7 @@ async def _mg_is_user_confirmed_for_deal(uid: int, deal_id: int) -> bool:
     """
     True, если у пользователя уже есть подтверждение:
       • в CRM-тегах присутствует точная подпись из locked_distribution;
-      • фолбэк: локальный кэш state.pending_confirmations/confirmed.
+      • фолбэк: локальная отметка state.pending_confirmations/confirmed.
     """
     label = _mg_label_for_user_from_locked(deal_id, uid)
     if label:
@@ -893,33 +1020,29 @@ async def build_confirm_button_for_mygame(uid: int, deal_id: int) -> InlineKeybo
     """
     Возвращает кнопку для карточки «Моих игр»:
       • «🔁 Замена» — если пользователь уже подтвердил участие;
-      • иначе «✅ Подтвердить» с callback `confirm_role_{deal_id}_{role}`.
+      • иначе «✓ Подтвердить» с callback `confirm_participation_{deal_id}_{role}`.
     """
     if await _mg_is_user_confirmed_for_deal(uid, deal_id):
         return InlineKeyboardButton(text="🔁 Замена", callback_data=f"{SWAP_PREFIX}{deal_id}")
 
     role = _assigned_role_from_state(uid, deal_id)
     if role not in {"main", "assist", "admin"}:
+        # Нечего показывать — пользователь не назначен.
         return InlineKeyboardButton(text="noop", callback_data="noop")
 
-    return InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"{CONFIRM_PREFIX}{deal_id}_{role}")
+    return InlineKeyboardButton(
+        text="✓ Подтвердить",
+        callback_data=f"{CONFIRM_PREFIX}{deal_id}_{role}"
+    )
+
 # История изменений [3.2]:
 # • 2025-08-28 — выровнено под SSOT; подтверждение отдаём handlers.confirmations; фиксы Pylance.
 
-# ════════════════════════════════════════════════════════════════════
-# [3.3] NOTIFY: announce_if_all_confirmed — заголовок «как в опросе»: Название — Дата Время Пакет Бонусы
-# ════════════════════════════════════════════════════════════════════
-import logging
-from contextlib import suppress
-from typing import List, Tuple, Optional
 
-from aiogram import Bot
-from core.state import state
-from core.utils import team_bulleted_lines, resolve_notify_chat_id
-from services import amocrm as _amo  # type: ignore
-
-logger = logging.getLogger(__name__)
-
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# [3.3] NOTIFY: announce_if_all_confirmed — заголовок «как в опросе»
+# Название — Дата Время Пакет Бонусы; буллеты по команде из слотов locked_distribution
+# ╚═══════════════════════════════════════════════════════════════════════════╝
 def _normalize_time_str(raw: Optional[str]) -> str:
     """
     Приводит строку времени к формату 'HH:MM'.
@@ -934,14 +1057,10 @@ def _normalize_time_str(raw: Optional[str]) -> str:
     if ":" not in s:
         if not s.isdigit():
             return ""
-        if len(s) == 4:
-            hh, mm = s[:2], s[2:]
-        elif len(s) == 3:
-            hh, mm = s[:1], s[1:]
-        elif len(s) == 2:
-            hh, mm = s, "00"
-        else:
-            hh, mm = s, "00"
+        if   len(s) == 4: hh, mm = s[:2], s[2:]
+        elif len(s) == 3: hh, mm = s[:1], s[1:]
+        elif len(s) == 2: hh, mm = s, "00"
+        else:             hh, mm = s, "00"
         try:
             return f"{int(hh):02d}:{int(mm):02d}"
         except Exception:
@@ -951,6 +1070,7 @@ def _normalize_time_str(raw: Optional[str]) -> str:
         return f"{int(h or 0):02d}:{int(m or 0):02d}"
     except Exception:
         return ""
+
 
 def _normalize_date_short(raw: Optional[str]) -> str:
     """'YYYY-MM-DD' → 'DD.MM'; 'DD.MM.YYYY' → 'DD.MM'; иначе — как есть."""
@@ -968,6 +1088,7 @@ def _normalize_date_short(raw: Optional[str]) -> str:
             return f"{int(d):02d}.{int(m):02d}"
     return s
 
+
 def _pick_first(d: dict, keys: List[str]) -> str:
     for k in keys:
         v = d.get(k)
@@ -977,6 +1098,7 @@ def _pick_first(d: dict, keys: List[str]) -> str:
         if s:
             return s
     return ""
+
 
 def _title_date_time(did: int) -> Tuple[str, str, str, str, str]:
     """
@@ -997,48 +1119,32 @@ def _title_date_time(did: int) -> Tuple[str, str, str, str, str]:
         if not title:
             title = str(d.get("game_name") or d.get("name") or d.get("title") or "").strip()
 
-        # дата/время
         dt = d.get("event_datetime")
         if not date_s:
             if hasattr(dt, "strftime"):
                 date_s = dt.strftime("%d.%m")
             else:
                 date_s = _normalize_date_short(_pick_first(d, ["event_date", "date", "eventDate", "game_date"]))
-        # источники времени (широкий список, чтобы совпасть с опросом)
+
         if not time_s:
-            # приоритет: явные time-поля
             time_raw = _pick_first(
                 d,
                 [
-                    "event_time",
-                    "time",
-                    "time_start",
-                    "start_time",
-                    "slot_time",
-                    "begin_time",
-                    "game_time",
-                    "startAt",
-                    "start_at",
-                    "start",
+                    "event_time", "time", "time_start", "start_time", "slot_time",
+                    "begin_time", "game_time", "startAt", "start_at", "start",
                 ],
             )
             if time_raw:
                 time_s = _normalize_time_str(time_raw)
             elif hasattr(dt, "strftime"):
                 t_dt = dt.strftime("%H:%M")
-                # Если время в dt = 00:00 — пробуем альтернативные поля-строки
                 if t_dt != "00:00":
                     time_s = t_dt
 
-        # пакет/бонусы (как в опросе)
         if not package_s:
-            package_s = str(
-                _pick_first(d, ["package_human", "package_short", "package", "pkg", "tariff"])
-            ).strip()
+            package_s = str(_pick_first(d, ["package_human", "package_short", "package", "pkg", "tariff"])).strip()
         if not bonus_s:
-            bonus_s = str(
-                _pick_first(d, ["bonus_human", "bonuses", "bonus", "extra_bonuses", "extra_services"])
-            ).strip()
+            bonus_s = str(_pick_first(d, ["bonus_human", "bonuses", "bonus", "extra_bonuses", "extra_services"])).strip()
 
     # 1) текущий снапшот опроса
     with suppress(Exception):
@@ -1055,13 +1161,13 @@ def _title_date_time(did: int) -> Tuple[str, str, str, str, str]:
                 or {}
             _apply_from(meta)
 
-    # 3) distribution_cache (снимок опроса на уровне сделки)
+    # 3) distribution_cache
     if not (title and date_s and time_s and package_s and bonus_s):
         with suppress(Exception):
             snap = (getattr(state, "distribution_cache", {}) or {}).get(str(did)) or {}
             _apply_from(snap)
 
-    # 4) games_by_user (как резерв, если отчёт уже подмели)
+    # 4) games_by_user
     if not (title and date_s and time_s and package_s and bonus_s):
         with suppress(Exception):
             for _, arr in (getattr(state, "games_by_user", {}) or {}).items():
@@ -1071,6 +1177,7 @@ def _title_date_time(did: int) -> Tuple[str, str, str, str, str]:
                         raise StopIteration
 
     return title, date_s, time_s, package_s, bonus_s
+
 
 async def _status_info_for(did: int) -> Tuple[Optional[str], str]:
     """
@@ -1101,313 +1208,194 @@ async def _status_info_for(did: int) -> Tuple[Optional[str], str]:
 
     return (None, "")
 
+
 async def announce_if_all_confirmed(deal_id: int) -> None:
     """
-    Шлёт одноразовое уведомление в рабочий чат, что все назначенные роли подтвердили участие.
-    Идемпотентность: на один deal_id — не более одного уведомления за сессию.
-    Если подтверждения по ролям ещё не полные — тихо выходим.
-    Для «Предварительной заявки» добавляется строка-предупреждение с эмодзи.
+    Отправляет в чат уведомление, когда все участники подтвердили участие.
+    Заголовок и метаданные — «как в опросе», список команды — по зафиксированным слотам.
     """
     try:
         did = int(deal_id)
     except Exception:
         return
 
+    # Повторные уведомления не шлём
+    announced: set[int] = state.__dict__.setdefault("_all_confirmed_announced", set())  # type: ignore[assignment]
+    if did in announced:
+        return
+
+    # Проверка: все обязательные подтверждены?
     try:
-        # антидубли на время жизни процесса
-        announced: set[int] = state.__dict__.setdefault("_all_confirmed_announced", set())  # type: ignore[assignment]
-        if did in announced:
-            return
+        from handlers.confirmations import _all_required_confirmed  # type: ignore
+    except Exception:
+        _all_required_confirmed = None  # type: ignore
+    if not callable(_all_required_confirmed) or not await _all_required_confirmed(did):  # type: ignore[misc]
+        return
 
-        # проверка полноты подтверждений — используем логику из handlers.confirmations
-        try:
-            from handlers.confirmations import _all_required_confirmed  # type: ignore
-        except Exception:
-            _all_required_confirmed = None  # type: ignore
-        if not callable(_all_required_confirmed) or not await _all_required_confirmed(did):  # type: ignore[misc]
-            return
+    # Слоты команды
+    slots = (
+        (getattr(state, "locked_distribution", {}) or {}).get(did)
+        or (getattr(state, "locked_distribution", {}) or {}).get(str(did))
+        or {}
+    )
+    if not isinstance(slots, dict) or not slots:
+        return
 
-        # состав печатаем по зафиксированному распределению (locked_distribution)
-        slots = (
-            (getattr(state, "locked_distribution", {}) or {}).get(did)
-            or (getattr(state, "locked_distribution", {}) or {}).get(str(did))
-            or {}
-        )
-        if not isinstance(slots, dict) or not slots:
-            return
-        lines: List[str] = await team_bulleted_lines(slots)
+    # Заголовок и мета
+    title, date_s, time_s, package_s, bonus_s = _title_date_time(did)
 
-        # заголовок/дата/время/пакет/бонусы (как в опросе; без фолбэка на ID и без лишнего «—»)
-        title, date_s, time_s, package_s, bonus_s = _title_date_time(did)
-        tail = " ".join(x for x in (date_s, time_s, package_s, bonus_s) if x).strip()
-        if title:
-            head = f"🎉 {title}" + (f" — {tail}" if tail else "")
-        else:
-            head = f"🎉 — {tail}" if tail else ""
+    # Данные о возможной замене (для пометки «Спасибо за отклик!»)
+    replacements = getattr(state, "swap_replacements", {}) or {}
+    repl_entry = replacements.get(did) or replacements.get(str(did)) or {}
+    candidate_uid: Optional[int] = None
+    candidate_role: Optional[str] = None
+    if isinstance(repl_entry, dict):
+        with suppress(Exception):
+            candidate_uid = int(repl_entry.get("candidate"))
+        raw_role = repl_entry.get("role")
+        candidate_role = str(raw_role) if isinstance(raw_role, str) else None
 
-        # статус (для предупреждения при «Предварительной заявке»)
-        sid, name_lower = await _status_info_for(did)
-        prelim_id = str(globals().get("PRELIM_STATUS_ID", "") or "")
-        is_prelim = (prelim_id and sid and str(sid) == prelim_id) or (
-            name_lower in {"предварительная заявка", "предварительно", "предварит."}
-        )
+    # Порядок ролей и эмодзи
+    emoji_map: Dict[str, str] = {
+        "main": "🎤",
+        "assist": "🧑‍🤝‍🧑",
+        "admin": "🛡️",
+        "trainee": "👷",
+    }
 
-        # куда слать
-        bot = Bot.get_current()
-        try:
-            chat_id = resolve_notify_chat_id(bot)  # предпочтительная сигнатура
-        except TypeError:
-            chat_id = resolve_notify_chat_id()     # фолбэк для старых сборок
-        if chat_id is None:
-            logger.warning("[my_games] notify chat not resolved; skip announce")
-            return
+    def _role_for_slot(slot_key: str) -> str:
+        if slot_key.startswith("lead"):
+            return "main"
+        if slot_key.startswith("assistant"):
+            return "assist"
+        if slot_key == "admin":
+            return "admin"
+        if slot_key == "trainee":
+            return "trainee"
+        return ""
 
-        # текст уведомления
-        parts: List[str] = ["✅ Вся команда подтвердила участие."]
-        if head:
-            parts.append(head)
-        if lines:
-            parts.append("\n".join(lines))
-        if is_prelim:
-            parts.append("⚠️ Это *предварительная заявка*. Игра не гарантирована. Ждём предоплату.")
-        text = "\n".join(p for p in parts if p)
+    ordered_keys: List[str] = []
+    ordered_keys += [k for k in sorted(slots.keys()) if str(k).startswith("lead")]
+    ordered_keys += [k for k in sorted(slots.keys()) if str(k).startswith("assistant")]
+    if "admin" in slots:
+        ordered_keys.append("admin")
+    if "trainee" in slots:
+        ordered_keys.append("trainee")
 
-        await bot.send_message(chat_id, text)
-        announced.add(did)
-    except Exception as e:
-        logger.warning("[my_games] announce_if_all_confirmed failed for deal=%s: %s", deal_id, e)
+    # Список участников
+    lines: List[str] = []
+    for slot_key in ordered_keys:
+        raw = slots.get(slot_key)
+        values = raw if isinstance(raw, list) else [raw]
+        for item in values:
+            if not item:
+                continue
+            label = str(item).split("|", 1)[0].strip()
+            if not label:
+                continue
+            uid_val: Optional[int] = None
+            with suppress(Exception):
+                parsed = list(map(int, to_uid_list(item)))
+                if parsed:
+                    uid_val = parsed[0]
+            role_key = _role_for_slot(str(slot_key))
+            is_candidate = (
+                candidate_uid is not None
+                and uid_val is not None
+                and int(uid_val) == int(candidate_uid)
+            )
+            if is_candidate:
+                emoji = emoji_map.get(candidate_role or role_key, "")
+                suffix = f" {emoji}" if emoji else ""
+                lines.append(f"• {label} Спасибо за отклик!{suffix}")
+            else:
+                lines.append(f"• {label}")
+
+    # Шапка
+    date_time = " ".join(part for part in [date_s, time_s] if part).strip()
+    extras = " ".join(part for part in [package_s, bonus_s] if part).strip()
+    meta_parts = [p for p in [date_time, extras] if p]
+    header_tail = " ".join(meta_parts).strip()
+    header = f"🎉 {title}" + (f" — {header_tail}" if header_tail else "")
+
+    # Сообщение
+    parts = [
+        "✅ Вся команда подтвердила участие.",
+        header,
+    ]
+    parts.extend(lines)
+    message_text = "\n".join(part for part in parts if part)
+
+    # Чат для уведомления
+    bot = Bot.get_current()
+    try:
+        chat_id = resolve_notify_chat_id(bot)
+    except TypeError:
+        chat_id = resolve_notify_chat_id()
+    if chat_id is None:
+        return
+
+    await bot.send_message(chat_id, message_text)
+
+    # Помечаем, что сообщили
+    announced.add(did)
+
+    # Флаг в swap_replacements (если был кандидат)
+    if isinstance(repl_entry, dict):
+        repl_entry["confirmed"] = True
+        replacements[int(did)] = repl_entry
+        state.swap_replacements = replacements  # type: ignore[attr-defined]
 
 # История изменений [3.3]:
-# • 2025-09-02 — заголовок дополнен временем и бонусами, источники времени расширены (event_time/time/start_time/...),
-#                 формат ровно как в опросе: «🎉 Название — ДД.MM HH:MM Пакет Бонусы», без фолбэка «Сделка #ID».
+# • 2025-09-05 — дописан и очищен блок: убран дублирующийся код, починены переводы строк,
+#                аккуратно собраны заголовок/мета/список; безопасный резолв чата уведомлений.
 
-
-# ════════════════════════════════════════════════════════════════════
-# [3.4] Дашборд «Мои игры» — мягкий редрав и кнопки действий
-# Версия 3.4.6 · 2025-09-05 (фикс: «✅ Подтверждено» до SUCCESS; «Замена» только на SUCCESS)
-# ════════════════════════════════════════════════════════════════════
-import logging
-from contextlib import suppress
-from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING, Callable, cast
-
-from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-
-from core.state import state
-
-# Заглушка для Pylance: во время type-check иметь сигнатуру функции из [1.4].
-if TYPE_CHECKING:
-    def get_my_games_dashboard(uid: int) -> Optional[int]: ...
-else:
-    # Рантайм-шим: всегда берём актуальную реализацию из globals()
-    def get_my_games_dashboard(uid: int) -> Optional[int]:
-        f = globals().get("get_my_games_dashboard")
-        if f is not None and f is not get_my_games_dashboard:
-            try:
-                return cast(Callable[[int], Optional[int]], f)(uid)
-            except Exception:
-                return None
-        return None
-
-logger = logging.getLogger(__name__)
-
-
-def _role_human(role: Optional[str]) -> str:
-    m = {"main": "Ведущий", "assist": "Помощник", "admin": "Админ", "trainee": "Стажёр"}
-    return m.get((role or "").lower(), "Роль")
-
-
-def _deal_meta(did: int) -> Tuple[str, str, str, str]:
-    """
-    Возвращает (title, date_s, time_s, pkg).
-    Источники: state.current_poll_deals → state.deals_index.
-    """
-    title, date_s, time_s, pkg = f"Сделка #{did}", "", "", ""
-    with suppress(Exception):
-        for d in (state.current_poll_deals or []):
-            if int(d.get("id") or 0) == int(did):
-                title = str(d.get("game_name") or d.get("name") or title)
-                if d.get("event_datetime") and hasattr(d["event_datetime"], "strftime"):
-                    date_s = d["event_datetime"].strftime("%d.%m.%Y")
-                    time_s = d["event_datetime"].strftime("%H:%M")
-                else:
-                    date_s = str(d.get("event_date") or "")
-                    time_s = str(d.get("event_time") or "")
-                pkg = str(d.get("package") or "")
-                return title, date_s, time_s, pkg
-    with suppress(Exception):
-        meta = (getattr(state, "deals_index", {}) or {}).get(did) \
-            or (getattr(state, "deals_index", {}) or {}).get(str(did)) \
-            or {}
-        title = str(meta.get("title") or title)
-        date_s = str(meta.get("date") or "")
-        time_s = str(meta.get("time") or "")
-        pkg = str(meta.get("package") or "")
-    return title, date_s, time_s, pkg
-
-
-def _is_locally_confirmed_for_redraw(did: int, uid: int) -> bool:
-    """
-    Локальная отметка подтверждения (фолбэк, когда CRM-теги ещё не потянулись).
-    Используем pending_confirmations/confirmed.
-    """
-    pc = (getattr(state, "pending_confirmations", {}) or {}).get(int(did), {}) or {}
-    with suppress(Exception):
-        conf = pc.get("confirmed") or {}
-        if isinstance(conf, dict):
-            for k in ("main", "assist", "admin", "trainee"):
-                s = conf.get(k) or set()
-                if isinstance(s, set) and int(uid) in s:
-                    return True
-        elif isinstance(conf, set):
-            return int(uid) in conf
-    with suppress(Exception):
-        confirmed = (getattr(state, "confirmed", {}) or {}).get(int(did)) or set()
-        return int(uid) in confirmed
-    return False
-
-
-def _report_available_for(deal_id: int) -> bool:
-    """
-    Кнопку «📝 Написать отчёт» показываем после наступления даты/времени игры.
-    Берём event_datetime из того же снапшота, что использовали при отрисовке.
-    """
-    with suppress(Exception):
-        for d in (getattr(state, "games_by_user", {}) or {}).get(int(getattr(state, "report_uid_hint", 0)), []):
-            if int(d.get("id") or 0) == int(deal_id):
-                dt = globals().get("_safe_event_dt", lambda *_: None)(d)  # type: ignore
-                if dt:
-                    from datetime import datetime as _dt
-                    now = _dt.now(dt.tzinfo) if dt.tzinfo else _dt.now()
-                    return now >= dt
-    with suppress(Exception):
-        for d in (state.current_poll_deals or []):
-            if int(d.get("id") or 0) == int(deal_id):
-                dt = globals().get("_safe_event_dt", lambda *_: None)(d)  # type: ignore
-                if dt:
-                    from datetime import datetime as _dt
-                    now = _dt.now(dt.tzinfo) if dt.tzinfo else _dt.now()
-                    return now >= dt
-    return False
-
-
-def _build_dashboard_kb(uid: int, deals_sorted: List[Dict]) -> InlineKeyboardMarkup:
-    """
-    Собирает разметку дашборда: на каждую игру — строка деталей и строка действия
-    («✅ Подтвердить» / «🔁 Замена»). «📝 Написать отчёт» — отдельной строкой при наступлении даты.
-    Логика полностью локальная, без внешних хелперов.
-    """
-    from core.config import settings as _cfg
-    from core.utils import truncate as _trunc
-
-    BRON_ID: str = str(getattr(_cfg, "BRON_STATUS_ID", ""))
-    OK_ID: str = str(getattr(_cfg, "SUCCESSFUL_STATUS_ID", ""))
-    PRELIM_ID: str = str(getattr(_cfg, "PRELIM_STATUS_ID", getattr(_cfg, "PRELIMINARY_STATUS_ID", "")) or "")
-
-    _safe_title = cast(Callable[[Dict[str, Any]], str], globals().get("_safe_title", lambda d: str(d.get("name") or "")))  # type: ignore
-    _safe_event_dt = cast(Callable[[Dict[str, Any]], Optional["datetime"]], globals().get("_safe_event_dt", lambda *_: None))  # type: ignore
-    _safe_status_id = cast(Callable[[Dict[str, Any]], str], globals().get("_safe_status_id", lambda d: str(d.get("status_id") or "")))  # type: ignore
-    _has_confirmation_tag = cast(Callable[[Dict[str, Any], int], bool], globals().get("_has_confirmation_tag"))  # type: ignore
-    _assigned_role_from_state = cast(Callable[[int, int], Optional[str]], globals().get("_assigned_role_from_state"))  # type: ignore
-
-    kb = InlineKeyboardBuilder()
-
-    for d in deals_sorted:
-        did = int(d.get("id") or 0)
-        title = _trunc(_safe_title(d), 28)
-        dt = _safe_event_dt(d)
-        # Исправлено: корректный формат даты с латинской 'm'
-        date = dt.strftime("%d.%m") if dt else "??.??"
-
-        sid = _safe_status_id(d)
-        name = str(d.get("status_name") or d.get("status") or "").strip().lower()
-        prelim_names = {"предварительная заявка", "предварительно", "предварит."}
-        if (PRELIM_ID and sid == PRELIM_ID) or (name in prelim_names):
-            status = "Предвар."
-        else:
-            status = "Бронь" if sid == BRON_ID else "Заверш."
-
-        # строка с деталями
-        kb.button(
-            text=f"ℹ️ {title} · {date} · {status}",
-            callback_data=f"{globals().get('DETAILS_PREFIX','mygame_details_')}{did}"
-        )
-
-        # состояние подтверждения
-        confirmed = (_has_confirmation_tag(d, uid) if callable(_has_confirmation_tag) else False) or _is_locally_confirmed_for_redraw(did, uid)  # type: ignore
-        role = _assigned_role_from_state(uid, did) if callable(_assigned_role_from_state) else None
-
-        # строка действия (фикс логики)
-        if sid == OK_ID:
-            kb.row(InlineKeyboardButton(
-                text="🔁 Замена",
-                callback_data=f"{globals().get('SWAP_PREFIX','mygame_swap_')}{did}"
-            ))
-        elif confirmed:
-            kb.row(InlineKeyboardButton(text="✅ Подтверждено", callback_data="mygame_noop"))
-        elif role in {"main", "assist", "admin"} and (sid == BRON_ID or status == "Предвар."):
-            kb.row(InlineKeyboardButton(
-                text="✅ Подтвердить",
-                callback_data=f"{globals().get('CONFIRM_PREFIX','confirm_role_')}{did}_{role}"
-            ))
-
-        # «Отчёт» — отдельной строкой при наступлении даты/времени
-        if _report_available_for(did):  # type: ignore
-            kb.row(InlineKeyboardButton(text="📝 Написать отчёт", callback_data=f"{globals().get('REPORT_PREFIX','mygame_report_')}{did}"))
-
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-async def _soft_redraw_my_games(uid: int) -> None:
-    """
-    МЯГКИЙ редрав «Моих игр»: заменяем только reply_markup.
-    Если в кэше нет сообщения — используем sticky-id из [1.4].
-    """
-    try:
-        if (getattr(state, "ui_context", {}) or {}).get(int(uid)) != "my_games":
-            logger.debug("[my_games] skip soft redraw: context not my_games (uid=%s)", uid)
-            return
-
-        header = (getattr(state, "last_user_messages", {}) or {}).get(int(uid), [None])[0]
-        header_mid: Optional[int] = None
-        if header and getattr(header, "message_id", None):
-            header_mid = int(header.message_id)
-        if not header_mid and callable(get_my_games_dashboard):
-            # фолбэк к sticky-id
-            with suppress(Exception):
-                header_mid = get_my_games_dashboard(int(uid))  # type: ignore[misc]
-
-        if not header_mid:
-            logger.debug("[my_games] skip soft redraw: no header/sticky message id")
-            return
-
-        deals_sorted = (getattr(state, "games_by_user", {}) or {}).get(int(uid), [])
-        if not deals_sorted:
-            logger.debug("[my_games] skip soft redraw: no cached deals for uid=%s", uid)
-            return
-
-        state.report_uid_hint = int(uid)
-
-        bot = Bot.get_current()
-        markup = _build_dashboard_kb(int(uid), deals_sorted)
-        await bot.edit_message_reply_markup(chat_id=int(uid), message_id=int(header_mid), reply_markup=markup)
-    except Exception as e:
-        logger.warning("[my_games] soft redraw failed for uid=%s: %s", uid, e)
-
-
-# ════════════════════════════════════════════════════════════════════
+# ╔═══════════════════════════════════════════════════════════════════════════╗
 # [4] ВЫБОРКА ИГР
-# ════════════════════════════════════════════════════════════════════
+# ╚═══════════════════════════════════════════════════════════════════════════╝
 from typing import Any, Dict, List, Optional, Set
 import logging
+from contextlib import suppress
 
 from core.config import settings
 from core.state import state
 from core.utils import assigned_role_from_state  # SSOT: присутствует для совместимости
 
+# Локальная таймзона для сортировки дат (не зависящая от внешних модулей)
+from pytz import timezone as _tz
+try:
+    _TZ_NAME: str = (getattr(settings, "TIMEZONE", None) or "Europe/Moscow")
+except Exception:
+    _TZ_NAME = "Europe/Moscow"
+LOCAL_TZ = _tz(_TZ_NAME)
+
 logger = logging.getLogger(__name__)
+
+# Безопасный доступ к внешним хелперам (если не определены выше — даём совместимый фолбэк)
+with suppress(Exception):
+    _label_belongs_to_uid = globals().get("_label_belongs_to_uid")
+if not callable(globals().get("_label_belongs_to_uid")):
+    import re
+    def _label_belongs_to_uid(label: str, uid: int) -> bool:  # type: ignore[override]
+        """
+        Фолбэк: пытаемся извлечь user_id из подписи слота.
+        Совместим с формами вида 'Имя | 123456' или 'Имя (123456)'.
+        """
+        s = str(label or "")
+        nums = re.findall(r"\d+", s)
+        return str(int(uid)) in nums
+
+with suppress(Exception):
+    _safe_status_id = globals().get("_safe_status_id")
+if not callable(globals().get("_safe_status_id")):
+    def _safe_status_id(deal: Dict[str, Any]) -> str:  # type: ignore[override]
+        return str(deal.get("status_id") or deal.get("pipeline_status_id") or "")
+
+with suppress(Exception):
+    _safe_event_dt = globals().get("_safe_event_dt")
+if not callable(globals().get("_safe_event_dt")):
+    def _safe_event_dt(deal: Dict[str, Any]):
+        return deal.get("event_datetime")  # может быть None/naive/aware — учитывается на месте
 
 
 def _success_status_id() -> str:
@@ -1442,40 +1430,33 @@ def _prelim_status_id() -> str:
 def _wanted_status(deal: Dict) -> bool:
     """
     Игра попадает в «Мои игры», если её статус один из допустимых:
-    • «Бронь» (settings.BRON_STATUS_ID),
-    • «Предварительная заявка» (settings.PRELIM_STATUS_ID или по названию),
-    • «Завершение сделки» (settings.SUCCESSFUL_STATUS_ID или по названию).
+      • «Бронь» (settings.BRON_STATUS_ID),
+      • «Завершение сделки» (settings.SUCCESSFUL_STATUS_ID).
 
-    Если статус не распознан — фолбэк «Бронь».
+    Остальные статусы скрываются из раздела.
     """
     try:
-        sid_any = _safe_status_id(deal)  # определена выше в файле
+        sid_any = _safe_status_id(deal)  # type: ignore[misc]
     except Exception:
         sid_any = None
 
-    bron_id = str(getattr(settings, "BRON_STATUS_ID", ""))
-    prelim_id = _prelim_status_id()
-    success_id = _success_status_id()
+    bron_id = str(getattr(settings, "BRON_STATUS_ID", "") or "")
+    success_id = str(getattr(settings, "SUCCESSFUL_STATUS_ID", "") or "")
 
-    sid = str(sid_any or bron_id)
+    sid = str(sid_any or "").strip()
     name = str(deal.get("status_name") or deal.get("status") or "").strip().lower()
 
-    prelim_names = {"предварительная заявка", "предварительно", "предварит.", "предварит", "prelim"}
-    success_names = {"завершение сделки", "успешно реализовано", "успешно", "завершена"}
+    success_names = {"завершение сделки", "успешно реализовано", "успешно", "заверш."}
 
-    if sid == bron_id:
-        return True
-    if prelim_id and sid == prelim_id:
+    if bron_id and sid == bron_id:
         return True
     if success_id and sid == success_id:
         return True
-    if name in prelim_names:
+    if not sid and bron_id and name.startswith("брон"):
         return True
     if name in success_names:
         return True
-
-    # фолбэк: неизвестный → считаем «Бронь»
-    return sid == bron_id
+    return False
 
 
 def _assigned_deal_ids_from_locked(uid: int) -> Set[int]:
@@ -1499,7 +1480,7 @@ def _assigned_deal_ids_from_locked(uid: int) -> Set[int]:
                 continue
             if k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"}:
                 if isinstance(v, str):
-                    if _label_belongs_to_uid(v, uid):  # определена выше
+                    if _label_belongs_to_uid(v, uid):  # определена выше/фолбэк
                         out.add(did)
                         break
                 elif isinstance(v, (list, tuple)):
@@ -1519,7 +1500,7 @@ def _assigned_role_via_locked(uid: int, deal_id: int) -> Optional[str]:
     """
     # Вызов SSOT-хелпера сохраняем для совместимости/телеметрии, но решение принимаем по locked.
     try:
-        _ = assigned_role_from_state(uid, deal_id)  # не используем результат, полагаемся на locked
+        _ = assigned_role_from_state(uid, deal_id)  # не используем результат
     except Exception:
         pass
 
@@ -1689,6 +1670,9 @@ def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
 
     out: List[Dict] = []
     seen: Set[int] = set()
+    swap_requests = getattr(state, "swap_requests", {}) or {}
+    if not isinstance(swap_requests, dict):
+        swap_requests = {}
 
     def _to_epoch(dt_obj):
         try:
@@ -1696,13 +1680,12 @@ def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
                 return float("inf")
             if getattr(dt_obj, "tzinfo", None):
                 return dt_obj.timestamp()
-            # локализуем «наивное» время в МСК для стабильной сортировки
-            return dt_obj.replace(tzinfo=MSK_TZ).timestamp()
+            return LOCAL_TZ.localize(dt_obj).timestamp()
         except Exception:
             return float("inf")
 
     def _key(d: Dict):
-        dt = _safe_event_dt(d)
+        dt = _safe_event_dt(d)  # type: ignore[misc]
         return (dt is None, _to_epoch(dt))
 
     for d in sorted(all_deals, key=_key):
@@ -1712,17 +1695,39 @@ def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
             continue
         if not did or did in seen:
             continue
-        # не показываем удалённые сделки
         if bool(d.get("is_deleted")):
             continue
         if not _wanted_status(d):
             continue
 
-        # Единственный валидный критерий — утверждение через locked_distribution ∪ finished_locked_distribution
-        if not _assigned_role_via_locked(uid, did):
+        swap_req: Optional[Dict[str, Any]] = None
+        if swap_requests:
+            raw_req = swap_requests.get(did) or swap_requests.get(str(did))
+            if isinstance(raw_req, dict):
+                swap_req = raw_req
+
+        pending_state: Optional[str] = None
+        if swap_req:
+            try:
+                is_author = int(str(swap_req.get("by"))) == int(uid)
+            except Exception:
+                is_author = False
+            if is_author:
+                if swap_req.get("awaiting_confirmation"):
+                    pending_state = "awaiting"
+                elif not swap_req.get("accepted_by"):
+                    pending_state = "search"
+
+        role_locked = _assigned_role_via_locked(uid, did)
+        if not role_locked and not pending_state:
             continue
 
-        out.append(d)
+        row = d
+        if pending_state:
+            row = dict(d)
+            row["_pending_swap"] = pending_state
+
+        out.append(row)
         seen.add(did)
 
     if logger.isEnabledFor(logging.DEBUG):
@@ -1731,32 +1736,14 @@ def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
     return out
 
 
-# История изменений [4]:
-# • 2025-08-31 — учитываем union(active+finished) для want_ids и определения роли; добавлен DEBUG-лог
-#                '[my_games] augment_with_locked: using union(active+finished), want_ids=...'.
-# • 2025-08-31 — не показываем удалённые сделки (is_deleted); выровнено под SSOT/фиксы Pylance.
-# • 2025-08-30 — добавлен статус «Предварительная заявка» (ID + текстовые синонимы);
-#                выборка жёстко ограничена только locked_distribution; фиксы Pylance.
-# • 2025-08-29 — безопасная сортировка по timestamp (naive/aware); распознавание success-name.
-# • 2025-08-24 — дедупликация и коллекции в слотах; отладочный лог augment_with_locked.
-# • 2025-08-19 — учёт слотов без «|uid» + фолбэк по ярлыку.
-
-
-
-# ════════════════════════════════════════════════════════════════════
-# [4.1] Backward compatibility (for handlers.profile import)
-# ════════════════════════════════════════════════════════════════════
 def _my_games(uid: int, deals: List[Dict]) -> List[Dict]:
     """Совместимость со старыми модулями (handlers.profile)."""
     return _visible_deals_for_user(uid, deals)
 
 
 
-
-
-# ════════════════════════════════════════════════════════════════════
+## ╔═══════════════════════════════════════════════════════════════════════════╗
 # ███ [5] DASHBOARD / DETAILS — липкий дашборд + пылесос как в отчёте
-# ════════════════════════════════════════════════════════════════════
 # Версия 5.11.2 · 2025-09-06 (quiet-confirm + menu-safe, no-redraw, global vacuum keep)
 # Что изменено:
 # • При нажатии «✅ Подтвердить» дашборд НЕ удаляется — выполняется тихая перекраска
@@ -1766,10 +1753,11 @@ def _my_games(uid: int, deals: List[Dict]) -> List[Dict]:
 #   – добавлено в глобальный и локальный keep_for_vacuum;
 #   – _vacuum_safe всегда включает его в keep;
 #   – _vacuum_poll_details_blocks исключает его из удаления.
-# • ГЛОБАЛЬНО: пропатчен core.utils.vacuum_private — к любому keep он ДОБАВЛЯЕТ sticky «Мои игры»
+# • ГЛОБАЛЬНО: пропачен core.utils.vacuum_private — к любому keep он ДОБАВЛЯЕТ sticky «Мои игры»
 #   и сообщение ГЛАВНОГО МЕНЮ (даже если вызывающий модуль их не передал).
 # • «Без редрава»: в mygames_after_confirm_ui_patch/mysuccess_ui_patch никогда не пересоздаём sticky;
 #   только edit_message_reply_markup. Восстановление sticky — через эвристику в update_my_games_buttons_only().
+# ╚═══════════════════════════════════════════════════════════════════════════╝
 import logging
 from contextlib import suppress
 from typing import Any, Dict, List, Optional, TYPE_CHECKING, Callable, cast, Set, Tuple
@@ -1922,7 +1910,7 @@ try:
 except Exception as e:
     logger.warning("[my_games.keep_patch] cannot patch core.utils.vacuum_private: %s", e)
 
-# ── sticky-реестр дашборда ──────────────────────────────────────────
+# ── sticky-реестр дашборда ───────────────────────────────────────────────────
 if not hasattr(state, "my_games_dashboard"):
     # uid -> message_id
     state.my_games_dashboard: Dict[int, int] = {}  # type: ignore[attr-defined]
@@ -1970,7 +1958,7 @@ def keep_for_vacuum(uid: int, *extra_msg_ids: int) -> List[int]:
     logger.debug("[my_games.vacuum] keep_for_vacuum(uid=%s) -> keep_ids=%s", uid, keep)
     return keep
 
-# ── локальный флаг подтверждения для «тихой» перекраски ─────────────
+# ── локальный флаг подтверждения для «тихой» перекраски ─────────────────────
 if not hasattr(state, "mygames_local_confirm"):
     # ключ: (uid, deal_id) -> bool
     state.mygames_local_confirm: Dict[Tuple[int, int], bool] = {}  # type: ignore[attr-defined]
@@ -1988,7 +1976,7 @@ def _mg_local_confirmed(uid: int, deal_id: int) -> bool:
     except Exception:
         return False
 
-# ── внешние хелперы из других блоков (типизированные заглушки) ─────
+# ── внешние хелперы из других блоков (типизированные заглушки) ──────────────
 if TYPE_CHECKING:
     async def _vacuum_poll_details_blocks(uid: int) -> None: ...
     def _safe_event_dt(deal: Dict[str, Any]) -> Optional[datetime]: ...
@@ -2004,7 +1992,7 @@ else:
     make_my_games_confirm_btn_for_row = cast(Callable[[Dict[str, Any], int], Optional[InlineKeyboardButton]], globals().get("make_my_games_confirm_btn_for_row"))  # type: ignore
     make_my_games_swap_btn_for_row   = cast(Callable[[Dict[str, Any], int], Optional[InlineKeyboardButton]], globals().get("make_my_games_swap_btn_for_row"))    # type: ignore
 
-# ── подавление keep leader report в ядре (если поддерживается) ──────
+# ── подавление keep leader report в ядре (если поддерживается) ───────────────
 class _SuppressLeaderReport:
     def __init__(self, uid: int):
         self.uid = int(uid)
@@ -2024,7 +2012,7 @@ class _SuppressLeaderReport:
         # откат не делаем — ядро обычно снимает флаги само, это снижает гонки
         return False
 
-# ── общий пылесос ЛС (сохраняет sticky «Мои игры» и ГЛАВНОЕ МЕНЮ) ──
+# ── общий пылесос ЛС (сохраняет sticky «Мои игры» и ГЛАВНОЕ МЕНЮ) ───────────
 async def _vacuum_safe(uid: int, keep: Optional[List[Any]] = None, *, ignore_sticky: bool = False) -> None:
     """
     Пылесос ЛС для «Моих игр».
@@ -2110,83 +2098,72 @@ async def _vacuum_safe(uid: int, keep: Optional[List[Any]] = None, *, ignore_sti
                 await res3
             logger.debug("[my_games.vacuum] post-clean poll_details/report done (legacy) for uid=%s", uid)
 
-# ── построение клавиатуры дашборда (v2) ─────────────────────────────
+# ── построение клавиатуры дашборда (v2) ──────────────────────────────────────
 def _build_dashboard_kb_v2(uid: int, deals_sorted: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
-    """
-    Кнопки «✅ Подтвердить»/«🔁 Замена» строятся локально по SSOT:
-    • «✅ Подтверждено» — до SUCCESS (по тегу/локальному флагу);
-    • «🔁 Замена» — только на SUCCESS.
-    """
+    """Вариант клавиатуры для альтернативных представлений (минимальный вид)."""
     from core.config import settings as _cfg
-    BRON_ID: str   = str(getattr(_cfg, "BRON_STATUS_ID", ""))
-    OK_ID: str     = str(getattr(_cfg, "SUCCESSFUL_STATUS_ID", ""))
-    PRELIM_ID: str = str(getattr(_cfg, "PRELIM_STATUS_ID", getattr(_cfg, "PRELIMINARY_STATUS_ID", "")) or "")
 
-    _has_confirmation_tag = cast(Callable[[Dict[str, Any], int], bool], globals().get("_has_confirmation_tag"))  # type: ignore
-    _assigned_role_from_state = cast(Callable[[int, int], Optional[str]], globals().get("_assigned_role_from_state"))  # type: ignore
-    _is_locally_confirmed_for_redraw = cast(Callable[[int, int], bool], globals().get("_is_locally_confirmed_for_redraw"))  # type: ignore
-    _report_available_for = cast(Callable[[int], bool], globals().get("_report_available_for"))  # type: ignore
+    BRON_ID: str = str(getattr(_cfg, "BRON_STATUS_ID", "") or "")
+    OK_ID: str = str(getattr(_cfg, "SUCCESSFUL_STATUS_ID", "") or "")
+    PRELIM_ID: str = str(getattr(_cfg, "PRELIM_STATUS_ID", getattr(_cfg, "PRELIMINARY_STATUS_ID", "") or "") or "")
 
     kb = InlineKeyboardBuilder()
 
+    prelim_names = {"предварительная заявка", "предварительно", "предварит."}
+
     for d in deals_sorted:
         did = int(d.get("id") or 0)
-        title = truncate(_safe_title(d), 28)
-        dt = _safe_event_dt(d)
-        date = dt.strftime("%d.%m") if dt else "??.??"
+        title = str(d.get("title") or d.get("name") or d.get("game_name") or "Игра")
+        dt = _safe_event_dt(d) if '_safe_event_dt' in globals() else None  # type: ignore[name-defined]
+        date = dt.strftime("%d.%m") if dt else str(d.get("event_date") or "??.??")
 
-        sid = _safe_status_id(d)
+        sid = str(d.get("status_id") or "")
         name = str(d.get("status_name") or d.get("status") or "").strip().lower()
-        prelim_names = {"предварительная заявка", "предварительно", "предварит."}
-        if (PRELIM_ID and sid == PRELIM_ID) or (name in prelim_names):
-            status = "Предвар."
+        is_prelim = (PRELIM_ID and sid == PRELIM_ID) or (name in prelim_names)
+        pending_flag = d.get("_pending_swap")
+
+        if pending_flag == "awaiting":
+            status_label = "🔁 Ожидает подтверждения замены"
+        elif pending_flag:
+            status_label = "🔁 Идёт поиск замены"
+        elif is_prelim:
+            status_label = "Предварительно"
         else:
-            status = "Бронь" if sid == BRON_ID else "Заверш."
+            status_label = "Бронь" if sid == BRON_ID else "Завершено"
 
         kb.button(
-            text=f"ℹ️ {title} · {date} · {status}",
-            callback_data=f"{globals().get('DETAILS_PREFIX','mygame_details_')}{did}",
+            text=f"ℹ️ {title} · {date} · {status_label}",
+            callback_data=f"{globals().get('DETAILS_PREFIX','mygame_details_')}{did}"
         )
 
-        # состояние подтверждения: локальный флаг → CRM-теги → локальная отметка
-        confirmed = _mg_local_confirmed(uid, did)
-        if not confirmed and callable(_has_confirmation_tag):
+        confirmed = _is_locally_confirmed_for_redraw(did, uid) if callable(globals().get("_is_locally_confirmed_for_redraw")) else _mg_local_confirmed(uid, did)
+        role = None
+        _role_fn = globals().get('_assigned_role_from_state')
+        if not callable(_role_fn):
             with suppress(Exception):
-                confirmed = bool(_has_confirmation_tag(d, uid))
-        if not confirmed and callable(_is_locally_confirmed_for_redraw):
+                from core.utils import assigned_role_from_state as _role_fn  # type: ignore
+        if callable(_role_fn):
             with suppress(Exception):
-                confirmed = bool(_is_locally_confirmed_for_redraw(did, uid))
+                role = _role_fn(uid, did)  # type: ignore[misc]
 
-        # роль из зафиксированного распределения
-        role: Optional[str] = None
-        if callable(_assigned_role_from_state):
-            with suppress(Exception):
-                role = _assigned_role_from_state(uid, did)
-
-        # строка действия
-        if sid == OK_ID:
-            kb.row(InlineKeyboardButton(
-                text="🔁 Замена",
-                callback_data=f"{globals().get('SWAP_PREFIX','mygame_swap_')}{did}"
-            ))
-        elif confirmed:
-            kb.row(InlineKeyboardButton(text="✅ Подтверждено", callback_data="mygame_noop"))
-        elif role in {"main", "assist", "admin"} and (sid == BRON_ID or status == "Предвар."):
-            kb.row(InlineKeyboardButton(
-                text="✅ Подтвердить",
-                callback_data=f"{globals().get('CONFIRM_PREFIX','confirm_role_')}{did}_{role}",
-            ))
-
-        # «Отчёт» — отдельной строкой при наступлении доступности
-        if callable(_report_available_for):
-            with suppress(Exception):
-                if _report_available_for(did):
-                    kb.row(InlineKeyboardButton(text="📝 Написать отчёт", callback_data=f"{globals().get('REPORT_PREFIX','mygame_report_')}{did}"))
+        if not pending_flag:
+            if sid == OK_ID:
+                kb.row(InlineKeyboardButton(
+                    text="🔁 Замена",
+                    callback_data=f"{globals().get('SWAP_PREFIX','mygame_swap_')}{did}"
+                ))
+            elif confirmed:
+                kb.row(InlineKeyboardButton(text="✅ Участие подтверждено", callback_data="mygame_noop"))
+            elif role in {"main", "assist", "admin"} and (sid == BRON_ID or is_prelim):
+                kb.row(InlineKeyboardButton(
+                    text="✅ Подтвердить",
+                    callback_data=f"{globals().get('CONFIRM_PREFIX','confirm_participation_')}{did}_{role}"
+                ))
 
     kb.adjust(1)
     return kb.as_markup()
 
-# ── «тихая» перекраска только кнопок текущего дашборда ──────────────
+# ── «тихая» перекраска только кнопок текущего дашборда ──────────────────────
 async def update_my_games_buttons_only(uid: int, markup: InlineKeyboardMarkup | None) -> Optional[int]:
     """
     Тихая перекраска инлайн-клавиатуры sticky-дашборда.
@@ -2218,11 +2195,11 @@ async def update_my_games_buttons_only(uid: int, markup: InlineKeyboardMarkup | 
 
     with suppress(Exception):
         await Bot.get_current().edit_message_reply_markup(chat_id=int(uid), message_id=int(mid), reply_markup=markup)
-        await _vacuum_safe(int(uid), keep=[mid])  # мягкий подмет: сохранить sticky, убрать хвосты/репорт
+        await _vacuum_safe(int(uid), keep=[mid])  # мягкий подмёт: сохранить sticky, убрать хвосты/репорт
         return int(mid)
     return None
 
-# ── основной вывод/обновление дашборда ──────────────────────────────
+# ── основной вывод/обновление дашборда ───────────────────────────────────────
 async def _send_dashboard(uid: int, deals: List[Dict[str, Any]]) -> None:
     """
     Отрисовывает (или обновляет) список игр.
@@ -2298,7 +2275,7 @@ async def _send_dashboard(uid: int, deals: List[Dict[str, Any]]) -> None:
     set_my_games_dashboard(int(uid), int(mid))
     logger.info("[my_games] sticky created: uid=%s mid=%s", uid, mid)
 
-    # (5) После создания — подметём, сохраняя sticky и меню
+    # (5) После создания — подмётём, сохраняя sticky и меню
     await _vacuum_safe(int(uid), keep=[mid])
 
     # Кэши для быстрого редрава/деталей
@@ -2307,7 +2284,7 @@ async def _send_dashboard(uid: int, deals: List[Dict[str, Any]]) -> None:
     (getattr(state, "last_user_messages", {}) or {}).setdefault(int(uid), [])
     state.last_user_messages[int(uid)] = [sent]
 
-# ── детали (fallback, без накопления хвостов) ───────────────────────
+# ── детали (fallback, без накопления хвостов) ────────────────────────────────
 async def _send_details(uid: int, deal: Dict[str, Any]) -> None:
     """
     Детали «Моих игр». Основной рендер — через show_my_game_details(fake_cb), если доступен.
@@ -2349,15 +2326,28 @@ async def _send_details(uid: int, deal: Dict[str, Any]) -> None:
     kb = InlineKeyboardBuilder()
     if OK_ID and sid == OK_ID:
         kb.button(text="🙋 Попросить замену", callback_data=f"{globals().get('SWAP_PREFIX','mygame_swap_')}{deal_id}")
-        kb.row(InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="mygames_back"))
+        kb.row(InlineKeyboardButton(text="↩️ Назад к списку", callback_data="mygames_back"))
     else:
-        kb.button(text="⬅️ Назад к списку", callback_data="mygames_back")
+        kb.button(text="↩️ Назад к списку", callback_data="mygames_back")
 
     await bot.send_message(int(uid), text, reply_markup=kb.as_markup())
 
+
 # [5.2] CROSS-MODULE VACUUM — удаление и обнуление реестров poll/report (модиф.: меню не трогаем)
 from contextlib import suppress
-from typing import Any, Dict, Set
+from typing import Any, Dict, Set, Optional
+import logging
+
+from core.state import state
+from core.menu import get_menu_message_id  # не удаляем главное меню
+
+logger = logging.getLogger(__name__)
+
+# Пытаемся получить доступ к core.utils (там часто лежат leader-report/реестры)
+_cu = None
+with suppress(Exception):
+    import core.utils as _cu  # type: ignore
+
 
 async def _vacuum_poll_details_blocks(uid: int) -> None:
     """
@@ -2376,7 +2366,7 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
             logger.debug("[my_games.vacuum] poll_details: used official API for uid=%s", u)
             # продолжаем best-effort, чтобы убрать leader-report, если API его не трогает
 
-    # ── утилиты ──────────────────────────────────────────────────────
+    # ── утилиты ──────────────────────────────────────────────────────────────
     def _as_int(v: Any) -> Optional[int]:
         try:
             if isinstance(v, int):
@@ -2391,7 +2381,8 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
         if obj is None:
             return
         if isinstance(obj, int):
-            acc.add(int(obj)); return
+            acc.add(int(obj))
+            return
         if isinstance(obj, str):
             x = _as_int(obj)
             if x is not None:
@@ -2430,9 +2421,9 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
             for v in obj:
                 _purge_uid_entries(v, user_key)
 
-    # ── 1) Известные и эвристические «реестры» в state ───────────────
+    # ── 1) Известные и эвристические «реестры» в state ──────────────────────
     candidate_names = [
-        # poll details / report details
+        # poll/report details
         "poll_details_blocks", "poll_detail_blocks",
         "poll_details_index",  "poll_detail_index",
         "pd_blocks", "pd_index",
@@ -2465,7 +2456,7 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
                     with suppress(Exception):
                         registries[name] = getattr(state, name)
 
-    # ── 2) Похожие «реестры» в core.utils (часто там хранится leader report) ──
+    # ── 2) Похожие «реестры» в core.utils (часто там хранится leader report) ─
     registries_cu: Dict[str, Any] = {}
     if _cu:
         with suppress(Exception):
@@ -2477,7 +2468,7 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
                     with suppress(Exception):
                         registries_cu[name] = getattr(_cu, name)
 
-    # ── 3) Собираем message_id и стираем (кроме ГЛАВНОГО МЕНЮ) ───────
+    # ── 3) Собираем message_id и стираем (кроме ГЛАВНОГО МЕНЮ) ───────────────
     ids: Set[int] = set()
 
     for _, reg in list(registries.items()):
@@ -2516,7 +2507,8 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
     for reg in list(registries.values()):
         with suppress(Exception):
             if isinstance(reg, dict):
-                reg.pop(u, None); reg.pop(str(u), None)
+                reg.pop(u, None)
+                reg.pop(str(u), None)
                 _purge_uid_entries(reg, u)
             elif isinstance(reg, list):
                 for v in reg:
@@ -2525,7 +2517,8 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
     for reg in list(registries_cu.values()):
         with suppress(Exception):
             if isinstance(reg, dict):
-                reg.pop(u, None); reg.pop(str(u), None)
+                reg.pop(u, None)
+                reg.pop(str(u), None)
                 _purge_uid_entries(reg, u)
 
     # зачистка last_user_messages от удалённых id
@@ -2543,26 +2536,67 @@ async def _vacuum_poll_details_blocks(uid: int) -> None:
                     continue
                 new_lum.append(msg)
             (getattr(state, "last_user_messages", {}) or {}).__setitem__(u, new_lum)  # type: ignore[index]
+
     # тихо выходим
     return
 
-# ────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
 # [5.3] QUIET PATCH API — вызывается из handlers.confirmations / pipelines
 #      (не удалять sticky; только перекрасить кнопки на дашборде)
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+from contextlib import suppress
+from typing import Any, Dict, List, Optional
+import logging
+
+from core.state import state
+
+logger = logging.getLogger(__name__)
+
+# мягкая отметка локального подтверждения строки
+def _set_locally_confirmed(uid: int, deal_id: int, flag: bool = True) -> None:
+    try:
+        if not hasattr(state, "mygames_local_confirm"):
+            state.mygames_local_confirm = {}  # type: ignore[attr-defined]
+        state.mygames_local_confirm[(int(uid), int(deal_id))] = bool(flag)
+    except Exception:
+        logger.debug("[my_games.local] set confirmed failed", exc_info=True)
+
+def get_my_games_dashboard(uid: int) -> Optional[int]:
+    try:
+        mid = (getattr(state, "my_games_dashboard", {}) or {}).get(int(uid))
+        return int(mid) if mid else None
+    except Exception:
+        return None
+
+# тихая перекраска текущего sticky (если есть), без редрава текста
+async def update_my_games_buttons_only(uid: int, markup):
+    from aiogram import Bot
+    mid = get_my_games_dashboard(int(uid))
+    if not isinstance(mid, int) or mid <= 0:
+        # даст шанс восстановить sticky по эвристике в вызывающем модуле
+        return None
+    with suppress(Exception):
+        await Bot.get_current().edit_message_reply_markup(
+            chat_id=int(uid), message_id=int(mid), reply_markup=markup
+        )
+        return int(mid)
+    return None
+
 
 async def mygames_after_confirm_ui_patch(uid: int, deal_id: int) -> bool:
     """
     После успешного подтверждения:
     • Помечаем локально (до прихода CRM-тегов).
     • ТИХО обновляем ТОЛЬКО клавиатуру sticky-дашборда (без удаления сообщения).
-    • Без редрава: не пересоздаём sticky; если слот потерян — пытаемся восстановить
-      в update_my_games_buttons_only(), иначе возвращаем False.
+    • Без редрава: не пересоздаём sticky; если слот потерян — попробуем
+      восстановить в update_my_games_buttons_only(), иначе вернём False.
     """
     with suppress(Exception):
         _set_locally_confirmed(int(uid), int(deal_id), True)
 
-    deals_sorted = (getattr(state, "games_by_user", {}) or {}).get(int(uid)) or []
+    deals_sorted: List[Dict[str, Any]] = (getattr(state, "games_by_user", {}) or {}).get(int(uid)) or []
     if not deals_sorted:
         logger.debug("[my_games.patch] after_confirm: no cached deals for uid=%s", uid)
         return False
@@ -2571,7 +2605,7 @@ async def mygames_after_confirm_ui_patch(uid: int, deal_id: int) -> bool:
     if callable(build_kb):
         markup = build_kb(int(uid), deals_sorted)  # type: ignore[misc]
     else:
-        markup = _build_dashboard_kb_v2(int(uid), deals_sorted)
+        markup = globals().get("_build_dashboard_kb_v2")(int(uid), deals_sorted)  # type: ignore[misc]
 
     mid2 = await update_my_games_buttons_only(int(uid), markup)
     ok = bool(mid2)
@@ -2584,7 +2618,7 @@ async def mygames_after_success_ui_patch(uid: int, deal_id: int) -> bool:
     После перевода сделки в SUCCESS:
     • Переключаем строку на «🔁 Замена».
     • Снимаем локальную отметку «✅ Подтверждено» (если была).
-    • Тихо обновляем ТОЛЬКО клавиатуру sticky-дашборда, без редрава текста/сообщения.
+    • Тихо обновляем ТОЛЬКО клавиатуру sticky-дашборда (без редрава текста/сообщения).
     """
     from core.config import settings as _cfg
     OK_ID: str = str(getattr(_cfg, "SUCCESSFUL_STATUS_ID", ""))
@@ -2606,16 +2640,19 @@ async def mygames_after_success_ui_patch(uid: int, deal_id: int) -> bool:
     if callable(build_kb):
         markup = build_kb(int(uid), deals_sorted)  # type: ignore[misc]
     else:
-        markup = _build_dashboard_kb_v2(int(uid), deals_sorted)
+        markup = globals().get("_build_dashboard_kb_v2")(int(uid), deals_sorted)  # type: ignore[misc]
 
     mid2 = await update_my_games_buttons_only(int(uid), markup)
     ok = bool(mid2)
     logger.info("[my_games.patch] after_success: uid=%s deal=%s mid=%s ok=%s", uid, deal_id, mid2, ok)
     return ok
 
-# ════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
 # [6] PUBLIC API
-# ════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+from aiogram import Bot
+
 async def redraw_my_games(uid: int) -> None:
     """
     Перерисовывает дашборд «Мои игры».
@@ -2634,108 +2671,60 @@ async def redraw_my_games(uid: int) -> None:
 
     # полный путь
     try:
-        all_deals = await get_amocrm_deals()
+        all_deals = await globals().get("get_amocrm_deals")()  # type: ignore[misc]
     except Exception as e:
         logger.error("[my_games:redraw] get_amocrm_deals failed: %s", e)
-        # даже при ошибке — подчистим репорт-дашборд, чтобы он не «липнул»
         with suppress(Exception):
-            await _vacuum_poll_details_blocks(int(uid))
-        await _vacuum_safe(uid)  # мягкая уборка
+            await globals().get("_vacuum_poll_details_blocks")(int(uid))  # type: ignore[misc]
+        await globals().get("_vacuum_safe")(uid)  # type: ignore[misc]
         await Bot.get_current().send_message(uid, "⚠️ Не удалось получить список игр.")
         return
 
-    deals = _visible_deals_for_user(uid, all_deals)
+    deals = globals().get("_visible_deals_for_user")(uid, all_deals)  # type: ignore[misc]
     if deals:
-        await _send_dashboard(uid, deals)
+        await globals().get("_send_dashboard")(uid, deals)  # type: ignore[misc]
     else:
         with suppress(Exception):
-            await _vacuum_poll_details_blocks(int(uid))
-        await _vacuum_safe(uid)
-        await Bot.get_current().send_message(uid, "😔 Назначенных игр пока нет.")
+            await globals().get("_vacuum_poll_details_blocks")(int(uid))  # type: ignore[misc]
+        await globals().get("_vacuum_safe")(uid)  # type: ignore[misc]
+        await Bot.get_current().send_message(uid, "😕 Назначенных игр пока нет.")
 
-# ────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
 # [6.x] QUIET PATCH: после подтверждения (handlers.confirmations вызывает)
-async def mygames_after_confirm_ui_patch(uid: int, deal_id: int) -> bool:
+#      (оставлено для совместимости — делегирует в актуальную реализацию)
+# ─────────────────────────────────────────────────────────────────────────────
+async def mygames_after_confirm_ui_patch_compat(uid: int, deal_id: int) -> bool:
     """
-    После успешного подтверждения — тихо помечаем строку «✅ Подтверждено»
-    и обновляем ТОЛЬКО клавиатуру sticky-дашборда. Если sticky внезапно удалён,
-    пересоздаём дашборд из кэша и всё равно возвращаем ok.
+    Совместимость: тихо помечает строку «✅ Подтверждено» и обновляет только
+    клавиатуру sticky-дашборда. Если sticky внезапно удалён, не пересоздаёт.
     """
-    with suppress(Exception):
-        _set_locally_confirmed(int(uid), int(deal_id), True)
-
-    deals_sorted = (getattr(state, "games_by_user", {}) or {}).get(int(uid)) or []
-    if not deals_sorted:
-        logger.debug("[my_games.patch] after_confirm: no cached deals for uid=%s", uid)
-        return False
-
-    mid = get_my_games_dashboard(int(uid))
-    if not mid or mid <= 0:
-        logger.debug("[my_games.patch] after_confirm: sticky missing, silently re-create")
-        with suppress(Exception):
-            await _send_dashboard(int(uid), deals_sorted)  # создаст sticky со «✅ Подтверждено»
-        return True
-
-    build_kb = globals().get("_build_dashboard_kb")
-    if callable(build_kb):
-        markup = build_kb(int(uid), deals_sorted)  # type: ignore[misc]
-    else:
-        markup = globals().get("_build_dashboard_kb_v2")(int(uid), deals_sorted)  # type: ignore[misc]
-
-    mid2 = await globals().get("update_my_games_buttons_only")(int(uid), markup)  # type: ignore[misc]
-    ok = bool(mid2)
-    logger.info("[my_games.patch] after_confirm: uid=%s deal=%s mid=%s ok=%s", uid, deal_id, mid2, ok)
-    return ok
-
-# QUIET PATCH: после SUCCESS (вся команда подтвердила, сделка → SUCCESS)
-async def mygames_after_success_ui_patch(uid: int, deal_id: int) -> bool:
-    """
-    Тихо переключает строку сделки в «🔁 Замена» после SUCCESS
-    и снимает локальную отметку подтверждения (если была).
-    """
-    from core.config import settings as _cfg
-    OK_ID: str = str(getattr(_cfg, "SUCCESSFUL_STATUS_ID", ""))
-
-    deals_sorted: List[Dict[str, Any]] = (getattr(state, "games_by_user", {}) or {}).get(int(uid)) or []
-    for d in deals_sorted:
-        if int(d.get("id") or 0) == int(deal_id):
-            d["status_id"] = OK_ID or d.get("status_id")
-            d["status_name"] = "Завершена"
-            break
-
-    with suppress(Exception):
-        (getattr(state, "mygames_local_confirm", {}) or {}).pop((int(uid), int(deal_id)), None)
-
-    if not deals_sorted:
-        return False
-
-    mid = get_my_games_dashboard(int(uid))
-    if not mid or mid <= 0:
-        logger.debug("[my_games.patch] after_success: sticky missing, silently re-create")
-        with suppress(Exception):
-            await _send_dashboard(int(uid), deals_sorted)  # создаст sticky с «🔁 Замена»
-        return True
-
-    build_kb = globals().get("_build_dashboard_kb")
-    if callable(build_kb):
-        markup = build_kb(int(uid), deals_sorted)  # type: ignore[misc]
-    else:
-        markup = globals().get("_build_dashboard_kb_v2")(int(uid), deals_sorted)  # type: ignore[misc]
-
-    mid2 = await globals().get("update_my_games_buttons_only")(int(uid), markup)  # type: ignore[misc]
-    ok = bool(mid2)
-    logger.info("[my_games.patch] after_success: uid=%s deal=%s mid=%s ok=%s", uid, deal_id, mid2, ok)
-    return ok
+    return await mygames_after_confirm_ui_patch(uid, deal_id)
 
 
-
-# ════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # [7] HANDLERS
-# ════════════════════════════════════════════════════════════════════
-from aiogram import Bot
-from aiogram import types as _types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+# ─────────────────────────────────────────────────────────────────────────────
 import contextlib
+from typing import Optional
+from aiogram import types
+from aiogram.filters import Command
+
+# Ожидаем, что router уже объявлен в модуле и доступен через globals()
+router = globals().get("router")
+
+def _is_my_games_btn(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    t = text.strip().lower()
+    return "мои игры" in t or t.startswith("/my_games")
+
+def get_menu_message_id(uid: int) -> Optional[int]:
+    with suppress(Exception):
+        from core.menu import get_menu_message_id as _get
+        mid = _get(int(uid))
+        return int(mid) if mid else None
+    return None
 
 @router.message(Command("my_games"))
 @router.message(lambda m: _is_my_games_btn(getattr(m, "text", None)))
@@ -2767,17 +2756,16 @@ async def my_games_handler(message: types.Message) -> None:
             menu_mid = get_menu_message_id(uid)
             if isinstance(menu_mid, int) and menu_mid > 0:
                 keep_ids.append(menu_mid)
-        await _vacuum_safe(uid, keep=keep_ids)
+        await globals().get("_vacuum_safe")(uid, keep=keep_ids)  # type: ignore[misc]
     finally:
         setattr(state, "suppress_report_keep", prev_suppress)
 
     try:
-        deals_all = await get_amocrm_deals()
-        deals = _visible_deals_for_user(uid, deals_all)
+        deals_all = await globals().get("get_amocrm_deals")()  # type: ignore[misc]
+        deals = globals().get("_visible_deals_for_user")(uid, deals_all)  # type: ignore[misc]
     except Exception as e:
         logger.error("[my_games:handler] get_amocrm_deals failed: %s", e)
         sent = await Bot.get_current().send_message(uid, "⚠️ Не удалось получить список игр.")
-        # трекаем, чтобы последующий вакуум удалил
         (getattr(state, "last_user_messages", {}) or {}).setdefault(uid, [])
         state.last_user_messages[uid] = [sent]
         with contextlib.suppress(Exception):
@@ -2785,17 +2773,21 @@ async def my_games_handler(message: types.Message) -> None:
         return
 
     if deals:
-        await _send_dashboard(uid, deals)
+        await globals().get("_send_dashboard")(uid, deals)  # type: ignore[misc]
     else:
         # «Игр нет»: отправляем ОДНО сообщение и записываем его в трекер
-        sent = await Bot.get_current().send_message(uid, "😔 Назначенных игр пока нет.")
+        sent = await Bot.get_current().send_message(uid, "😕 Назначенных игр пока нет.")
         (getattr(state, "last_user_messages", {}) or {}).setdefault(uid, [])
         state.last_user_messages[uid] = [sent]
 
-    # Не критично: удаляем входящее «кнопочное» сообщение пользователя
+    # Некритично: удаляем входящее «кнопочное» сообщение пользователя
     with contextlib.suppress(Exception):
         await message.delete()
 
+
+DETAILS_PREFIX = globals().get("DETAILS_PREFIX", "mygame_details_")
+REPORT_PREFIX  = globals().get("REPORT_PREFIX",  "report_")
+SWAP_PREFIX    = globals().get("SWAP_PREFIX",    "mygame_swap_")
 
 @router.callback_query(lambda c: (c.data or "").startswith(DETAILS_PREFIX))
 async def _open_my_game_details_cb(callback: types.CallbackQuery) -> None:
@@ -2811,7 +2803,7 @@ async def _open_my_game_details_cb(callback: types.CallbackQuery) -> None:
     except Exception:
         pass
 
-    # Попробуем вытащить саму сделку (если не найдём — перейдём на прямой рендер через show_my_game_details)
+    # Попробуем вытащить саму сделку
     try:
         deal_id = int((callback.data or "").split("_")[-1])
     except Exception:
@@ -2820,7 +2812,7 @@ async def _open_my_game_details_cb(callback: types.CallbackQuery) -> None:
         logger.warning("[my_games] open details failed: bad deal_id in %r", callback.data)
         return
 
-    deal: Optional[Dict] = None
+    deal: Optional[Dict[str, Any]] = None
     try:
         # сначала смотрим, что уже рисовали пользователю
         deal = next(
@@ -2831,7 +2823,7 @@ async def _open_my_game_details_cb(callback: types.CallbackQuery) -> None:
         # если нет — делаем свежую выборку видимых игр и берём оттуда
         if not deal:
             deal = next(
-                (d for d in _visible_deals_for_user(uid, await get_amocrm_deals())
+                (d for d in globals().get("_visible_deals_for_user")(uid, await globals().get("get_amocrm_deals")())  # type: ignore[misc]
                  if int(d.get("id") or 0) == deal_id),
                 None,
             )
@@ -2840,14 +2832,14 @@ async def _open_my_game_details_cb(callback: types.CallbackQuery) -> None:
         deal = None
 
     if deal:
-        await _send_details(uid, deal)
+        await globals().get("_send_details")(uid, deal)  # type: ignore[misc]
         with contextlib.suppress(Exception):
             await callback.answer()
         return
 
     # Фолбэк: отдаём управление стандартному рендеру деталей (он сам выполнит предварительный vacuum)
     try:
-        await show_my_game_details(callback)
+        await globals().get("show_my_game_details")(callback)  # type: ignore[misc]
     except Exception as e:
         with contextlib.suppress(Exception):
             await callback.answer("Не удалось открыть детали.", show_alert=True)
@@ -2865,11 +2857,11 @@ async def cb_back(callback: types.CallbackQuery) -> None:
 
     deals_cached = (getattr(state, "games_by_user", {}) or {}).get(uid, [])
     if deals_cached:
-        await _send_dashboard(uid, deals_cached)
+        await globals().get("_send_dashboard")(uid, deals_cached)  # type: ignore[misc]
         await callback.answer()
         return
 
-    # Если кэша нет — запрашиваем и действуем как в handler'е, критично: трекаем «игр нет»
+    # Если кэша нет — запрашиваем и действуем как в handler'е; критично: трекаем «игр нет»
     prev_suppress = bool(getattr(state, "suppress_report_keep", False))
     setattr(state, "suppress_report_keep", True)
     try:
@@ -2878,13 +2870,13 @@ async def cb_back(callback: types.CallbackQuery) -> None:
             menu_mid = get_menu_message_id(uid)
             if isinstance(menu_mid, int) and menu_mid > 0:
                 keep_ids.append(menu_mid)
-        await _vacuum_safe(uid, keep=keep_ids)
+        await globals().get("_vacuum_safe")(uid, keep=keep_ids)  # type: ignore[misc]
     finally:
         setattr(state, "suppress_report_keep", prev_suppress)
 
     try:
-        deals_all = await get_amocrm_deals()
-        deals = _visible_deals_for_user(uid, deals_all)
+        deals_all = await globals().get("get_amocrm_deals")()  # type: ignore[misc]
+        deals = globals().get("_visible_deals_for_user")(uid, deals_all)  # type: ignore[misc]
     except Exception as e:
         logger.error("[my_games:back] get_amocrm_deals failed: %s", e)
         sent = await Bot.get_current().send_message(uid, "⚠️ Не удалось получить список игр.")
@@ -2894,9 +2886,9 @@ async def cb_back(callback: types.CallbackQuery) -> None:
         return
 
     if deals:
-        await _send_dashboard(uid, deals)
+        await globals().get("_send_dashboard")(uid, deals)  # type: ignore[misc]
     else:
-        sent = await Bot.get_current().send_message(uid, "😔 Назначенных игр пока нет.")
+        sent = await Bot.get_current().send_message(uid, "😕 Назначенных игр пока нет.")
         (getattr(state, "last_user_messages", {}) or {}).setdefault(uid, [])
         state.last_user_messages[uid] = [sent]
 
@@ -2921,25 +2913,34 @@ async def cb_ack_misc(callback: types.CallbackQuery) -> None:
 
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 # [7.2] HANDLER: SWAP («Замена»/«Попросить замену») — полноценная реализация
-# ════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 from contextlib import suppress
-from typing import Any, Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, List
+import logging
 
 from aiogram import Bot, types as _types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from core.state import state
 from core.utils import resolve_notify_chat_id, team_bulleted_lines
+from core.config import settings  # используется для BRON_STATUS_ID
 from services import amocrm as _amo  # type: ignore
 from services.amocrm import update_amocrm_tags, update_deal_status  # type: ignore
 
+logger = logging.getLogger(__name__)
+
 def _swap_role_alias(key: str) -> str:
     k = (key or "").lower()
-    if k.startswith("lead") or k == "main": return "main"
-    if k.startswith("assist"):              return "assist"
-    if "admin" in k:                        return "admin"
-    if "trainee" in k or "intern" in k or "стаж" in k: return "trainee"
+    if k.startswith("lead") or k == "main":
+        return "main"
+    if k.startswith("assist"):
+        return "assist"
+    if "admin" in k:
+        return "admin"
+    if "trainee" in k or "intern" in k or "стаж" in k:
+        return "trainee"
     return k
 
 def _swap_tag_uid(val: Any) -> Optional[int]:
@@ -2974,7 +2975,7 @@ def _swap_find_slot_for_user(deal_id: int, uid: int) -> Tuple[Optional[str], Opt
         except Exception:
             return False
 
-    # lead*/assistant* — ищем конкретный слот
+    # lead*/assistant*/admin/trainee — ищем конкретный слот
     for k, v in raw.items():
         if not isinstance(k, str):
             continue
@@ -3039,7 +3040,7 @@ async def _swap_announce_and_button(deal_id: int) -> None:
         return
 
     # Заголовок/дата/время — используем уже имеющийся helper блока [3.3]
-    title, date_s, time_s = ("Сделка #{0}".format(int(deal_id)), "", "")
+    title, date_s, time_s = (f"Сделка #{int(deal_id)}", "", "")
     with suppress(Exception):
         _title_date_time = globals().get("_title_date_time")
         if callable(_title_date_time):
@@ -3051,7 +3052,7 @@ async def _swap_announce_and_button(deal_id: int) -> None:
         or (getattr(state, "locked_distribution", {}) or {}).get(str(deal_id))
         or {}
     )
-    lines: list[str] = []
+    lines: List[str] = []
     if isinstance(slots, dict) and slots:
         with suppress(Exception):
             lines = await team_bulleted_lines(slots)
@@ -3062,7 +3063,7 @@ async def _swap_announce_and_button(deal_id: int) -> None:
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🖐 Откликнуться", callback_data=f"{globals().get('RESPOND_PREFIX','swap_accept_')}{int(deal_id)}")]
+            [InlineKeyboardButton(text="🙋 Откликнуться", callback_data=f"{globals().get('RESPOND_PREFIX','swap_accept_')}{int(deal_id)}")]
         ]
     )
     await bot.send_message(chat_id, text, reply_markup=kb)
@@ -3083,7 +3084,8 @@ async def _cb_swap_request(callback: _types.CallbackQuery) -> None:
         return
 
     # slot_key и подпись из active-locked
-    slot_key, label = _swap_find_slot_for_user(deal_id, uid)
+    slot_key, _label = _swap_find_slot_for_user(deal_id, uid)
+
     # 1) снять подтверждающий тег (если был)
     await _swap_remove_current_role_tag(deal_id, slot_key)
 
@@ -3093,7 +3095,7 @@ async def _cb_swap_request(callback: _types.CallbackQuery) -> None:
         if bron:
             await update_deal_status(int(deal_id), bron)  # type: ignore[arg-type]
 
-    # 3) вернуть игру в цикл: перенос замков из finished_* и очистка тамошних следов
+    # 3) вернуть игру в цикл (из finished_* → locked_*)
     _swap_restore_from_finished(int(deal_id))
 
     # 4) объявление в рабочем чате + кнопка «Откликнуться»
@@ -3106,58 +3108,122 @@ async def _cb_swap_request(callback: _types.CallbackQuery) -> None:
             await globals().get("_soft_redraw_my_games")(uid)  # type: ignore[misc]
 
     with suppress(Exception):
-        await callback.answer("Запрос на замену отправлен ✅")
+        await callback.answer("Запрос на замену отправлен ✓")
 
 
 
-# ════════════════════════════════════════════════════════════════════
-# [8] SELF-TEST
-# ════════════════════════════════════════════════════════════════════
-async def _test() -> None:
-    now = MSK_TZ.localize(datetime.now())
-    dummy_bron = {
-        "id": 1,
-        "game_name": "Quest Room",
-        "event_datetime": now,
-        "status_id": BRON_STATUS_ID,
-        "team_leads": [{"id": "123"}],
-        "players": "2-6",
-        "tags": [],
-    }
-    dummy_done = {
-        "id": 2,
-        "name": "Another Game",
-        "event_datetime": now,
-        "status_id": OK_STATUS_ID,
-        "team_leads": [],
-        "players": "5-8",
-        "tags": [{"name": "Иван И.2"}],
-    }
+# ─────────────────────────────────────────────────────────────────────────────
+# [7.3] HANDLERS: REPORT FLOW — «📝 Написать отчёт»
+# ─────────────────────────────────────────────────────────────────────────────
+from datetime import datetime
 
-    # эмулируем слоты, как пишет polls_distribution
-    state.locked_distribution = {
-        1: {"lead1": "Иван И..1|123", "assistant1": "Пётр П..2|456", "admin": "Анна А..Адм|789"},
-        2: {"lead1": "Иван И..1|123"},
-    }
-    state.assigned_index = {123: {1, 2}, 456: {1}, 789: {1}}
-    state.games_by_user = {}
+REPORT_PROMPT = "📝 Пришлите текст отчёта одним сообщением. Чтобы отменить — отправьте «Отмена»."
 
-    assert _is_user_assigned_current(123, dummy_bron) is True
-    assert _assigned_role_from_state(123, 1) == "main"
-    assert _assigned_role_from_state(456, 1) == "assist"
-    assert _assigned_role_from_state(789, 1) == "admin"
+@router.callback_query(lambda c: c.data and c.data.startswith(REPORT_PREFIX))
+async def _cb_report_start(callback: types.CallbackQuery) -> None:
+    try:
+        deal_id = int((callback.data or "").split("_")[-1])
+    except Exception:
+        with suppress(Exception):
+            await callback.answer("⚠️ Ошибочные данные кнопки.", show_alert=True)
+        return
 
-    assert _wanted_status(dummy_bron) and _wanted_status(dummy_done)
+    uid = int(callback.from_user.id)
+    pending = getattr(state, "pending_report", None)
+    if not isinstance(pending, dict):
+        pending = {}
+        setattr(state, "pending_report", pending)
+    pending[uid] = deal_id
 
-    assert _is_my_games_btn("🎲 Мои игры")
-    assert _is_my_games_btn("🎲\u00A0Мои игры")
-    assert _is_my_games_btn("🎲\uFE0F\u00A0Мои игры")
-    assert _is_my_games_btn("\uFEFF🎲 Мои игры")
+    with suppress(Exception):
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
 
-    print("handlers.my_games ✅ tests passed")
+    sent = False
+    if callback.message:
+        with suppress(Exception):
+            await callback.message.answer(REPORT_PROMPT)
+            sent = True
+    if not sent:
+        await Bot.get_current().send_message(uid, REPORT_PROMPT)
+
+    await callback.answer()
 
 
-if __name__ == "__main__":
-    import asyncio, logging as _log
-    _log.basicConfig(level=_log.DEBUG)
-    asyncio.run(_test())
+@router.message(lambda m: (getattr(state, "pending_report", {}) or {}).get(m.from_user.id))
+async def _cb_report_collect(message: types.Message) -> None:
+    uid = int(message.from_user.id)
+    pending_raw = getattr(state, "pending_report", {}) or {}
+    deal_id_raw = pending_raw.get(uid)
+    try:
+        deal_id = int(deal_id_raw)
+    except Exception:
+        pending_raw.pop(uid, None)
+        await message.answer("⚠️ Не удалось определить игру для отчёта.")
+        return
+
+    text = (message.text or "").strip()
+    lower = text.lower()
+    if lower in {"отмена", "cancel", "/cancel"}:
+        pending_raw.pop(uid, None)
+        await message.answer("Отмена. Возвращаюсь к «Моим играм».")
+        with suppress(Exception):
+            redraw = globals().get("redraw_my_games")
+            if callable(redraw):
+                await redraw(uid)
+        return
+
+    if not text:
+        await message.answer("⚠️ Отчёт не может быть пустым. Пришлите текст или отправьте «Отмена».")
+        return
+
+    # внешние зависимости
+    get_deal_by_id = globals().get("get_deal_by_id")
+    patch_lead = globals().get("patch_lead")
+    _build_cf_patch = globals().get("_build_cf_patch")
+    WON_STATUS_ID = globals().get("WON_STATUS_ID")
+    MSK_TZ = globals().get("MSK_TZ")
+    _short_name = globals().get("_short_name", lambda *_: "")
+
+    try:
+        deal = await get_deal_by_id(int(deal_id)) if callable(get_deal_by_id) else None  # type: ignore[misc]
+    except Exception:
+        deal = None
+
+    old_comment = str((deal or {}).get("comment") or "").strip()
+    stamp = (MSK_TZ.localize(datetime.now()) if getattr(MSK_TZ, "localize", None) else datetime.now()).strftime("%d.%m.%Y %H:%M")  # type: ignore[attr-defined]
+    author = _short_name(uid) or f"uid:{uid}"
+    new_comment = (old_comment + "\n\n" if old_comment else "") + f"Отчёт {author} от {stamp}:\n{text}"
+
+    payload = None
+    if callable(_build_cf_patch):
+        with suppress(Exception):
+            payload = await _build_cf_patch({"comment": new_comment})  # type: ignore[arg-type]
+    if not payload:
+        payload = {"comment": new_comment}
+
+    patched = False
+    if callable(patch_lead):
+        with suppress(Exception):
+            patched = await patch_lead(int(deal_id), payload)  # type: ignore[arg-type]
+
+    if not patched:
+        await message.answer("⚠️ Не удалось сохранить отчёт в сделке. Попробуйте позже.")
+        return
+
+    status_changed = False
+    if WON_STATUS_ID:
+        with suppress(Exception):
+            status_changed = await update_deal_status(int(deal_id), str(WON_STATUS_ID))
+
+    note = "✅ Отчёт принят и добавлен в сделку."
+    if WON_STATUS_ID and not status_changed:
+        note += " (статус не изменён)"
+    await message.answer(note)
+
+    pending_raw.pop(uid, None)
+
+    with suppress(Exception):
+        soft_redraw = globals().get("_soft_redraw_my_games")
+        if callable(soft_redraw):
+            await soft_redraw(uid)
