@@ -67,15 +67,15 @@ def parse_players_count(raw: Any) -> PlayersRange:
     if m:
         return _mk(int(m.group(1)), None)
 
-    m = re.search(r"(до|<=|≤)\s*(\d+)", s_norm)
-    if m:
-        return _mk(None, int(m.group(2)))
-
     m = re.search(r"от\s*(\d+)(?:\s*(?:до|–|-|—)\s*(\d+))?", s_norm)
     if m:
         lo = int(m.group(1))
         hi = int(m.group(2)) if m.group(2) else None
         return _mk(lo, hi)
+
+    m = re.search(r"(до|<=|≤)\s*(\d+)", s_norm)
+    if m:
+        return _mk(None, int(m.group(2)))
 
     m = re.fullmatch(r"\s*(\d+)\s*", s_norm)
     if m:
@@ -1032,3 +1032,19 @@ if __name__ == "__main__":  # локальный прогон
 #                      «кнопку нажали — выше ЛС пусто», исключения для poll_details/my_games.
 #   2025-09-03 — нормализация ключей state.detail_blocks (int → (uid, 0)),
 #                фиксация assigned_role_from_state для finished_locked.
+
+# === Названия игр (публичный алиас для UI) =========================
+_GAME_TITLE_ALIASES = {
+    # любые встречающиеся сокращения/опечатки -> каноничное имя для интерфейса
+    "треугольник": "Бермудский треугольник",
+    "бермудский трегольник": "Бермудский треугольник",  # частая опечатка
+}
+
+def public_game_title(name: str) -> str:
+    """
+    Возвращает имя игры для отображения (кнопки, опросы, отчёты, детали).
+    Не влияет на бизнес-логику/поиск колонок в «Светофоре».
+    """
+    s = (name or "").strip()
+    key = s.lower().replace("ё", "е")
+    return _GAME_TITLE_ALIASES.get(key, s)

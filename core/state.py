@@ -47,6 +47,8 @@ class _State:
         self.personal_report_message_id: Optional[int] = None
         # РїРѕСЃР»РµРґРЅРёРµ Р»РёС‡РЅС‹Рµ СЃРѕРѕР±С‰РµРЅРёСЏ РїРѕ РїРѕР»СЊР·РѕРІР°С‚РµР»СЋ: {uid: [Message,...]}
         self.last_user_messages: Dict[int, List[Message]] = {}
+# кэш закреплённого сообщения главного меню в ЛС: {uid: message_id}
+        self.menu_message_id: Dict[int, int] = {}
 
         # РєР»Р°РІРёР°С‚СѓСЂР° РѕС‚С‡С‘С‚Р° Р»РёРґРµСЂСѓ (РІРµСЂС…РЅСЏСЏ С‡Р°СЃС‚СЊ вЂ” РёРіСЂС‹)
         self.distribution_keyboard: Any = None
@@ -92,6 +94,8 @@ class _State:
         # РѕР¶РёРґР°РЅРёРµ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёР№ РїРѕСЃР»Рµ СѓС‚РІРµСЂР¶РґРµРЅРёСЏ:
         #   {deal_id: {"distribution": {...}, "confirmed": set(uid,...)}}
         self.pending_confirmations: Dict[int, dict] = {}
+        self.swap_replacements: Dict[int, dict] = {}
+        self.urgent_swap_award: Dict[int, int] = {}
 
         # РІСЃРїРѕРјРѕРіР°С‚РµР»СЊРЅС‹Р№ РєСЌС€ РґР»СЏ РѕС‚С‡С‘С‚РѕРІ Р»РёРґРµСЂСѓ (РЅРµ РєСЂРёС‚РёС‡РЅРѕ)
         self.poll_distribution: Dict[int, Dict[str, List[Any]]] = {}
@@ -153,3 +157,5 @@ __all__ = ["state"]
 # вЂў 2025-08-09 вЂ” РґРѕР±Р°РІР»РµРЅС‹ poll_details, deal_titles, pending_confirmations, detail_blocks.
 # вЂў 2025-08-09 вЂ” РґРѕР±Р°РІР»РµРЅС‹ tokens/amocrm_meta/amocrm_last_refresh_ts.
 # вЂў 2025-08-09 вЂ” РґРѕР±Р°РІР»РµРЅРѕ confirmed_users.
+# • 2025-09-17 — добавлен menu_message_id для синглтона главного меню (SSOT).
+# 2025-09-17 · модуль рейтинга: выровнено под SSOT.

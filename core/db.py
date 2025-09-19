@@ -27,6 +27,45 @@ CREATE TABLE IF NOT EXISTS users (
 );
 """
 
+CREATE_LEADER_RATING_EVENTS_SQL = """
+CREATE TABLE IF NOT EXISTS leader_rating_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uid INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  points INTEGER NOT NULL,
+  when_ts INTEGER NOT NULL,
+  meta TEXT,
+  poll_id TEXT,
+  deal_id TEXT
+);
+"""
+
+CREATE_LEADER_RATING_ADJUST_SQL = """
+CREATE TABLE IF NOT EXISTS leader_rating_adjust (
+  uid INTEGER PRIMARY KEY,
+  manual_delta INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
+"""
+
+CREATE_LEADER_RATING_FLAGS_SQL = """
+CREATE TABLE IF NOT EXISTS leader_rating_flags (
+  uid INTEGER NOT NULL,
+  poll_id TEXT NOT NULL,
+  flag TEXT NOT NULL,
+  value TEXT NOT NULL,
+  PRIMARY KEY (uid, poll_id, flag)
+);
+"""
+
+CREATE_LEADER_CANTWORK_WEEKS_SQL = """
+CREATE TABLE IF NOT EXISTS leader_cantwork_weeks (
+  uid INTEGER NOT NULL,
+  week_iso TEXT NOT NULL,
+  PRIMARY KEY (uid, week_iso)
+);
+"""
+
 # ███ [3.0] ИНИЦИАЛИЗАЦИЯ БД & ГАРАНТИРОВАННОЕ ДОБАВЛЕНИЕ ЛИДЕРА
 # --------------------------------------------------------------------
 async def init_db() -> None:
@@ -36,6 +75,10 @@ async def init_db() -> None:
     """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(CREATE_USERS_SQL)
+        await db.execute(CREATE_LEADER_RATING_EVENTS_SQL)
+        await db.execute(CREATE_LEADER_RATING_ADJUST_SQL)
+        await db.execute(CREATE_LEADER_RATING_FLAGS_SQL)
+        await db.execute(CREATE_LEADER_CANTWORK_WEEKS_SQL)
         await db.execute(
             "INSERT OR IGNORE INTO users(user_id, role) VALUES (?, 'руководитель')",
             (settings.LEADER_ID,),
@@ -129,3 +172,4 @@ async def _test():
 if __name__ == "__main__":
     import asyncio
     asyncio.run(_test())
+# 2025-09-17 � ������ ��������: ��������� ��� SSOT.

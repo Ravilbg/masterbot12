@@ -27,10 +27,72 @@ except NameError:
     BASE_DIR = Path(os.getcwd()).resolve()
 CONFIG_JSON = BASE_DIR / "config.json"
 
+_DEFAULT_RATING_WEIGHTS: Dict[str, int] = {
+    "poll_reply_d12": 2,
+    "poll_reply_d36": 1,
+    "poll_reply_late": 0,
+    "confirm_d24": 2,
+    "confirm_d36": 1,
+    "confirm_late": 0,
+    "no_reply_penalty_w1": -20,
+    "no_reply_penalty_w2": -30,
+    "cant_work_2w_row": -10,
+    "cant_work_3w_row": -50,
+    "game_main": 4,
+    "game_assist": 3,
+    "game_admin": 2,
+    "game_trainee": 1,
+    "learn_game": 10,
+    "urgent_replacement": 10,
+}
+
+def _default_rating_config() -> Dict[str, Any]:
+    base = {
+        "WINDOW_DAYS": 30,
+        "CAP_MIN": 0,
+        "CAP_MAX": 100,
+        "YELLOW_WEIGHT": 0.0,
+        "WEEKLY_CHECK_CRON": "0 6 * * MON",
+    }
+    base["WEIGHTS"] = dict(_DEFAULT_RATING_WEIGHTS)
+    return base
+
+def _merge_rating_config(raw: Any) -> Dict[str, Any]:
+    merged = _default_rating_config()
+    if isinstance(raw, dict):
+        for key in ("WINDOW_DAYS", "CAP_MIN", "CAP_MAX"):
+            if key in raw and raw[key] is not None:
+                try:
+                    merged[key] = int(raw[key])
+                except Exception:
+                    pass
+        if "YELLOW_WEIGHT" in raw and raw["YELLOW_WEIGHT"] is not None:
+            try:
+                merged["YELLOW_WEIGHT"] = float(raw["YELLOW_WEIGHT"])
+            except Exception:
+                pass
+        if "WEEKLY_CHECK_CRON" in raw and raw["WEEKLY_CHECK_CRON"]:
+            merged["WEEKLY_CHECK_CRON"] = str(raw["WEEKLY_CHECK_CRON"])
+        weights = raw.get("WEIGHTS")
+        if isinstance(weights, dict):
+            for w_key, w_val in weights.items():
+                if w_val is None:
+                    continue
+                try:
+                    merged["WEIGHTS"][str(w_key)] = int(w_val)
+                    continue
+                except Exception:
+                    try:
+                        merged["WEIGHTS"][str(w_key)] = float(w_val)
+                    except Exception:
+                        continue
+    return merged
+
 # ── bootstrap: json → env ----------------------------------------------------
+# ВАЖНО: читаем с utf-8-sig, чтобы не падать на BOM
 if CONFIG_JSON.exists():
     try:
-        with open(CONFIG_JSON, "r", encoding="utf-8") as _f:
+        with open(CONFIG_JSON, "r", encoding="utf-8-sig") as _f:
             _raw = json.load(_f)
         for _k, _v in (_raw or {}).items():
             env_key = str(_k).upper()
@@ -40,6 +102,10 @@ if CONFIG_JSON.exists():
     except Exception:
         # не мешаем запуску, просто игнорируем битый config.json
         pass
+
+# Поддержка альтернативного имени переменной для токена
+if "API_TOKEN" not in os.environ and "TELEGRAM_BOT_TOKEN" in os.environ:
+    os.environ["API_TOKEN"] = os.environ["TELEGRAM_BOT_TOKEN"]
 
 # ── dual-import для Pydantic или заглушек ------------------------------------
 _T = TypeVar("_T")
@@ -58,17 +124,25 @@ except (ModuleNotFoundError, ImportError):
         # для совместимости с main.py (model_dump()/dict())
         def dict(self) -> Dict[str, Any]:
             return dict(self.__dict__)
+
     def Field(  # type: ignore
         default: Any = None,
         *,
         env: str = "",
         default_factory: Callable[[], Any] | None = None
     ) -> Any:
+        # имитируем чтение из окружения для скаляров (как делает pydantic)
+        if env:
+            val = os.environ.get(env)
+            if val is not None:
+                return val
         return default_factory() if default_factory is not None else default
+
     def field_validator(field_name: str, mode: str = "before"):  # type: ignore
         def wrap(fn: Callable[..., Any]) -> Callable[..., Any]:
             return fn
         return wrap
+
     _V2 = False
 
 
@@ -143,6 +217,7 @@ class Settings(BaseSettings):
 
     # — AmoCRM fields (ID кастом-полей) —
     AMOCRM_FIELDS: Dict[str, str] = Field(default_factory=dict)
+    RATING: Dict[str, Any] = Field(default_factory=_default_rating_config)
 
     class Config:
         env_file = ".env"
@@ -218,7 +293,7 @@ class Settings(BaseSettings):
             return v
         if CONFIG_JSON.exists():
             try:
-                data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
+                data = json.loads(CONFIG_JSON.read_text(encoding="utf-8-sig"))
                 if isinstance(data.get("GAME_ROLE_MAPPING"), dict):
                     return data["GAME_ROLE_MAPPING"]  # type: ignore[return-value]
             except Exception:
@@ -242,7 +317,7 @@ class Settings(BaseSettings):
             return v
         if CONFIG_JSON.exists():
             try:
-                data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
+                data = json.loads(CONFIG_JSON.read_text(encoding="utf-8-sig"))
                 if isinstance(data.get("AMOCRM_FIELDS"), dict):
                     return data["AMOCRM_FIELDS"]  # type: ignore[return-value]
             except Exception:
@@ -265,6 +340,42 @@ class Settings(BaseSettings):
 
 # ── экспорт singleton --------------------------------------------------------
 settings = Settings()
+settings.RATING = _merge_rating_config(getattr(settings, "RATING", {}))
+
+# ── Fallback для окружения/типов при работе без pydantic ───────────
+# 1) API_TOKEN: если пуст — попробуем TELEGRAM_BOT_TOKEN
+if not getattr(settings, "API_TOKEN", ""):
+    settings.API_TOKEN = (os.getenv("API_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+
+# 2) Приведём к int ID'шники, если pydantic не сделал это сам
+def _as_int(x: Any) -> int:
+    try:
+        return int(str(x).strip())
+    except Exception:
+        return 0
+
+for _name in ("LEADER_ID", "POLLS_CHAT_ID", "LEADERS_CHAT_ID", "ADMIN_CHAT_ID"):
+    setattr(settings, _name, _as_int(getattr(settings, _name, 0)))
+
+# 3) Если dict-поля пустые — подхватим из config.json (учитываем BOM)
+try:
+    if CONFIG_JSON.exists():
+        _cfg = json.loads(CONFIG_JSON.read_text(encoding="utf-8-sig"))
+        if not getattr(settings, "GAME_ROLE_MAPPING", {}):
+            grm = _cfg.get("GAME_ROLE_MAPPING")
+            if isinstance(grm, dict):
+                settings.GAME_ROLE_MAPPING = grm
+        if not getattr(settings, "AMOCRM_FIELDS", {}):
+            af = _cfg.get("AMOCRM_FIELDS")
+            if isinstance(af, dict):
+                settings.AMOCRM_FIELDS = af
+        rating_raw = _cfg.get("RATING")
+        if isinstance(rating_raw, dict):
+            settings.RATING = _merge_rating_config(rating_raw)
+        else:
+            settings.RATING = _merge_rating_config(settings.RATING)
+except Exception:
+    pass
 
 # Фолбэк: если POLLS_CHAT_ID не задан/плейсхолдер, пробуем LEADERS_CHAT_ID → ADMIN_CHAT_ID.
 # Это устраняет 'Bad Request: chat not found' при публикации «Замены».
@@ -315,3 +426,5 @@ if __name__ == "__main__":
 # 2025-08-18 — выровнено под SSOT/фиксы Pylance: добавлены BRON_STATUS_ID, POLL_WINDOW_DAYS, GOOGLE_CREDENTIALS_JSON,
 #               безопасные дефолты вместо обязательных полей, нормализаторы chat_id/scopes, самотест.
 # 2025-08-26 — добавлен WON_STATUS_ID (финальный статус «Успешно реализовано») с поддержкой ENV/config.json.
+# 2025-09-12 — чтение config.json с utf-8-sig (BOM), фиксы ENV для режима без pydantic, фолбэки API_TOKEN/ID/словари.
+# 2025-09-17 — модуль рейтинга: выровнено под SSOT.
