@@ -7,11 +7,12 @@ from aiogram import F, Router, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from core.utils import dm_singleton_edit_or_send
+from core.state import state
 from services.ratings import get_user_stats
 
 router = Router(name="ratings_user")
 
-BUTTON_MY_RATING = "⭐ Рейтинг"
+BUTTON_MY_RATING = "⭐ Мой рейтинг"
 
 _GROUP_TITLES: Dict[str, str] = {
     "poll_reply": "Отклики",
@@ -41,6 +42,41 @@ def _format_groups(groups: Dict[str, int]) -> str:
 def _format_events(events: List[Dict[str, Any]], limit: int = 5) -> str:
     if not events:
         return "• Нет событий за период"
+    def _human_event_label(kind: str, meta: Optional[Dict[str, Any]] = None) -> str:
+        meta = meta or {}
+        mapping: Dict[str, str] = {
+            "poll_reply_d12": "📨 Отклик ≤12ч",
+            "poll_reply_d36": "📨 Отклик ≤36ч",
+            "poll_reply_late": "📨 Отклик (поздно)",
+            "confirm_d24": "✅ Подтверждение ≤24ч",
+            "confirm_d36": "✅ Подтверждение ≤36ч",
+            "confirm_late": "✅ Подтверждение (поздно)",
+            "game_main": "🎭 Вёл игру",
+            "game_assist": "🎭 Помогал в игре",
+            "game_admin": "🛡️ Администратор",
+            "game_trainee": "🧑‍💼 Стажёр",
+            "learn_game": "📚 Обучение/репетиция",
+            "urgent_replacement": "⚡ Срочная замена",
+            "manual_adjust": "🔧 Ручная поправка",
+            "bonus_hero": "🏅 Бонус за подвиг",
+            "miss_meeting": "🚫 Пропуск собрания",
+            "late": "⏰ Опаздание",
+            "poor_review": "⚠️ Некачественный разбор",
+            "attend_meeting": "✅ Выход на собрание",
+            "no_reply_penalty_w1": "⚠️ Не ответил (штраф)",
+            "no_reply_penalty_w2": "⚠️ Не ответил (повторный штраф)",
+            "cant_work_2w_row": "🚫 Не могу (2 недели подряд)",
+            "cant_work_3w_row": "🚫 Не могу (3 недели подряд)",
+        }
+        base = mapping.get(kind, kind)
+        if isinstance(meta, dict) and meta.get("delta_hours") is not None:
+            try:
+                dh = float(meta.get("delta_hours"))
+                base = f"{base} ({dh:.1f}ч)"
+            except Exception:
+                pass
+        return base
+
     lines: List[str] = []
     for item in events[:limit]:
         when_ts = int(item.get("when_ts", 0))
@@ -54,7 +90,17 @@ def _format_events(events: List[Dict[str, Any]], limit: int = 5) -> str:
                 suffix = f" (опрос {meta['poll_id']})"
             elif meta.get("deal_id"):
                 suffix = f" (сделка {meta['deal_id']})"
-        lines.append(f"• {when}: {kind} {points:+d}{suffix}")
+        label = _human_event_label(kind, meta)
+        if kind == "manual_adjust" and isinstance(meta, dict):
+            try:
+                delta = int(meta.get("delta", points))
+            except Exception:
+                delta = int(points)
+            reason = str(meta.get("reason") or "").strip()
+            reason_s = f" — {reason}" if reason else ""
+            lines.append(f"• {when}: {label} {delta:+d}{reason_s}{suffix}")
+        else:
+            lines.append(f"• {when}: {label} {points:+d}{suffix}")
     return "\n".join(lines)
 
 
@@ -65,6 +111,11 @@ def _rating_keyboard() -> InlineKeyboardMarkup:
 
 
 async def _render_user_rating(uid: int, message_id: Optional[int]) -> None:
+    # При показе «Мой рейтинг» — не сохранять отчётный дашборд лидера
+    try:
+        setattr(state, "suppress_report_keep", True)
+    except Exception:
+        pass
     stats = await get_user_stats(uid)
     score = int(stats.get("score", 0))
     baseline = int(stats.get("baseline", 0))
@@ -72,12 +123,17 @@ async def _render_user_rating(uid: int, message_id: Optional[int]) -> None:
     groups = stats.get("groups", {})
     events = stats.get("events", [])
     window_days = int(stats.get("window_days", 30))
-
+    try:
+        manual_val = int(stats.get("manual_delta", 0))
+    except Exception:
+        manual_val = 0
+    groups_display = dict(groups or {})
+    if manual_val:
+        groups_display["manual"] = groups_display.get("manual", 0) + int(manual_val)
     text = (
         f"⭐ Текущий рейтинг: <b>{score}</b> / 100\n\n"
         f"База (Светофор): {baseline}\n"
-        f"Ручная поправка: {manual:+d}\n"
-        f"События за {window_days} дн.:\n{_format_groups(groups)}\n\n"
+        f"События за {window_days} дн.:\n{_format_groups(groups_display)}\n\n"
         "Последние события:\n"
         f"{_format_events(events)}\n\n"
         "Совет: откликайтесь ≤ 12 часов (+2), подтверждайте ≤ 24 часов (+2),\n"
@@ -91,6 +147,11 @@ async def _render_user_rating(uid: int, message_id: Optional[int]) -> None:
         parse_mode="HTML",
         reply_markup=_rating_keyboard(),
     )
+    # вернуть флаг
+    try:
+        setattr(state, "suppress_report_keep", False)
+    except Exception:
+        pass
 
 
 @router.message(F.text == BUTTON_MY_RATING)

@@ -43,6 +43,11 @@ try:
 except Exception:  # pragma: no cover
     _vacuum_private = None  # type: ignore
 
+try:
+    from core.utils import resolve_notify_chat_id  # type: ignore
+except Exception:  # pragma: no cover
+    resolve_notify_chat_id = None  # type: ignore
+
 from services.gsheets import get_user_status_from_svetofor
 
 logger = logging.getLogger(__name__)
@@ -169,19 +174,44 @@ def _parse_uid(tag: Optional[str]) -> Optional[int]:
     return None
 
 
+async def team_bulleted_lines(slots: Dict[str, Any]) -> List[str]:
+    """
+    SSOT-функция для формирования строк состава команды.
+    Принимает словарь слотов и возвращает список строк с участниками.
+    В деталях суффиксы НЕ отображаются - они закрепляются только при утверждении игры.
+    """
+    lines: List[str] = []
+    
+    # Обрабатываем слоты в порядке приоритета
+    for key, value in slots.items():
+        if not value or not str(value).strip():
+            continue
+            
+        uid = _parse_uid(value)
+        if not uid:
+            continue
+            
+        human = await _short_name(uid)
+        
+        # В деталях суффиксы НЕ показываем - только имя
+        lines.append(f"– {human}")
+    
+    return lines
+
+
 async def _fmt(uid_: int, role_key: str) -> str:
     """
     Формирует тег для кэша распределения/подтверждений:
-      main    -> «Имя Ф.1|uid»
-      assist  -> «Имя Ф.2|uid»
-      admin   -> «Имя Ф.Адм|uid»
-      trainee -> «Имя Ф.Стаж|uid»
+    В деталях суффиксы НЕ отображаются - только имя и uid.
+    Суффиксы закрепляются только при утверждении игры руководителем.
+      main    -> «Имя Ф.|uid»
+      assist  -> «Имя Ф.|uid»
+      admin   -> «Имя Ф.|uid»
+      trainee -> «Имя Ф.|uid»
     """
-    from core.utils import role_suffix as _role_suffix
     human = await _short_name(uid_)
-    idx = 1 if role_key == "main" else (2 if role_key == "assist" else None)
-    suffix = _role_suffix(role_key, idx)
-    return f"{human}{suffix}|{uid_}".strip()
+    # В деталях суффиксы НЕ добавляем
+    return f"{human}|{uid_}".strip()
 
 
 async def _ensure_single_role(dist: Dict[str, str], need_main: int, need_assist: int) -> None:
@@ -211,7 +241,8 @@ async def _ensure_single_role(dist: Dict[str, str], need_main: int, need_assist:
 
 
 async def _normalize_tag_texts(dist: Dict[str, str], need_main: int, need_assist: int) -> None:
-    """Приводит тексты слотов к «Имя Ф.+суффикс|uid», пересобирая по uid."""
+    """Приводит тексты слотов к «Имя Ф.|uid», пересобирая по uid.
+    В деталях суффиксы НЕ отображаются - они закрепляются только при утверждении игры."""
     leads, assis = _role_slots(need_main, need_assist)
     for role, keys in (("main", leads), ("assist", assis)):
         for k in keys:
@@ -270,13 +301,20 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot, *, force_approved: bo
     except Exception:
         pass
 
-    # 0) Пылесос перед рендером (временно разрешаем снести дашборд отчёта)
+    # 0) Пылесос перед рендером (сохраняем меню и «Мои игры» как в дашборде)
     from core.state import state as _state
     _prev_flag = bool(getattr(_state, "suppress_report_keep", False))
     setattr(_state, "suppress_report_keep", True)
     logger.debug("[details:vacuum] uid=%s deal=%s suppress_report_keep=True", uid, deal_id)
+
+    # собираем keep-ids: главное меню + «Мои игры»
     try:
-        await _vacuum(uid, bot=bot, keep=[])
+        keep_ids = _collect_keep_ids(uid)  # та же утилита, что в [2.7]
+    except Exception:
+        keep_ids = []
+
+    try:
+        await _vacuum(uid, bot=bot, keep=keep_ids)
     finally:
         setattr(_state, "suppress_report_keep", _prev_flag)
         logger.debug("[details:vacuum] uid=%s deal=%s suppress_report_keep=%s(restored)", uid, deal_id, _prev_flag)
@@ -311,6 +349,33 @@ async def _render_detail(uid: int, deal_id: int, bot: Bot, *, force_approved: bo
     # 4) Сохраняем реестр и линкуем в last_user_messages — для корректной уборки внешним пылесосом
     _set_block(uid, deal_id, msgs)
     _link_to_last_user_messages(uid, msgs)
+
+    # ФРАГМЕНТ в конце функции, где ты уже получил список созданных сообщений:
+    # msgs = [header_id, main_id, main_alt_id, assist_id, ...]  # как у тебя в логе
+
+    from core.utils import vacuum_private as ssot_vacuum_private, keep_for_vacuum as ssot_keep_for_vacuum
+    import logging
+    log = logging.getLogger(__name__)
+
+    # …после сохранения индекса detail-блока:
+    try:
+        # 1) сначала фиксируем keep ровно на текущие детали (без дашборда)
+        # если у keep_for_vacuum есть параметр replace=True — используем его;
+        # если нет — просто передаём список; это безопасно.
+        try:
+            await ssot_keep_for_vacuum(uid, [getattr(m, "message_id", 0) for m in msgs], replace=True)  # предпочтительно, если поддерживается
+        except TypeError:
+            await ssot_keep_for_vacuum(uid, [getattr(m, "message_id", 0) for m in msgs])
+
+        # 2) и сразу запускаем «пылесос», чтобы снести старые сообщения
+        try:
+            await ssot_vacuum_private(uid, keep=[getattr(m, "message_id", 0) for m in msgs])  # сигнатура SSOT: vacuum_private(uid, keep=[...])
+        except TypeError:
+            await ssot_vacuum_private(uid)  # на случай старой сигнатуры — хуже, но не сломает
+
+        log.debug("[details:vacuum] uid=%s keep=%s (exclusive)", uid, [getattr(m, "message_id", 0) for m in msgs])
+    except Exception as e:
+        log.debug("[details:vacuum] skip: %s", e)
 
     # Диагностика: снимок реестра после рендера
     try:
@@ -1089,19 +1154,13 @@ def _parse_uid(val: Any) -> Optional[int]:
 
 async def _fmt(uid: int, _role: str = "") -> str:
     """
-    Формат слота 'Имя Ф.<суффикс>|uid' (имя — строго через SSOT short_name).
-    Суффиксы ролей (.1/.2/.Адм/.Стаж) — через core.utils.role_suffix.
-    ВНИМАНИЕ: индекс для main/assist здесь символический (1/2), как и в остальном проекте.
+    Формат слота 'Имя Ф.|uid' (имя — строго через SSOT short_name).
+    В деталях суффиксы НЕ отображаются - они закрепляются только при утверждении игры.
     """
     human = (getattr(state, "user_short", {}) or {}).get(uid) or (await _short_name(uid))
     base = (human or f"user{uid}").strip()
-    try:
-        from core.utils import role_suffix as _role_suffix  # SSOT
-        idx = 1 if _role == "main" else (2 if _role == "assist" else None)
-        suf = _role_suffix(_role, idx)
-    except Exception:
-        suf = ""  # мягкий фолбэк: без суффикса
-    return f"{base}{suf}|{uid}"
+    # В деталях суффиксы НЕ добавляем
+    return f"{base}|{uid}"
 
 
 def _role_cfg(game_name: str) -> Dict[str, int]:
@@ -1233,7 +1292,8 @@ async def _ensure_single_role(dist: Dict[str, Any], need_main: int, need_assist:
 async def _normalize_tag_texts(dist: Dict[str, Any], need_main: int, need_assist: int) -> None:
     """
     Создаём отсутствующие ключи слотов под фактическую конфигурацию ролей
-    И НОРМАЛИЗУЕМ тексты тегов к виду 'Имя Ф.<суффикс>|uid' для всех присутствующих uid.
+    И НОРМАЛИЗУЕМ тексты тегов к виду 'Имя Ф.|uid' для всех присутствующих uid.
+    В деталях суффиксы НЕ отображаются - они закрепляются только при утверждении игры.
     """
     # Создание ключей
     for i in range(1, max(1, need_main) + 1):
@@ -1243,7 +1303,7 @@ async def _normalize_tag_texts(dist: Dict[str, Any], need_main: int, need_assist
     dist.setdefault("admin", dist.get("admin", None))
     # trainee показывается отдельно — не влияет на готовность
 
-    # Нормализация содержимого (если в слоте есть uid)
+    # Нормализация содержимого (если в слоте есть uid) - без суффиксов в деталях
     for i in range(1, max(1, need_main) + 1):
         k = f"lead{i}"
         u = _parse_uid(dist.get(k))
@@ -1439,18 +1499,31 @@ async def _build_blocks(*, bot: Bot, uid: int, deal_id: int, force_approved: boo
     need_assist = int(cfg.get("assistants", 0))
     need_admin = _need_admin_by_package(str(deal.get("package") or ""))
 
-    respondents = await _get_respondents(deal_id)  # uid → {status, is_admin_eligible}
+    # Предзагружаем все данные участников одним пакетом
+    try:
+        from performance_fixes import get_all_participants
+        preloaded_data = await get_all_participants(deal_id, g_name)
+    except ImportError:
+        # Fallback на старый способ
+        respondents = await _get_respondents(deal_id)
+        preloaded_data = {"respondents": respondents, "statuses": {}, "names": {}}
+    
+    respondents = preloaded_data["respondents"]
     dist: Dict[str, Any] = (getattr(state, "distribution_cache", {}) or {}).setdefault(str(deal_id), {})
     await _normalize_tag_texts(dist, need_main, need_assist)
     await _ensure_single_role(dist, need_main, need_assist)
 
-    async def _compose_role(role: str, title: str, icon: str, need: int) -> Tuple[Optional[str], Optional[InlineKeyboardMarkup]]:
+    async def _compose_role(role: str, title: str, icon: str, need: int, preloaded_data: Dict[str, Any]) -> Tuple[Optional[str], Optional[InlineKeyboardMarkup]]:
         """
         Печать выбранных и альтернатив.
         ВАЖНО: выбранные (назначенные) берём ТОЛЬКО из dist — без фильтра по respondents,
         чтобы не скрывать вручную назначенных, кто не отвечал в опросе.
         Альтернативы формируем по respondents с фильтрацией «светофора».
         """
+        # Используем предзагруженные данные
+        statuses = preloaded_data.get("statuses", {})
+        names = preloaded_data.get("names", {})
+        respondents = preloaded_data.get("respondents", {})
         if need <= 0:
             if role == "admin":
                 dist.pop("admin", None)
@@ -1472,29 +1545,45 @@ async def _build_blocks(*, bot: Bot, uid: int, deal_id: int, force_approved: boo
                 if u:
                     chosen.append((u, ""))
 
-        # пометки по «светофору» для отображения
+        # пометки по «светофору» для отображения (используем предзагруженные данные)
         if role != "admin":
             tmp: List[Tuple[int, str]] = []
             for u, _m in chosen:
-                st = await _status_cached(u, g_name)
+                st = statuses.get(u, "")
                 mark = "🟢" if st == "green" else ("🟡" if st == "yellow" else "")
                 tmp.append((u, mark))
             chosen = tmp
 
         ready = len([u for u, _ in chosen]) >= need
         lines = [f"─────{icon} *{title.upper()}* ────", f"{'✅' if ready else '❌'} {min(len(chosen), need)}/{need}"]
-        for u, mark in chosen[:max(need, 0)]:
-            human = (getattr(state, "user_short", {}) or {}).get(u) or (await _short_name(u))
-            lines.append(f"– {human} {mark}")
+        
+        # Формируем слоты для team_bulleted_lines
+        slots_for_team = {}
+        for i, (u, mark) in enumerate(chosen[:max(need, 0)]):
+            if role == "admin":
+                slots_for_team["admin"] = await _fmt(u, "admin")
+            elif role == "main":
+                slots_for_team[f"lead{i+1}"] = await _fmt(u, "main")
+            elif role == "assist":
+                slots_for_team[f"assistant{i+1}"] = await _fmt(u, "assist")
+        
+        team_lines = await team_bulleted_lines(slots_for_team)
+        
+        # Добавляем маркеры статуса
+        for i, (u, mark) in enumerate(chosen[:max(need, 0)]):
+            if i < len(team_lines) and mark:
+                team_lines[i] += f" {mark}"
+        
+        lines.extend(team_lines)
         text = "\n".join(lines)
 
         # альтернативы — только из откликнувшихся, не занятых в выбранных
         chosen_uids = {u for u, _ in chosen}
 
-        async def _fits_for_block(user_id: int) -> bool:
+        def _fits_for_block(user_id: int) -> bool:
             if role == "admin":
                 return bool(respondents.get(user_id, {}).get("is_admin_eligible"))
-            st = await _status_cached(user_id, g_name)
+            st = statuses.get(user_id, "")
             if role == "main":
                 return st == "green"
             if role == "assist":
@@ -1502,33 +1591,34 @@ async def _build_blocks(*, bot: Bot, uid: int, deal_id: int, force_approved: boo
             return False
 
         kb = None
-        alts = [u for u in respondents.keys() if (u not in chosen_uids) and (await _fits_for_block(u))]
+        alts = [u for u in respondents.keys() if (u not in chosen_uids) and _fits_for_block(u)]
         if alts:
             kbld = InlineKeyboardBuilder()
             for u in alts:
                 if role == "admin":
                     mark = "🛡️"
                 else:
-                    st = await _status_cached(u, g_name)
+                    st = statuses.get(u, "")
                     mark = "🟢" if st == "green" else ("🟡" if st == "yellow" else "")
-                human = (getattr(state, "user_short", {}) or {}).get(u) or (await _short_name(u))
+                human = names.get(u, f"uid:{u}")
+                # В деталях нужна ИМЕННО прямая рокировка:
+                # жмём альтернативу → сразу swap_{deal_id}_{role}_{uid} → poll_swap_handler
                 kbld.button(text=f"{human} {mark}", callback_data=f"swap_{deal_id}_{role}_{u}")
             kbld.adjust(1)
             kb = kbld.as_markup()
 
         return text, kb
 
-    # Секции ролей
-    main_text, main_alt = await _compose_role("main", "Ведущие", "🎤", need_main)
-    assist_text, assist_alt = await _compose_role("assist", "Помощники", "🧑‍🤝‍🧑", need_assist)
+    # Секции ролей (с предзагруженными данными)
+    main_text, main_alt = await _compose_role("main", "Ведущие", "🎭", need_main, preloaded_data)
+    assist_text, assist_alt = await _compose_role("assist", "Помощники", "🤝", need_assist, preloaded_data)
     admin_text, admin_alt = (None, None)
     if need_admin:
-        admin_text, admin_alt = await _compose_role("admin", "Администратор", "🛡️", 1)
+        admin_text, admin_alt = await _compose_role("admin", "Администратор", "🛡️", 1, preloaded_data)
     else:
         dist.pop("admin", None)
 
     # Стажёр (всегда отображаем; не влияет на индикатор комплектности)
-    trainee_text: Optional[str] = None
     trainee_uid: Optional[int] = _parse_uid(dist.get("trainee"))
     occupied: Set[int] = {
         *[(_parse_uid(dist.get(f"lead{i}")) or -1) for i in range(1, need_main + 1)],
@@ -1546,8 +1636,15 @@ async def _build_blocks(*, bot: Bot, uid: int, deal_id: int, force_approved: boo
         if trainee_uid not in reds:
             trainee_uid = reds[0]
             dist["trainee"] = await _fmt(trainee_uid, "trainee")
-        human = (getattr(state, "user_short", {}) or {}).get(trainee_uid) or (await _short_name(int(trainee_uid)))  # type: ignore[arg-type]
-        trainee_text = "\n".join(["───── 👷 *СТАЖЁР* ─────", f"– {human} 🔴", "_Стажёр не влияет на индикатор набора._"])
+        
+        # Используем team_bulleted_lines для стажёра
+        trainee_slots = {"trainee": dist["trainee"]}
+        trainee_lines = await team_bulleted_lines(trainee_slots)
+        trainee_text_lines = ["───── 👷 *СТАЖЁР* ─────"]
+        if trainee_lines:
+            trainee_text_lines.extend([line + " 🔴" for line in trainee_lines])
+        trainee_text_lines.append("_Стажёр не влияет на индикатор набора._")
+        trainee_text = "\n".join(trainee_text_lines)
     else:
         dist.pop("trainee", None)
         trainee_text = "───── 👷 *СТАЖЁР* ─────\n_Пока никого._\n_Стажёр не влияет на индикатор набора._"
@@ -1555,6 +1652,23 @@ async def _build_blocks(*, bot: Bot, uid: int, deal_id: int, force_approved: boo
     # Кнопки управления
     is_locked = (deal_id in (getattr(state, "locked_distribution", {}) or {})) or (str(deal_id) in (getattr(state, "locked_distribution", {}) or {}))
     is_force_closed = deal_id in (getattr(state, "deal_force_closed", set()) or set())
+    
+    # Проверяем статус сделки
+    deal_status = str(deal.get("status_id") or "")
+    ok_status_id = str(getattr(settings, "SUCCESSFUL_STATUS_ID", "") or "")
+    is_success_status = ok_status_id and deal_status == ok_status_id
+    
+    # Проверяем, назначен ли пользователь в утвержденном составе
+    user_assigned = False
+    if is_success_status:
+        locked_dist = (getattr(state, "locked_distribution", {}) or {}).get(deal_id) or (getattr(state, "locked_distribution", {}) or {}).get(str(deal_id)) or {}
+        for slot_key, slot_value in locked_dist.items():
+            if isinstance(slot_key, str) and slot_key.startswith(("lead", "assistant")) or slot_key == "admin":
+                slot_uid = _parse_uid(slot_value)
+                if slot_uid == uid:
+                    user_assigned = True
+                    break
+    
     mgr_kb = None
     if (getattr(state, "current_poll_leader", None) == uid) and not is_force_closed:
         kb_mgr = InlineKeyboardBuilder()
@@ -1562,9 +1676,17 @@ async def _build_blocks(*, bot: Bot, uid: int, deal_id: int, force_approved: boo
             kb_mgr.button(text="✅ Утверждено", callback_data="noop")
         else:
             kb_mgr.button(text=f"✅ Утвердить игру", callback_data=f"poll_approve_{deal_id}")
+        
+        # Проверяем наличие активной замены
+        has_swap = deal_id in (getattr(state, "swap_open", {}) or {})
+        if has_swap:
+            kb_mgr.button(text="❌ Отменить запрос на замену", callback_data=f"swap_cancel_{deal_id}")
+        # Убрана кнопка "Попросить замену" из деталей отчета по опросу
+        
         kb_mgr.button(text="⏹️ Стоп набор", callback_data=f"poll_stop_{deal_id}")
         kb_mgr.adjust(1)
         mgr_kb = kb_mgr.as_markup()
+    # Убираем кнопку "Попросить замену" из деталей отчета по опросу
 
     # Назад
     back_kb = InlineKeyboardMarkup(
@@ -1633,9 +1755,45 @@ async def render_detail_legacy(uid: int, deal_id: int, *_, **__) -> None:
 #                refresh_deal_details — патч по индексам, точечные пересоздания, без «массового» delete;
 #                разбито на подпункты 2.1.1–2.1.7; фиксы Pylance/тайпинги; «тихая замена» стабилизирована.
 
-# ███ [2.6] SWAP (альтернативы) — ручное назначение кандидата на роль (с УМНОЙ РОКИРОВКОЙ)
+# ███ [2.6] SWAP (альтернативы) — делегирующие callback'и в handlers.polls_lifecycle
 # --------------------------------------------------------------------
-@router.callback_query(lambda c: c.data and c.data.startswith("swap_"))
+@router.callback_query(lambda c: c.data and c.data.startswith("swap_request_"))
+async def poll_swap_request_handler(callback: types.CallbackQuery) -> None:
+    """Делегирующий обработчик для запросов замены."""
+    try:
+        from handlers.polls_lifecycle import swap_request_handler
+        await swap_request_handler(callback)
+    except Exception as e:
+        logger.exception("[poll_details] swap_request delegate failed: %s", e)
+        with contextlib.suppress(Exception):
+            await callback.answer("Ошибка обработки запроса замены.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("swap_cancel_"))
+async def poll_swap_cancel_handler(callback: types.CallbackQuery) -> None:
+    """Делегирующий обработчик для отмены замены."""
+    try:
+        from handlers.polls_lifecycle import swap_cancel_handler
+        await swap_cancel_handler(callback)
+    except Exception as e:
+        logger.exception("[poll_details] swap_cancel delegate failed: %s", e)
+        with contextlib.suppress(Exception):
+            await callback.answer("Ошибка обработки отмены замены.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("swap_request_menu_"))
+async def poll_swap_request_menu_handler(callback: types.CallbackQuery) -> None:
+    """Делегирующий обработчик для меню запроса замены."""
+    try:
+        from handlers.polls_lifecycle import swap_request_menu_handler
+        await swap_request_menu_handler(callback)
+    except Exception as e:
+        logger.exception("[poll_details] swap_request_menu delegate failed: %s", e)
+        with contextlib.suppress(Exception):
+            await callback.answer("Ошибка обработки меню замены.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("swap_") and not c.data.startswith(("swap_request_", "swap_cancel_")))
 async def poll_swap_handler(callback: types.CallbackQuery) -> None:
     """
     Переназначение из альтернатив:
@@ -1858,6 +2016,7 @@ async def poll_swap_handler(callback: types.CallbackQuery) -> None:
             await callback.answer("✅ Переназначено", show_alert=False)
             answered = True
 
+    # Обновление через тихий refresh
     await refresh_deal_details(bot=bot, deal_id=deal_id, uid=callback.from_user.id)
 
 # История изменений [2.6]:
@@ -2133,6 +2292,15 @@ async def _test_fmt_status() -> None:
     """Локальный тест форматирования и кэша статуса."""
     print(await _fmt(1, "main"))
     print(await _status_cached(1, "Цветочная башня"))
+    
+    # Тест team_bulleted_lines
+    test_slots = {
+        "lead1": "Иван И.1|111",
+        "assistant1": "Пётр П.2|222",
+        "admin": "Админ А.Адм|333"
+    }
+    lines = await team_bulleted_lines(test_slots)
+    print("Team lines:", lines)
 
 
 async def _test():
@@ -2147,5 +2315,6 @@ if __name__ == "__main__":
 
 # История изменений:
 # • 2025-08-24 — v13.4: починен ручной SWAP, выровнено хранение «Имя Ф.|uid», стабилен пылесос в деталях,
-
 #                       совместимость с aiogram 3.x и SSOT, добавлены мягкие guard'ы и self-tests.
+# • 2025-01-16 — блок «Стажёр» всегда показывается; кнопки замены делегируются в polls_lifecycle;
+#                обновление после swap через тихий refresh; все строки состава через team_bulleted_lines.

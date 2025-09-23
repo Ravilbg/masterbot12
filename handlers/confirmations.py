@@ -742,7 +742,8 @@ async def _maybe_move_to_success(deal_id: int) -> None:
     """
     Переводит сделку в «Завершение сделки» ТОЛЬКО если:
       • все требуемые роли подтвердили участие (CRM>LOCAL);
-      • текущий статус сделки — «Бронь».
+      • текущий статус сделки — «Бронь»;
+      • нет активного запроса замены (state.swap_open).
     Для «Предварительной заявки» и любого другого статуса — статус НЕ меняем.
     Уведомление «вся команда подтвердила» всегда отправляет handlers.my_games.announce_if_all_confirmed.
 
@@ -818,6 +819,11 @@ async def _maybe_move_to_success(deal_id: int) -> None:
             all_ok = ok
 
         if not all_ok:
+            return
+        
+            # Проверяем активный запрос замены
+        if hasattr(state, 'swap_open') and deal_id in getattr(state, 'swap_open', {}):
+            logger.debug("[confirm] swap request active for deal %s — skip status change", deal_id)
             return
         # Попытка явного скрытия из отчёта, если есть хук в polls_lifecycle
         try:
@@ -975,10 +981,16 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
     if not tag_text:
         suffix = _suffix_for_role(role)
         tag_text = f"{human}{suffix}" if human.endswith(".") else f"{human}.{suffix}"
+    else:
+        # Берем имя+суффикс до | из SSOT формата
+        tag_text = tag_text.split('|')[0].strip()
 
     slot_key = await _slot_key_for_user(deal_id, uid)
+    # Используем services.amocrm.update_amocrm_tags с частью до | из формата
     with contextlib.suppress(Exception):
-        await _amo_add_tag(deal_id, tag_text, slot_key=slot_key)
+        from services.amocrm import update_amocrm_tags
+        payload = {str(deal_id): {slot_key or "tag": tag_text}}
+        await update_amocrm_tags(payload)
 
     pc = state.pending_confirmations.setdefault(deal_id, {})
     if not isinstance(pc.get("confirmed"), dict):
@@ -1022,6 +1034,26 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
                 )
                 urgent_award.pop(int(deal_id), None)
                 urgent_award.pop(str(deal_id), None)
+        # Доп. совместимость: если кандидат помечен через handlers/swap (swap_urgent_candidates)
+        try:
+            cand_map = getattr(state, "swap_urgent_candidates", {}) or {}
+            cand_uid = cand_map.get(int(deal_id)) or cand_map.get(str(deal_id))
+            if cand_uid and int(cand_uid) == int(uid):
+                await record_event(
+                    uid,
+                    "urgent_replacement",
+                    {"deal_id": str(deal_id)},
+                    when=now_ts,
+                    deal_id=str(deal_id),
+                )
+                # очистим флаг
+                try:
+                    cand_map.pop(int(deal_id), None)
+                    cand_map.pop(str(deal_id), None)
+                except Exception:
+                    pass
+        except Exception:
+            logger.debug("[rating] swap_urgent_candidates hook failed")
     except Exception as exc:
         logger.debug("[rating] confirm hook failed: %s", exc)
 
@@ -1087,7 +1119,8 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
                 when = f"{d_s} {t_s}".strip()
 
                 role_human_map = {"main": "Ведущий", "assist": "Помощник", "admin": "Админ", "trainee": "Стажёр"}
-                role_emoji_map = {"main": "🎤", "assist": "🤝", "admin": "🛡️", "trainee": "👷"}
+                # main role emoji should be theatrical mask
+                role_emoji_map = {"main": "�", "assist": "🤝", "admin": "🛡️", "trainee": "👷"}
                 role_human = role_human_map.get(role, "Участник")
                 r = role_emoji_map.get(role, "👤")
 
@@ -1117,8 +1150,17 @@ async def _perform_confirm(callback: CallbackQuery, deal_id: int, role: str) -> 
     with contextlib.suppress(Exception):
         await _safe_answer(callback, "Готово ✅")
 
+    # Общий refresh/перерисовка кнопок в «Мои игры» и деталях
+    try:
+        from handlers.my_games import refresh_all_user_games
+        with contextlib.suppress(Exception):
+            await refresh_all_user_games(uid)
+    except Exception:
+        pass
+
 # История изменений:
 # 2025-08-31 · скрытие игры из отчёта и перенос «замков» в finished_* вместо удаления (сохранение в «Моих играх» до пост-отчёта)
+# 2025-09-22 — подтверждения: блокировка при pending swap; авто-перевод статуса после закрытия
 
 
 
@@ -1216,4 +1258,6 @@ if __name__ == "__main__":
 # 2025-08-19 — _read_status_info и строгая логика перевода в SUCCESS (только из «Бронь»).
 # 2025-08-24 — предотвращён автопереход в детали при подтверждении из «Мои игры».
 # 2025-09-17 · модуль рейтинга: выровнено под SSOT.
+# 2025-01-20 — проверка активного запроса замены (swap_open); теги из SSOT формата до |.
+# 2025-09-22 — подтверждения: блокировка при pending swap; авто-перевод статуса после закрытия.
 

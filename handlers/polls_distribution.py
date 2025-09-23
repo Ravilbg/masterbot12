@@ -1334,6 +1334,8 @@ async def poll_approve_all_ready_handler(callback: CallbackQuery) -> None:
                 try:
                     header = _approval_header_line(did)
                     lines = await _lines_from_slots(slots)
+                    joined_lines = "\n".join(lines)
+                    body = f"{joined_lines}\n" if joined_lines else ""
                     text = (
                         f"📣 {header}\n"
                         f"Состав команды на игру утвержден.\n"

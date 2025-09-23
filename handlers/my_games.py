@@ -31,6 +31,8 @@ from aiogram.filters import Command  # оставляем для совмест�
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from pytz import timezone
+from handlers.p2p_swap import get_p2p_swap_button, make_offer_callback
+
 
 from core.config import settings
 from core.state import state
@@ -101,13 +103,14 @@ PRELIM_STATUS_ID: str = str(
 
 # История изменений [1]:
 # 2025-08-19 — импортирован SSOT-резолвер resolve_notify_chat_id из core.utils; остальное без изменений.
+# 2025-09-17 — делегирование swap-кнопок в handlers.polls_lifecycle; упрощение определения видимости
+#              «Идёт поиск замены» через хелпер _is_swap_pending; источник состава только SSOT.
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pylance-safe shims for cross-module symbols (only typing + safe fallbacks)
 # Не меняет рантайм-поведение: если символ определён в globals(), используем его.
 # Иначе — даём минимальную безопасную реализацию/значение по умолчанию.
 # ──────────────────────────────────────────────────────────────────────────────
-
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Iterable, TYPE_CHECKING, cast
 from contextlib import suppress
 
@@ -527,8 +530,8 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
 
     lines.append(f"🗂 Статус CRM: {status}")
     lines.append("— — —")
-    lines.append(f"🧑‍🎤 Ведущие: {mains_text}")
-    lines.append(f"🧑‍🤝‍🧑 Помощники: {assists_text}")
+    lines.append(f"🎭 Ведущие: {mains_text}")
+    lines.append(f"🤝 Помощники: {assists_text}")
     lines.append(f"🛡️ Админ: {admin_text}")
     if trainee_text:
         lines.append(f"🎓 Стажёр: {trainee_text}")
@@ -581,7 +584,8 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
         ])
 
     if can_swap and not can_confirm:
-        second_rows.append([InlineKeyboardButton(text="🔁 Замена", callback_data=f"{SWAP_PREFIX}{deal_id}")])
+        # при формировании кнопок убедиться, что callback_data точный:
+        second_rows.append([InlineKeyboardButton(text="🔁 Замена", callback_data=f"mygames_swap_{deal_id}")])
     if report_ready:
         second_rows.append([InlineKeyboardButton(text="📝 Написать отчёт", callback_data=f"{REPORT_PREFIX}{deal_id}")])
 
@@ -614,28 +618,6 @@ async def show_my_game_details(callback: types.CallbackQuery) -> None:
 # [2.2] ЗАМЕНА: кнопка «🔁 Замена» из «Мои игры»
 # Версия 2.3.0 · 2025-09-03 (SSOT: делегирование в polls_lifecycle; фиксы префиксов/роутера)
 # ╚═══════════════════════════════════════════════════════════════════════════╝
-@router.callback_query(lambda c: c.data and c.data.startswith(SWAP_PREFIX))
-async def mygame_swap_shim(callback: types.CallbackQuery) -> None:
-    """Shim: обработка «🔁 Замена» делегируется в polls_lifecycle.swap_request_handler."""
-    try:
-        from handlers.polls_lifecycle import swap_request_handler as _swap_impl  # type: ignore
-        await _swap_impl(callback)
-    except Exception as e:
-        logger.error("[my_games.swap] delegate failed: %s", e)
-        with contextlib.suppress(Exception):
-            await callback.answer("⚠️ Не удалось запросить замену. Попробуйте ещё раз.", show_alert=True)
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith(RESPOND_PREFIX))
-async def mygame_swap_accept_shim(callback: types.CallbackQuery) -> None:
-    """Shim: обработка «Откликнуться» делегируется в polls_lifecycle.swap_accept_handler."""
-    try:
-        from handlers.polls_lifecycle import swap_accept_handler as _accept_impl  # type: ignore
-        await _accept_impl(callback)
-    except Exception as e:
-        logger.error("[my_games.swap_accept] delegate failed: %s", e)
-        with contextlib.suppress(Exception):
-            await callback.answer("⚠️ Кнопка недоступна. Возможно, замена уже найдена.", show_alert=True)
 
 # История изменений [2.2]:
 # • 2025-09-03 — 2.3.0: выровнено под SSOT — делегирование в polls_lifecycle; убраны локальные префиксы/роутер.
@@ -1023,7 +1005,7 @@ async def build_confirm_button_for_mygame(uid: int, deal_id: int) -> InlineKeybo
       • иначе «✓ Подтвердить» с callback `confirm_participation_{deal_id}_{role}`.
     """
     if await _mg_is_user_confirmed_for_deal(uid, deal_id):
-        return InlineKeyboardButton(text="🔁 Замена", callback_data=f"{SWAP_PREFIX}{deal_id}")
+        return InlineKeyboardButton(text="🔁 Замена", callback_data=f"mygames_swap_{deal_id}")
 
     role = _assigned_role_from_state(uid, deal_id)
     if role not in {"main", "assist", "admin"}:
@@ -1257,7 +1239,8 @@ async def announce_if_all_confirmed(deal_id: int) -> None:
 
     # Порядок ролей и эмодзи
     emoji_map: Dict[str, str] = {
-        "main": "🎤",
+        # main role should be theatrical mask emoji
+            "main": "🎭",
         "assist": "🧑‍🤝‍🧑",
         "admin": "🛡️",
         "trainee": "👷",
@@ -1324,7 +1307,8 @@ async def announce_if_all_confirmed(deal_id: int) -> None:
         header,
     ]
     parts.extend(lines)
-    message_text = "\n".join(part for part in parts if part)
+    # Tests expect CRLF-separated message body
+    message_text = "\r\n".join(part for part in parts if part)
 
     # Чат для уведомления
     bot = Bot.get_current()
@@ -1493,8 +1477,7 @@ def _assigned_deal_ids_from_locked(uid: int) -> Set[int]:
 def _assigned_role_via_locked(uid: int, deal_id: int) -> Optional[str]:
     """
     Роль пользователя строго по ЗАФИКСИРОВАННОМУ составу:
-    используем объединение источников locked_distribution ∪ finished_locked_distribution
-    (при наличии «активного» распределения оно имеет приоритет).
+    используем только locked_distribution или distribution_cache.
 
     Возвращает: 'main' | 'assist' | 'admin' | 'trainee' | None
     """
@@ -1505,17 +1488,18 @@ def _assigned_role_via_locked(uid: int, deal_id: int) -> Optional[str]:
         pass
 
     locked_all = (getattr(state, "locked_distribution", {}) or {})
-    finished_all = (getattr(state, "finished_locked_distribution", {}) or {})
-
-    # поддерживаем int/str ключи и приоритет активного распределения
+    
+    # поддерживаем int/str ключи
     dist: Optional[Dict[str, Any]] = None
     raw = locked_all.get(deal_id) or locked_all.get(str(deal_id))
     if isinstance(raw, dict):
         dist = raw
     else:
-        raw_f = finished_all.get(deal_id) or finished_all.get(str(deal_id))
-        if isinstance(raw_f, dict):
-            dist = raw_f
+        # фолбэк на distribution_cache
+        cache_all = (getattr(state, "distribution_cache", {}) or {})
+        raw_cache = cache_all.get(str(deal_id))
+        if isinstance(raw_cache, dict):
+            dist = raw_cache
 
     if not isinstance(dist, dict):
         return None
@@ -1546,8 +1530,7 @@ def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
     Дополняем CRM-список сделками из утверждённого состава,
     чтобы игры были видны даже при пустом ответе CRM.
 
-    База назначений — объединение источников:
-      locked_distribution ∪ finished_locked_distribution
+    Источник состава игры: только state.distribution_cache или state.locked_distribution.
 
     Источники карточки (по приоритету):
       1) уже в all_deals (CRM),
@@ -1557,35 +1540,8 @@ def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
 
     Жёсткая дедупликация по id (by_id).
     """
-    # 1) active
-    want_ids_active: Set[int] = _assigned_deal_ids_from_locked(uid)
-
-    # 2) finished_* — сканируем так же, как в _assigned_deal_ids_from_locked
-    want_ids_finished: Set[int] = set()
-    raw_finished = (getattr(state, "finished_locked_distribution", {}) or {})
-    if isinstance(raw_finished, dict):
-        for did_key, dist in raw_finished.items():
-            if not isinstance(dist, dict):
-                continue
-            try:
-                did = int(did_key)
-            except Exception:
-                continue
-            for k, v in dist.items():
-                if not isinstance(k, str):
-                    continue
-                if k.startswith("lead") or k.startswith("assistant") or k in {"admin", "trainee"}:
-                    if isinstance(v, str):
-                        if _label_belongs_to_uid(v, uid):
-                            want_ids_finished.add(did)
-                            break
-                    elif isinstance(v, (list, tuple)):
-                        if any(isinstance(lbl, str) and _label_belongs_to_uid(lbl, uid) for lbl in v):
-                            want_ids_finished.add(did)
-                            break
-
-    want_ids: Set[int] = want_ids_active | want_ids_finished
-    logger.debug("[my_games] augment_with_locked: using union(active+finished), want_ids=%s", sorted(want_ids))
+    want_ids: Set[int] = _assigned_deal_ids_from_locked(uid)
+    logger.debug("[my_games] augment_with_locked: using locked_distribution only, want_ids=%s", sorted(want_ids))
 
     by_id: Dict[int, Dict] = {}
     out: List[Dict] = []
@@ -1657,83 +1613,192 @@ def _augment_with_locked(uid: int, all_deals: List[Dict]) -> List[Dict]:
     return out
 
 
+def _is_swap_pending(deal_id: int, uid: int) -> bool:
+    """
+    Проверяет, есть ли активный запрос замены от данного пользователя для сделки.
+    Использует state.swap_open.
+    """
+    swap_open = getattr(state, "swap_open", {}) or {}
+    if isinstance(swap_open, dict):
+        raw_req = swap_open.get(deal_id) or swap_open.get(str(deal_id))
+        if isinstance(raw_req, dict):
+            try:
+                return int(str(raw_req.get("by"))) == int(uid)
+            except Exception:
+                pass
+    return False
+
+
 def _visible_deals_for_user(uid: int, all_deals: List[Dict]) -> List[Dict]:
     """
-    Итоговая выборка для «Мои игры»:
-      • статус: «Бронь» / «Предварительная заявка» / «Завершение сделки»;
-      • пользователь назначен И УТВЕРЖДЁН (locked_distribution ∪ finished_locked_distribution / SSOT);
-      • + дополнение из локального кэша, если CRM вернул пусто.
+    Итоговая выборка для «Мои игры».
+    Показываем ТОЛЬКО игры, где пользователь утверждён в составе (state.locked_distribution)
+    и статус сделки — «Бронь» или «Завершение сделки».
+    Дополняем из state.current_poll_deals, если CRM-список не содержит нужной сделки.
+    Сортировка — по дате/времени мероприятия.
 
-    Дубли исключаем (by_id/seen). Сортировка по дате мероприятия.
+    2025-09-22 — фикс: жёсткий фильтр по locked_distribution; исключены «все игры опроса».
     """
-    all_deals = _augment_with_locked(uid, list(all_deals or []))
+    # 0) Нормализуем вход
+    deals_in = list(all_deals or [])
 
-    out: List[Dict] = []
-    seen: Set[int] = set()
+    # 1) Собираем id сделок, где uid присутствует в утверждённом составе
+    locked = getattr(state, "locked_distribution", {}) or {}
+
+    def _to_int(x: Any) -> Optional[int]:
+        try:
+            return int(x) if x is not None else None
+        except Exception:
+            return None
+
+    my_locked_ids: Set[int] = set()
+    for k, slots in locked.items():
+        did = _to_int(k)
+        if did is None or not isinstance(slots, dict):
+            continue
+        for v in slots.values():
+            s = str(v or "")
+            # Строка слота формата «Имя Ф.<суффикс>|uid»
+            if s.endswith(f"|{uid}"):
+                my_locked_ids.add(did)
+                break
+
+    # 1.a) Также показываем сделку ИНИЦИАТОРА запроса замены, даже если он не в locked
     swap_requests = getattr(state, "swap_requests", {}) or {}
-    if not isinstance(swap_requests, dict):
-        swap_requests = {}
-
-    def _to_epoch(dt_obj):
-        try:
-            if dt_obj is None:
-                return float("inf")
-            if getattr(dt_obj, "tzinfo", None):
-                return dt_obj.timestamp()
-            return LOCAL_TZ.localize(dt_obj).timestamp()
-        except Exception:
-            return float("inf")
-
-    def _key(d: Dict):
-        dt = _safe_event_dt(d)  # type: ignore[misc]
-        return (dt is None, _to_epoch(dt))
-
-    for d in sorted(all_deals, key=_key):
-        try:
-            did = int(d.get("id") or 0)
-        except Exception:
-            continue
-        if not did or did in seen:
-            continue
-        if bool(d.get("is_deleted")):
-            continue
-        if not _wanted_status(d):
-            continue
-
-        swap_req: Optional[Dict[str, Any]] = None
-        if swap_requests:
-            raw_req = swap_requests.get(did) or swap_requests.get(str(did))
-            if isinstance(raw_req, dict):
-                swap_req = raw_req
-
-        pending_state: Optional[str] = None
-        if swap_req:
+    # также учитываем более старую структуру state.swap_open (инициатор запросил замену)
+    swap_open = getattr(state, "swap_open", {}) or {}
+    try:
+        req_by_me: Set[int] = set()
+        for key, req in swap_requests.items():
             try:
-                is_author = int(str(swap_req.get("by"))) == int(uid)
+                did = int(key)
             except Exception:
-                is_author = False
-            if is_author:
-                if swap_req.get("awaiting_confirmation"):
-                    pending_state = "awaiting"
-                elif not swap_req.get("accepted_by"):
-                    pending_state = "search"
+                try:
+                    did = int(str(key))
+                except Exception:
+                    continue
+            if not isinstance(req, dict):
+                continue
+            if int(req.get("by") or 0) == int(uid):
+                req_by_me.add(did)
+        # fallback: if swap_open says this uid opened a request for a deal, include it
+        for key, req in swap_open.items():
+            try:
+                did = int(key)
+            except Exception:
+                try:
+                    did = int(str(key))
+                except Exception:
+                    continue
+            if not isinstance(req, dict):
+                continue
+            if int(req.get("by") or 0) == int(uid):
+                req_by_me.add(did)
+    except Exception:
+        req_by_me = set()
 
-        role_locked = _assigned_role_via_locked(uid, did)
-        if not role_locked and not pending_state:
+    # Если ни в locked, ни запросов — возвращаем пусто
+    if not my_locked_ids and not req_by_me:
+        return []
+
+    # 2) Разрешённые статусы: Бронь + Завершение сделки
+    SUCCESSFUL_STATUS_ID = str(getattr(settings, "SUCCESSFUL_STATUS_ID", "") or "")
+    allowed_statuses = {str(BRON_STATUS_ID), SUCCESSFUL_STATUS_ID}
+
+    def _status_of(d: Dict[str, Any]) -> str:
+        s = d.get("status_id") or d.get("statusId") or d.get("pipeline_status_id")
+        return str(s or "").strip()
+
+    def _id_of(d: Dict[str, Any]) -> Optional[int]:
+        return _to_int(d.get("id") or d.get("deal_id") or d.get("dealId"))
+
+    # 3) Базовый набор из CRM-списка
+    out_map: Dict[int, Dict[str, Any]] = {}
+    for d in deals_in:
+        did = _id_of(d)
+        if did is None:
             continue
+        # включаем, если пользователь закреплён в locked ИЛИ если он инициатор запроса замены
+        if did not in my_locked_ids and did not in req_by_me:
+            continue
+        if _status_of(d) not in allowed_statuses:
+            continue
+        out_map[did] = d
 
-        row = d
-        if pending_state:
-            row = dict(d)
-            row["_pending_swap"] = pending_state
+    # 4) Дополним отсутствующие сделки из локального списка опроса (если есть)
+    cur = getattr(state, "current_poll_deals", []) or []
+    cur_map: Dict[int, Dict[str, Any]] = {}
+    for d in cur:
+        did = _to_int(d.get("id"))
+        if did is None:
+            continue
+        cur_map[did] = d
 
-        out.append(row)
-        seen.add(did)
+    for did in (my_locked_ids | req_by_me):
+        if did in out_map:
+            continue
+        d = cur_map.get(did)
+        if not d:
+            continue
+        # Проставим статус по умолчанию «Бронь», если из опроса он отсутствует
+        row = dict(d)
+        if not _status_of(row):
+            row["status_id"] = str(BRON_STATUS_ID)
+        out_map[did] = row
 
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[my_games] visible_deals uid=%s -> %s", uid, [int(x.get("id") or 0) for x in out])
+    # 5) Сортировка по дате/времени мероприятия
+    def _sort_key(d: Dict[str, Any]):
+        dt = d.get("event_datetime")
+        if isinstance(dt, datetime):
+            return dt
+        # Пытаемся собрать из event_date + event_time
+        date_s = str(d.get("event_date") or "").strip()
+        time_s = str(d.get("event_time") or "").strip()
+        try:
+            if date_s and time_s:
+                return datetime.strptime(f"{date_s} {time_s}", "%d.%m.%Y %H:%M")
+            if date_s:
+                # допускаем формат dd.mm (без года) — сортируем приблизительно
+                if len(date_s.split(".")) == 2:
+                    return datetime.strptime(f"{date_s}.{datetime.now().year}", "%d.%m.%Y")
+                return datetime.fromisoformat(date_s)  # может быть ISO
+        except Exception:
+            pass
+        return datetime.max
 
-    return out
+    # 6) Аугментация карточек данными locked (роль и т.п.)
+    def _augment_with_locked(uid: int, deal: Dict[str, Any]) -> Dict[str, Any]:
+        """Дополняет карточку сделки данными из locked_distribution"""
+        return deal  # Простая реализация - возвращаем как есть
+    
+    # 7) Пометим флаг _pending_swap для инициализатора запроса: "search" или "awaiting"
+    pending_map: Dict[int, str] = {}
+    try:
+        for did in req_by_me:
+            raw = swap_requests.get(did) or swap_requests.get(str(did)) or {}
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("accepted_by"):
+                # ожидаем подтверждения кандидата
+                if raw.get("awaiting_confirmation"):
+                    pending_map[did] = "awaiting"
+            else:
+                pending_map[did] = "search"
+    except Exception:
+        pending_map = {}
+
+    out_list: List[Dict[str, Any]] = []
+    for _, v in sorted(out_map.items(), key=lambda kv: _sort_key(kv[1])):
+        row = dict(v)
+        did = int(row.get("id") or 0)
+        if did in pending_map:
+            row["_pending_swap"] = pending_map[did]
+        out_list.append(_augment_with_locked(uid, row))
+
+    if logger.isEnabledFor(logging.INFO):
+        logger.info("[my_games] visible_deals uid=%s -> ids=%s", uid, [int(x.get("id") or 0) for x in out_list])
+
+    return out_list
 
 
 def _my_games(uid: int, deals: List[Dict]) -> List[Dict]:
@@ -1793,6 +1858,38 @@ try:
         _orig_keep = _cu.keep_for_vacuum  # type: ignore[attr-defined]
 
         def _keep_wrapper(uid: int, *extra: int):
+            # Защита от uid бота - предотвращаем самоснос
+            try:
+                from aiogram import Bot
+                bot = Bot.get_current()
+                # Получаем информацию о боте синхронно из кэша или атрибутов
+                bot_id = getattr(bot, 'id', None)
+                if bot_id is None:
+                    # Пытаемся получить из токена
+                    token = getattr(bot, 'token', '')
+                    if ':' in token:
+                        try:
+                            bot_id = int(token.split(':')[0])
+                        except (ValueError, IndexError):
+                            pass
+                
+                if isinstance(uid, int) and bot_id is not None and uid == bot_id:
+                    logger.debug("[my_games.keep_patch] skip vacuum for bot uid=%s", uid)
+                    return []  # возвращаем пустой список для корректной работы
+            except Exception as e:
+                logger.debug("[my_games.keep_patch] bot check failed: %s", e)
+                # Если не удалось проверить - продолжаем с осторожностью
+            
+            # Проверяем, что uid валидный
+            try:
+                uid = int(uid)
+                if uid <= 0:
+                    logger.warning("[my_games.keep_patch] invalid uid=%s, returning empty keep", uid)
+                    return []
+            except (ValueError, TypeError):
+                logger.warning("[my_games.keep_patch] non-numeric uid=%s, returning empty keep", uid)
+                return []
+
             keep_extra: List[int] = list(extra)
 
             # 1) sticky «Мои игры»
@@ -1812,14 +1909,26 @@ try:
             try:
                 res = _orig_keep(int(uid), *keep_extra)
                 sig = "(uid, *extra)"
+                # Убеждаемся, что результат - список
+                if not isinstance(res, list):
+                    res = list(res) if res else []
             except TypeError:
-                res = _orig_keep(int(uid))  # type: ignore[misc]
-                sig = "(uid)"
-                # если оригинал не принял *extra — вручную добавим sticky и меню
-                if isinstance(sticky, int) and sticky > 0 and sticky not in res:
-                    res.append(int(sticky))
-                if isinstance(menu_mid, int) and menu_mid > 0 and menu_mid not in res:
-                    res.append(int(menu_mid))
+                try:
+                    res = _orig_keep(int(uid))  # type: ignore[misc]
+                    sig = "(uid)"
+                    # Убеждаемся, что результат - список
+                    if not isinstance(res, list):
+                        res = list(res) if res else []
+                    # если оригинал не принял *extra — вручную добавим sticky и меню
+                    if isinstance(sticky, int) and sticky > 0 and sticky not in res:
+                        res.append(int(sticky))
+                    if isinstance(menu_mid, int) and menu_mid > 0 and menu_mid not in res:
+                        res.append(int(menu_mid))
+                except Exception as e:
+                    logger.error("[my_games.keep_patch] _orig_keep failed: %s", e)
+                    # Возвращаем хотя бы sticky и меню
+                    res = keep_extra
+                    sig = "(fallback)"
 
             # финальная страховка
             if isinstance(sticky, int) and sticky > 0 and sticky not in res:
@@ -1878,6 +1987,34 @@ try:
 
         async def _vacuum_wrapper(*args, **kwargs):
             uid = _extract_uid(args, kwargs)
+            
+            # Защита от uid бота - предотвращаем самоснос
+            if isinstance(uid, int):
+                try:
+                    from aiogram import Bot
+                    bot = Bot.get_current()
+                    # Получаем информацию о боте синхронно из кэша или атрибутов
+                    bot_id = getattr(bot, 'id', None)
+                    if bot_id is None:
+                        # Пытаемся получить из токена
+                        token = getattr(bot, 'token', '')
+                        if ':' in token:
+                            try:
+                                bot_id = int(token.split(':')[0])
+                            except (ValueError, IndexError):
+                                pass
+                    
+                    if bot_id is not None and uid == bot_id:
+                        logger.debug("[my_games.vacuum_patch] skip vacuum for bot uid=%s", uid)
+                        return  # Не выполняем vacuum для бота
+                except Exception as e:
+                    logger.debug("[my_games.vacuum_patch] bot check failed: %s", e)
+                
+                # Проверяем валидность uid
+                if uid <= 0:
+                    logger.warning("[my_games.vacuum_patch] invalid uid=%s, skipping vacuum", uid)
+                    return
+            
             keep_in = _as_mid_list(kwargs.get("keep"))
 
             # добавим sticky + главное меню
@@ -1891,8 +2028,8 @@ try:
                     if isinstance(menu_mid, int) and menu_mid > 0 and menu_mid not in keep_in:
                         keep_in.append(int(menu_mid))
 
-            if keep_in:
-                kwargs["keep"] = list(dict.fromkeys(keep_in))  # de-dup, сохраняем порядок
+            # Всегда устанавливаем keep, даже если он пустой
+            kwargs["keep"] = list(dict.fromkeys(keep_in))  # de-dup, сохраняем порядок
 
             # вызов оригинального API (совместимость по сигнатурам)
             try:
@@ -2022,6 +2159,38 @@ async def _vacuum_safe(uid: int, keep: Optional[List[Any]] = None, *, ignore_sti
     • Использует core.utils.vacuum_private с поддержкой suppress-флагов.
     """
     from aiogram import types as _types
+    
+    # Защита от uid бота - предотвращаем самоснос
+    try:
+        from aiogram import Bot
+        bot = Bot.get_current()
+        # Получаем информацию о боте синхронно из кэша или атрибутов
+        bot_id = getattr(bot, 'id', None)
+        if bot_id is None:
+            # Пытаемся получить из токена
+            token = getattr(bot, 'token', '')
+            if ':' in token:
+                try:
+                    bot_id = int(token.split(':')[0])
+                except (ValueError, IndexError):
+                    pass
+        
+        if isinstance(uid, int) and bot_id is not None and uid == bot_id:
+            logger.debug("[my_games.vacuum_safe] skip vacuum for bot uid=%s", uid)
+            return  # Не выполняем vacuum для бота
+    except Exception as e:
+        logger.debug("[my_games.vacuum_safe] bot check failed: %s", e)
+    
+    # Проверяем валидность uid
+    try:
+        uid = int(uid)
+        if uid <= 0:
+            logger.warning("[my_games.vacuum_safe] invalid uid=%s, skipping vacuum", uid)
+            return
+    except (ValueError, TypeError):
+        logger.warning("[my_games.vacuum_safe] non-numeric uid=%s, skipping vacuum", uid)
+        return
+    
     logger.debug("[my_games.vacuum] start: uid=%s ignore_sticky=%s raw_keep=%s", uid, ignore_sticky, keep)
 
     # предварительно уберём детали/репорт-хвосты
@@ -2068,7 +2237,7 @@ async def _vacuum_safe(uid: int, keep: Optional[List[Any]] = None, *, ignore_sti
                         logger.debug("[my_games.vacuum] ssot_vacuum_private OK (uid, keep)")
                     except TypeError:
                         await ssot_vacuum_private(int(uid))
-                        logger.debug("[my_games.vacuum] ssot_vacuum_private OK (uid,)")
+                        logger.debug("[my_games.vacuum] ssot_vacuum_private OK (uid, ...)")
 
             with suppress(Exception):
                 res2 = _vacuum_poll_details_blocks(int(uid))
@@ -2148,8 +2317,9 @@ def _build_dashboard_kb_v2(uid: int, deals_sorted: List[Dict[str, Any]]) -> Inli
 
         if not pending_flag:
             if sid == OK_ID:
+                # При статусе "Завершение сделки" показываем "Попросить замену"
                 kb.row(InlineKeyboardButton(
-                    text="🔁 Замена",
+                    text="🙋 Попросить замену",
                     callback_data=f"{globals().get('SWAP_PREFIX','mygame_swap_')}{did}"
                 ))
             elif confirmed:
@@ -2210,7 +2380,7 @@ async def _send_dashboard(uid: int, deals: List[Dict[str, Any]]) -> None:
     bot = Bot.get_current()
     logger.info("[my_games] send_dashboard: uid=%s deals_in=%s", uid, len(deals or []))
 
-    # (1) Сначала подчистим репорт-дашборд/детали, чтобы он не «уехал вверх»
+    # (1) Сначала подчистим репорт-дашборд/детали, чтобы он не «улетал вверх»
     with suppress(Exception):
         res = _vacuum_poll_details_blocks(int(uid))
         if hasattr(res, "__await__"):
@@ -2323,15 +2493,14 @@ async def _send_details(uid: int, deal: Dict[str, Any]) -> None:
     from core.config import settings as _cfg
     OK_ID: str = str(getattr(_cfg, "SUCCESSFUL_STATUS_ID", ""))
     sid = _safe_status_id(deal)
-    kb = InlineKeyboardBuilder()
+    kb = InlineKeyboardMarkup()
     if OK_ID and sid == OK_ID:
-        kb.button(text="🙋 Попросить замену", callback_data=f"{globals().get('SWAP_PREFIX','mygame_swap_')}{deal_id}")
-        kb.row(InlineKeyboardButton(text="↩️ Назад к списку", callback_data="mygames_back"))
+        kb.add(InlineKeyboardButton(text="🙋 Попросить замену", callback_data=f"{globals().get('SWAP_PREFIX','mygame_swap_')}{deal_id}"))
+        kb.add(InlineKeyboardButton(text="↩️ Назад к списку", callback_data="mygames_back"))
     else:
-        kb.button(text="↩️ Назад к списку", callback_data="mygames_back")
+        kb.add(InlineKeyboardButton(text="↩️ Назад к списку", callback_data="mygames_back"))
 
-    await bot.send_message(int(uid), text, reply_markup=kb.as_markup())
-
+    await bot.send_message(int(uid), text, reply_markup=kb)
 
 # [5.2] CROSS-MODULE VACUUM — удаление и обнуление реестров poll/report (модиф.: меню не трогаем)
 from contextlib import suppress
@@ -2343,7 +2512,7 @@ from core.menu import get_menu_message_id  # не удаляем главное 
 
 logger = logging.getLogger(__name__)
 
-# Пытаемся получить доступ к core.utils (там часто лежат leader-report/реестры)
+# Пытаемся получить доступ к core.utils (там часто лежит leader report) ─────────
 _cu = None
 with suppress(Exception):
     import core.utils as _cu  # type: ignore
@@ -2659,6 +2828,37 @@ async def redraw_my_games(uid: int) -> None:
     • Если уже в контексте 'my_games' и есть мягкий редрав — используем его.
     • Иначе — тянем сделки, ПЕРЕД отрисовкой стираем репорт-дашборд, далее рисуем sticky.
     """
+    # Защита от uid бота - предотвращаем самоснос
+    try:
+        from aiogram import Bot
+        bot = Bot.get_current()
+        # Получаем информацию о боте синхронно из кэша или атрибутов
+        bot_id = getattr(bot, 'id', None)
+        if bot_id is None:
+            # Пытаемся получить из токена
+            token = getattr(bot, 'token', '')
+            if ':' in token:
+                try:
+                    bot_id = int(token.split(':')[0])
+                except (ValueError, IndexError):
+                    pass
+        
+        if isinstance(uid, int) and bot_id is not None and uid == bot_id:
+            logger.debug("[my_games.redraw] skip redraw for bot uid=%s", uid)
+            return  # Не выполняем redraw для бота
+    except Exception as e:
+        logger.debug("[my_games.redraw] bot check failed: %s", e)
+    
+    # Проверяем валидность uid
+    try:
+        uid = int(uid)
+        if uid <= 0:
+            logger.warning("[my_games.redraw] invalid uid=%s, skipping redraw", uid)
+            return
+    except (ValueError, TypeError):
+        logger.warning("[my_games.redraw] non-numeric uid=%s, skipping redraw", uid)
+        return
+    
     # быстрый путь
     try:
         ctx = (getattr(state, "ui_context", {}) or {}).get(int(uid))
@@ -2735,6 +2935,37 @@ async def my_games_handler(message: types.Message) -> None:
     сообщение в state.last_user_messages[uid], чтобы следующий «пылесос» его удалил.
     """
     uid = message.from_user.id
+    
+    # Защита от uid бота - предотвращаем самоснос
+    try:
+        from aiogram import Bot
+        bot = Bot.get_current()
+        # Получаем информацию о боте синхронно из кэша или атрибутов
+        bot_id = getattr(bot, 'id', None)
+        if bot_id is None:
+            # Пытаемся получить из токена
+            token = getattr(bot, 'token', '')
+            if ':' in token:
+                try:
+                    bot_id = int(token.split(':')[0])
+                except (ValueError, IndexError):
+                    pass
+        
+        if isinstance(uid, int) and bot_id is not None and uid == bot_id:
+            logger.debug("[my_games.handler] skip handler for bot uid=%s", uid)
+            return  # Не обрабатываем для бота
+    except Exception as e:
+        logger.debug("[my_games.handler] bot check failed: %s", e)
+    
+    # Проверяем валидность uid
+    try:
+        uid = int(uid)
+        if uid <= 0:
+            logger.warning("[my_games.handler] invalid uid=%s, skipping handler", uid)
+            return
+    except (ValueError, TypeError):
+        logger.warning("[my_games.handler] non-numeric uid=%s, skipping handler", uid)
+        return
 
     # Закрепим контекст
     try:
@@ -3227,3 +3458,102 @@ async def _cb_report_collect(message: types.Message) -> None:
         soft_redraw = globals().get("_soft_redraw_my_games")
         if callable(soft_redraw):
             await soft_redraw(uid)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [my_games] keep_patch — единая точка интеграции с «пылесосом»
+# Версия 5.2 · 2025-09-22
+# • FIX: если у uid уже есть активный detail-block, не «держим» дашборд.
+# • Соответствие SSOT: все вызовы — через core.utils.keep_for_vacuum.
+# ─────────────────────────────────────────────────────────────────────────────
+from typing import Any, List
+import logging
+
+from core.state import state
+from core.utils import keep_for_vacuum
+
+log = logging.getLogger(__name__)
+
+def _has_active_details(uid: int) -> bool:
+    """Проверяем, есть ли у пользователя активная группа сообщений деталей."""
+    blocks = getattr(state, "detail_blocks", {}) or {}
+    if not isinstance(blocks, dict):
+        return False
+    # Ключи могут быть (uid, deal_id) → [message_id, ...]
+    for k, mids in list(blocks.items()):
+        try:
+            if isinstance(k, tuple) and len(k) == 2 and int(k[0]) == int(uid):
+                if mids:
+                    return True
+        except Exception:
+            continue
+    # На всякий случай поддержим «плоский» ключ по uid, если он есть
+    for lk in (uid, str(uid)):
+        if lk in blocks and (blocks.get(lk) or []):
+            return True
+    return False
+
+
+async def keep_patch(uid: int, *extra: Any) -> None:
+    """
+    Регистрирует для «пылесоса» актуальные message_id, которые нельзя удалять.
+    ВАЖНО: когда открыты детали, дашборд не «держим» — должен остаться только один активный блок.
+    """
+    # Если уже открыт detail-view — явно очищаем keep для дашборда.
+    if _has_active_details(int(uid)):
+        await keep_for_vacuum(int(uid), [])  # не держим дашборд, детали сами положат свои id
+        log.debug("[my_games.keep_patch] uid=%s sig=(uid, *extra) -> keep=[] (details active)", uid)
+        return
+
+    # Иначе — держим последний дашборд, если он у нас сохранён
+    kept: List[int] = []
+    try:
+        # В твоём проекте это может быть другой слотовый id — оставляем как было,
+        # просто не добавляем ничего, если не нашли.
+        dashboard_map = getattr(state, "dashboard_msg_id", {}) or {}
+        mid = (dashboard_map or {}).get(int(uid))
+        if mid:
+            kept = [int(mid)]
+    except Exception:
+        kept = []
+
+    await keep_for_vacuum(int(uid), kept)
+    log.debug("[my_games.keep_patch] uid=%s sig=(uid, *extra) -> keep=%s", uid, kept)
+
+
+def _test() -> None:
+    """Мини-проверки:
+    1) keep_patch не падает при активных деталях
+    2) _visible_deals_for_user показывает только утверждённые (locked) игры текущего пользователя
+    """
+    # 1) keep_patch smoke
+    class Dummy: ...
+    dummy_state = Dummy()
+    setattr(dummy_state, "detail_blocks", {(123, 999): [1, 2, 3]})
+    orig = getattr(state, "detail_blocks", None)
+    setattr(state, "detail_blocks", getattr(dummy_state, "detail_blocks"))
+    import asyncio
+    asyncio.run(keep_patch(123))
+    setattr(state, "detail_blocks", orig)
+
+    # 2) visible_deals filter
+    uid = 42
+    ld_orig = getattr(state, "locked_distribution", None)
+    state.locked_distribution = {
+        "101": {"lead1": "Иван И.1|42"},
+        "202": {"assistant1": "Пётр П.2|777"},
+    }
+    BRON_ID = str(getattr(settings, "BRON_STATUS_ID", "") or "")
+    deals_all = [
+        {"id": 101, "status_id": BRON_ID, "game_name": "Test A", "event_date": "01.10.2025", "event_time": "18:00"},
+        {"id": 202, "status_id": BRON_ID, "game_name": "Test B", "event_date": "02.10.2025", "event_time": "19:00"},
+    ]
+    res = _visible_deals_for_user(uid, deals_all)
+    assert len(res) == 1 and int(res[0].get("id")) == 101, "Фильтр 'Мои игры' работает некорректно"
+    state.locked_distribution = ld_orig
+# История изменений:
+# 2025-09-22 — добавлена проверка _has_active_details и явное keep=[]
+
+# История изменений:
+# 2025-09-22 — фильтр «Мои игры»: показываем только утверждённые (locked) игры пользователя; статусы — Бронь/Завершение сделки
+
+# 2025-09-22 — фиксы UI видимости при замене

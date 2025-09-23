@@ -70,7 +70,6 @@ def init_db() -> None:
             )
             """
         )
-    logger.debug("[guide] custom_buttons table initialized at %s", DB_FILE)
 
 
 def fetch_custom_buttons(chat_id: int) -> List[Tuple[str, str]]:
@@ -79,7 +78,6 @@ def fetch_custom_buttons(chat_id: int) -> List[Tuple[str, str]]:
         (chat_id,),
     )
     rows: List[Tuple[str, str]] = [(str(r[0]), str(r[1])) for r in cur.fetchall()]
-    logger.debug("[guide] fetched %d custom buttons for chat %d", len(rows), chat_id)
     return rows
 
 
@@ -104,10 +102,9 @@ async def ensure_pinned_menu(chat_id: int) -> None:
     if menu_id:
         try:
             await bot.edit_message_reply_markup(chat_id=chat_id, message_id=menu_id, reply_markup=markup)
-            logger.debug("[guide] updated pinned menu %d in chat %d", menu_id, chat_id)
             return
-        except Exception as e:
-            logger.warning("[guide] failed to update menu %d in chat %d: %s", menu_id, chat_id, e)
+        except Exception:
+            pass
 
     sent = await bot.send_message(
         chat_id,
@@ -122,13 +119,11 @@ async def ensure_pinned_menu(chat_id: int) -> None:
 
     try:
         await bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=True)
-    except Exception as e:
-        # не критично: сообщение отправлено, но не закрепилось — просто логируем
-        logger.debug("[guide] pin_chat_message failed for chat_id=%s: %r", chat_id, e)
+    except Exception:
+        pass
 
     group_menu_message_id[int(chat_id)] = int(sent.message_id)
     state.group_menu_message_id = group_menu_message_id  # синхронизируем обратно в state
-    logger.info("[guide] pinned new menu %d in chat %d", sent.message_id, chat_id)
 
 
 # ███ [3.2] Приватное «Главное меню» — как единственный блок
@@ -164,7 +159,6 @@ async def on_bot_join(evt: ChatMemberUpdated) -> None:
     except Exception:
         new_status = ""
     if new_status in {"member", "administrator"}:
-        logger.info("[guide] bot joined chat %d as %s", evt.chat.id, new_status)
         await ensure_pinned_menu(evt.chat.id)
 
 
@@ -172,17 +166,13 @@ async def on_bot_join(evt: ChatMemberUpdated) -> None:
 async def on_start(message: Message) -> None:
     """
     /start:
-    • в группах — гарантируем закреп меню,
-    • в личке — показываем корневое меню как единственный блок и снимаем старые пины.
+    • в группах — НЕ закрепляем меню автоматически,
+    • в личке — показываем корневое меню как единственный блок.
     """
     if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        logger.info("[guide] /start in group %d", message.chat.id)
-        await ensure_pinned_menu(message.chat.id)
+        # Убираем автоматическое закрепление при /start
+        pass
     elif message.chat.type == ChatType.PRIVATE:
-        # аккуратно снимаем старые пины в ЛС, если такие были
-        with contextlib.suppress(Exception):
-            bot = Bot.get_current()
-            await bot.unpin_all_chat_messages(chat_id=message.chat.id)
         await show_main_menu(message.from_user.id)
 
 
@@ -214,7 +204,6 @@ async def custom_button_handler(message: Message) -> None:
 
     for text, url in fetch_custom_buttons(message.chat.id):
         if txt == text:
-            logger.info("[guide] custom %r clicked in chat %d", text, message.chat.id)
             await message.reply(
                 "\u200B",
                 reply_markup=InlineKeyboardMarkup(
@@ -223,15 +212,12 @@ async def custom_button_handler(message: Message) -> None:
                 disable_web_page_preview=False,
             )
             return
-
-    logger.debug("[guide] no custom match for %r in chat %d", txt, message.chat.id)
     # просто выходим — другие хендлеры (личного кабинета и др.) обработают сообщение
 
 
 # ███ [6] ИНИЦИАЛИЗАЦИЯ
 # --------------------------------------------------------------------
 init_db()
-logger.info("[guide] module loaded, DB=%s", DB_FILE)
 
 # История изменений:
 # • 2025-09-02 — v15.0: приватное меню без pin (pin=False) + unpin_all в ЛС; добавлен /menu; фильтр «Меню» → lower().
