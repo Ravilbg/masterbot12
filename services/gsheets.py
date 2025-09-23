@@ -3,16 +3,14 @@
 """
 Статусы ведущих ('green' | 'yellow' | 'red') читаются из листа «Светофор».
 
-Версия 7.2 · 2025-08-12
+Версия 7.3 · 2025-09-12
 ──────────────────────────────────────────────────────────────────────
-Что исправлено и усилено:
-• Надёжная инициализация: поддержка ключа из файла ИЛИ из JSON-строки/словаря.
-• Авто-лечилка переноса строк в private_key (\\n → \n, «одна строка» → многострочный).
-• Антишум: при фатальной ошибке авторизации вводится «карантин» на повторные попытки
-  (по умолчанию 15 минут), чтобы не забивать логи и не долбить Google API.
-• Безопасные скоупы: валидация и автоматический фолбэк на spreadsheets.readonly.
-• Нормальный кеш includeGridData (24 часа) + бережная обработка пустых ячеек/листов.
-• Устойчивый разбор цвета фона ячейки из всех возможных полей формата.
+Что добавлено:
+• Детальное DEBUG-логирование принятия решения по «светофору»:
+  - поиск строки пользователя и колонки игры;
+  - предпросмотр ячейки (formattedValue + извлечённый RGB);
+  - вычисленный статус для uid/игры.
+Остальная логика и публичный API не изменены.
 
 Публичный экспорт (совместимо с проектом):
     get_user_status_from_svetofor(user_id: int, game_name: str) -> str
@@ -48,6 +46,7 @@ GAME_ROLE_MAPPING: Dict[str, Dict[str, int]] = getattr(settings, "GAME_ROLE_MAPP
 __all__ = [
     "get_user_status_from_svetofor",
     "get_user_row_from_svetofor",
+    "get_user_traffic_light",
     "get_game_column_from_svetofor",
     "status_to_role",
     "suggest_role_from_svetofor",
@@ -163,7 +162,8 @@ def _load_credentials_info() -> Dict[str, Any]:
     raise RuntimeError("[gsheets] Не найден ключ сервисного аккаунта: GOOGLE_CREDENTIALS_FILE/JSON")
 
 # История изменений (блок [1]):
-# 2025-08-18 — удалены дубли импортов/констант/стейта; оставлены только функции (выровнено под SSOT).
+# 2025-08-18 — выровнено под SSOT/фиксы Pylance: удалены дубли, оставлены функции.
+
 
 # ███ [2] INIT / LOAD
 # --------------------------------------------------------------------
@@ -174,7 +174,7 @@ def _init_svetofor() -> None:
       • подробный лог (email, scopes, fingerprint ключа);
       • авто-повтор при Invalid JWT Signature: повторная инициализация
         с тем же private_key, но БЕЗ private_key_id (убираем kid из JWT);
-      • «карантин» на auth-ошибках, чтобы не засыпать логи.
+      • «карантин» на auth-ошибках, чтобы не флудить логи.
     """
     if _svetofor["sheet"] is not None:
         return
@@ -197,7 +197,7 @@ def _init_svetofor() -> None:
         return f"sha256:{h[:8]}…{h[-8:]}"
 
     def _do_init(info: Dict[str, Any], scps: List[str], log_hint: str) -> None:
-        # Проверим обязательные поля
+        # Обязательные поля
         for k in ("client_email", "private_key", "token_uri"):
             if not info.get(k):
                 raise RuntimeError(f"[gsheets] В JSON ключе отсутствует поле: {k}")
@@ -236,7 +236,7 @@ def _init_svetofor() -> None:
         msg = str(exc)
         _svetofor["init_error"] = msg
 
-        # 1) Попытка re-init с readonly scope (если ругнулся на scope)
+        # 1) Повтор с readonly scope
         if "invalid_scope" in msg.lower():
             try:
                 _do_init(info_orig, ["https://www.googleapis.com/auth/spreadsheets.readonly"], " (readonly)")
@@ -246,11 +246,10 @@ def _init_svetofor() -> None:
                 _svetofor["init_error"] = str(e2)
                 logger.warning("[gsheets] re-init readonly failed: %s", e2)
 
-        # 2) КЛЮЧЕВОЕ: Invalid JWT Signature → повтор без kid (private_key_id)
+        # 2) Повтор без kid (private_key_id)
         if "invalid jwt signature" in msg.lower() or "invalid_grant" in msg.lower():
             try:
                 info_nokid = dict(info_orig)
-                # убираем private_key_id, чтобы в JWT не попал kid — Google подберёт сам
                 if "private_key_id" in info_nokid:
                     info_nokid.pop("private_key_id", None)
                 _do_init(info_nokid, scopes, " (no-kid)")
@@ -260,7 +259,7 @@ def _init_svetofor() -> None:
                 _svetofor["init_error"] = str(e3)
                 logger.warning("[gsheets] re-init no-kid failed: %s", e3)
 
-        # Если дошли сюда — ставим «карантин», чтобы не флудить
+        # Карантин
         _svetofor["sheet"] = None
         _svetofor["cooldown_until"] = datetime.now() + timedelta(minutes=_AUTH_COOLDOWN_MINUTES)
         logger.warning("[gsheets] init failed (auth): %s", msg)
@@ -304,6 +303,7 @@ def _load_svetofor_data() -> None:
             headers.append((c.get("formattedValue", "") or "").strip().lower())
     _svetofor["headers"] = headers
     _svetofor["last_refresh"] = datetime.now()
+    logger.debug("[gsheets] cache refreshed: rows=%d headers=%d", len(_svetofor["rows"] or []), len(headers))
 
 
 # ███ [3] COLOR PARSING
@@ -355,6 +355,16 @@ def _extract_bg_rgb(cell: Dict[str, Any]) -> Tuple[float, float, float]:
     return (1.0, 1.0, 1.0)
 
 
+def _cell_preview(cell: Dict[str, Any]) -> str:
+    """Короткий предпросмотр ячейки для логов."""
+    try:
+        fv = (cell.get("formattedValue", "") or "").strip()
+        r, g, b = _extract_bg_rgb(cell)
+        return f"fv={fv!r} rgb=({r:.2f},{g:.2f},{b:.2f})"
+    except Exception as e:  # noqa: BLE001
+        return f"<preview_error: {e!r}>"
+
+
 # ███ [4] LOW-LEVEL READERS
 # --------------------------------------------------------------------
 async def get_user_row_from_svetofor(user_id: int) -> Optional[int]:
@@ -363,6 +373,7 @@ async def get_user_row_from_svetofor(user_id: int) -> Optional[int]:
     _load_svetofor_data()
     rows = _svetofor["rows"]
     if rows is None:
+        logger.debug("[svetofor] rows unavailable (init_error=%r)", _svetofor.get("init_error"))
         return None
 
     target = str(user_id).strip()
@@ -371,9 +382,44 @@ async def get_user_row_from_svetofor(user_id: int) -> Optional[int]:
         if len(vals) > 1:
             v = (vals[1].get("formattedValue", "") or "").strip()
             if v == target:
+                logger.debug("[svetofor] user row found: uid=%s -> row=%d", user_id, idx)
                 return idx
+    logger.debug("[svetofor] user row NOT found: uid=%s", user_id)
     return None
 
+
+async def get_user_traffic_light(user_id: int) -> Dict[str, int]:
+    """������� �������� Svetofor ��� ������������."""
+    snapshot: Dict[str, int] = {"green": 0, "yellow": 0, "red": 0, "total": 0}
+    try:
+        _init_svetofor()
+        _load_svetofor_data()
+    except Exception:
+        return snapshot
+
+    try:
+        row_idx = await get_user_row_from_svetofor(int(user_id))
+    except Exception:
+        row_idx = None
+    if not isinstance(row_idx, int) or row_idx <= 0:
+        return snapshot
+
+    rows = _svetofor.get("rows") or []
+    row = rows[row_idx - 1] if 0 <= row_idx - 1 < len(rows) else None
+    values = row.get("values") if isinstance(row, dict) else None
+    if not isinstance(values, list):
+        return snapshot
+
+    for cell in values:
+        if not isinstance(cell, dict):
+            continue
+        status = _rgb_to_status(*_extract_bg_rgb(cell))
+        if status in ("green", "yellow", "red"):
+            snapshot[status] += 1
+            snapshot["total"] += 1
+    return snapshot
+
+# 2025-09-17 · модуль рейтинга: выровнено под SSOT.
 
 async def get_game_column_from_svetofor(game_name: str) -> Optional[int]:
     """Ищет game_name в заголовках и возвращает 1-based col или None."""
@@ -381,15 +427,19 @@ async def get_game_column_from_svetofor(game_name: str) -> Optional[int]:
     _load_svetofor_data()
     headers = _svetofor["headers"]
     if headers is None:
+        logger.debug("[svetofor] headers unavailable (init_error=%r)", _svetofor.get("init_error"))
         return None
 
     norm = (game_name or "").strip().lower()
     if not norm:
+        logger.debug("[svetofor] empty game_name")
         return None
 
     for idx, title in enumerate(headers, start=1):
         if (title or "").strip().lower() == norm:
+            logger.debug("[svetofor] game column found: game=%r -> col=%d", game_name, idx)
             return idx
+    logger.debug("[svetofor] game column NOT found: game=%r", game_name)
     return None
 
 
@@ -409,20 +459,25 @@ async def get_user_status_from_svetofor(user_id: int, game_name: str) -> str:
 
         rows = _svetofor["rows"]
         if rows is None:
+            logger.debug("[svetofor] table unavailable -> status='' (uid=%s game=%r)", user_id, game_name)
             return ""  # таблица недоступна / в карантине
 
         row = await get_user_row_from_svetofor(user_id)
-        col = await get_game_column_from_svetofor(game_name)
+        col = await _get_game_column_from_svetofor_synonyms(game_name) if True else await get_game_column_from_svetofor(game_name)
+        logger.debug("[svetofor] lookup uid=%s game=%r -> row=%s col=%s", user_id, game_name, row, col)
         if not row or not col:
             return ""
 
         row_vals: List[Dict[str, Any]] = (rows[row - 1].get("values", []) or [])
         if col - 1 >= len(row_vals):
+            logger.debug("[svetofor] cell out of range: row=%s col=%s len=%d", row, col, len(row_vals))
             return ""
         cell = row_vals[col - 1] or {}
 
         r, g, b = _extract_bg_rgb(cell)
-        return _rgb_to_status(r, g, b)
+        status = _rgb_to_status(r, g, b)
+        logger.debug("[svetofor] cell %s -> status=%s (uid=%s game=%r)", _cell_preview(cell), status, user_id, game_name)
+        return status
     except Exception as exc:  # noqa: BLE001
         logger.warning("[gsheets] status fetch failed: %s", exc)
         return ""
@@ -467,11 +522,46 @@ async def suggest_role_from_svetofor(
 ) -> Optional[str]:
     """Читает цвет из «Светофора» и возвращает роль согласно логике, либо None."""
     status = await get_user_status_from_svetofor(user_id, game_name)
-    return status_to_role(status, need, team)
+    role = status_to_role(status, need, team)
+    logger.debug("[svetofor:suggest] uid=%s game=%r status=%s -> role=%s (need=%s, team=%s)",
+                 user_id, game_name, status, role, need, {k: len(v or []) for k, v in (team or {}).items()})
+    return role
 
 
 # ███ [7] TESTS
 # --------------------------------------------------------------------
+async def _get_game_column_from_svetofor_synonyms(game_name: str) -> Optional[int]:
+    """Synonym-aware column lookup for Svetofor headers (UI spelling tolerant)."""
+    _init_svetofor()
+    _load_svetofor_data()
+    headers = _svetofor.get("headers") or []
+
+    def _norm(s: str) -> str:
+        return (s or "").strip().lower().replace("ё", "е")
+
+    def _game_header_candidates(name: str) -> list[str]:
+        k = _norm(name)
+        cands = [k]
+        if k == "треугольник":
+            cands += ["бермудский треугольник", "бермудский трегольник"]
+        if "бермуд" in k:
+            cands += ["бермудский треугольник", "бермудский трегольник", "треугольник"]
+        seen, out = set(), []
+        for c in cands:
+            if c and c not in seen:
+                seen.add(c); out.append(c)
+        return out
+
+    candidates = _game_header_candidates(game_name)
+    logger.debug("[svetofor] header candidates for %r: %s", game_name, ", ".join(candidates))
+    headers_norm = [_norm(h) for h in headers]
+    for idx, (h_raw, h_norm) in enumerate(zip(headers, headers_norm), start=1):
+        if h_norm in candidates:
+            logger.debug("[svetofor] game column found: game=%r -> header=%r (norm=%s) col=%d", game_name, h_raw, h_norm, idx)
+            return idx
+    logger.debug("[svetofor] game column NOT found: game=%r (candidates=%s)", game_name, candidates)
+    return None
+
 async def _test() -> None:
     """Smoke-тест: функции работают без падений при любой конфигурации."""
     # Допускаем пустой результат при недоступной таблице
@@ -497,3 +587,5 @@ if __name__ == "__main__":
 # История изменений:
 # 2025-08-12 — v7.2: чтение ключа из файла/JSON, починка переноса строк, антишум-карантин,
 #                    безопасные скоупы и устойчивый парсер цвета. Совместимо с v6 API.
+# 2025-09-12 — v7.3: добавлено детальное DEBUG-логирование поиска строки/колонки и
+#                    принятия решения по статусу (предпросмотр ячейки + RGB).

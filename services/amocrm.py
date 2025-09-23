@@ -48,7 +48,8 @@ import os
 import re
 import contextlib  # ← добавлено
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Iterable  # ← добавлено Iterable
+from typing import Any, Dict, List, Optional, Tuple, Iterable, Mapping, Union
+from collections.abc import Iterable as IterableABC  # ← добавлено Iterable
 
 import aiohttp
 from pytz import timezone
@@ -411,7 +412,7 @@ async def _build_cf_patch(updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     cf_items: List[Dict[str, Any]] = []
 
     for key, val in (updates or {}).items():
-        if val is None or str(val).strip() == "":
+        if val is None:
             continue
         field_id = AMOF.get(key)
         if not field_id:
@@ -422,7 +423,26 @@ async def _build_cf_patch(updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         except Exception:
             logger.warning("[Amo] CF '%s' has non-numeric id=%r, skip", key, field_id)
             continue
-        cf_items.append({"field_id": fid, "values": [{"value": val}]})
+        value_payload: Dict[str, Any] = {}
+        if isinstance(val, dict):
+            enum_candidate = val.get("enum_id")
+            if enum_candidate is not None:
+                try:
+                    value_payload["enum_id"] = int(enum_candidate)
+                except Exception:
+                    logger.debug("[Amo] skip invalid enum_id for '%s': %r", key, enum_candidate)
+            raw_value = val.get("value")
+            if raw_value is not None:
+                value_str = str(raw_value).strip()
+                if value_str:
+                    value_payload["value"] = value_str
+        else:
+            value_str = str(val).strip()
+            if value_str:
+                value_payload["value"] = value_str
+        if not value_payload:
+            continue
+        cf_items.append({"field_id": fid, "values": [value_payload]})
 
     if not cf_items:
         return None
@@ -489,20 +509,30 @@ async def ensure_required_fields(deal_id: int) -> bool:
 
 
 # ── helpers для тегов (safe merge) ──────────────────────────────────
-def _normalize_tag_name(name: str) -> str:
-    return " ".join((name or "").split())
+def _normalize_tag_name(name) -> str:
+    """
+    Принимает str | list | None. Возвращает нормализованную строку тега:
+    - склеивает list в строку;
+    - убирает двойные точки/двойные пробелы;
+    - триммит.
+    """
+    if isinstance(name, list):
+        name = " ".join([str(x or "") for x in name])
+    s = " ".join(str(name or "").split())
+    s = s.replace("..", ".").replace(" .", " ").strip()
+    return s
 
-
-def _dedup_tags(items: List[str]) -> List[str]:
+def _dedup_tags(tags: list) -> list[str]:
+    out: list[str] = []
     seen: set[str] = set()
-    out: List[str] = []
-    for t in items:
+    for t in tags or []:
         n = _normalize_tag_name(t)
-        if not n or n in seen:
-            continue
-        seen.add(n)
-        out.append(n)
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
     return out
+
+# 2025-01-19: фиксы нормализации тегов/артефактов ".."
 
 
 async def _get_current_tags_for_deal(deal_id: int) -> List[str]:
@@ -1024,9 +1054,70 @@ async def get_monthly_role_tag_counters(
 # 2025-08-24 — [5.7] Добавлен get_monthly_role_tag_counters(): счётчики подтверждающих тегов за прошлый месяц.
 
 # ════════════════════════════════════════════════════════════════════
+# Единый хелпер "откат в Бронь после запроса замены"
+# ════════════════════════════════════════════════════════════════════
+
+try:
+    from core.config import settings
+    PHOTOGRAPHER_CF_ID: int | None = getattr(settings, 'PHOTOGRAPHER_CF_ID', None)
+    PHOTOGRAPHER_ENUM_NO: int | None = getattr(settings, 'PHOTOGRAPHER_ENUM_NO', None)
+except ImportError:
+    try:
+        from settings import PHOTOGRAPHER_CF_ID, PHOTOGRAPHER_ENUM_NO
+    except ImportError:
+        PHOTOGRAPHER_CF_ID: int | None = None
+        PHOTOGRAPHER_ENUM_NO: int | None = None
+
+async def revert_to_bron_after_swap(deal_id: int, uid: int, short_base: str, *, wipe_photographer_if_required: bool = True) -> None:
+    """
+    1) Снимает персональные теги инициатора (все возможные варианты названий).
+    2) Переводит сделку в статус 'Бронь'.
+    3) (Опц.) Ставит 'Фотограф' = 'нет' через enum_id, если поле обязательно.
+    """
+    # 1) снять теги инициатора (покрываем старые форматы/артефакты)
+    variants = [
+        f"{short_base}.1", f"{short_base} 1", f"{short_base}1",
+        f"{short_base}.2", f"{short_base} 2", f"{short_base}2",
+        f"{short_base}.Адм", f"{short_base}.Стаж",
+        f"{short_base} .1",  # на всякий случай артефакт
+    ]
+    await update_amocrm_tags({str(deal_id): {"remove": _dedup_tags(variants)}})
+
+    # 2) статус в Бронь
+    await update_deal_status(deal_id, BRON_STATUS_ID)
+
+    # 3) безопасно выставить 'нет' в фотографе, если настроено
+    if wipe_photographer_if_required:
+        await _set_photographer_no_enum_safe(deal_id)
+
+async def _set_photographer_no_enum_safe(deal_id: int) -> None:
+    if not PHOTOGRAPHER_CF_ID or not PHOTOGRAPHER_ENUM_NO:
+        return
+    payload = {
+        "custom_fields_values": [{
+            "field_id": PHOTOGRAPHER_CF_ID,
+            "values": [{"enum_id": PHOTOGRAPHER_ENUM_NO}],
+        }]
+    }
+    await _patch_deal_custom_fields(deal_id, payload)
+
+async def _patch_deal_custom_fields(deal_id: int, payload: Dict[str, Any]) -> bool:
+    """Тонкий wrapper для PATCH поля"""
+    return await _patch_deal(deal_id, payload)
+
+# 2025-01-19: единый реверт в Бронь + безопасный фотограф
+
+# ════════════════════════════════════════════════════════════════════
 # [6] SELF-TEST
 # ════════════════════════════════════════════════════════════════════
-async def _test() -> None:
+def _test():
+    # services/amocrm.py
+    assert _normalize_tag_name(["Равиль", "Ш.1"]) == "Равиль Ш.1"
+    assert _dedup_tags(["Равиль Ш.1", "Равиль  Ш.1", "Равиль Ш..1"]) == ["Равиль Ш.1"]
+    print("services.amocrm OK sanity-tests normalization passed")
+# 2025-01-19: sanity-тесты нормализации
+
+async def _test_async() -> None:
     """
     Мини-тесты (будут работать и без реального AmoCRM — в offline-режиме).
     """
@@ -1052,13 +1143,18 @@ async def _test() -> None:
     ok_status = await update_deal_status(1, getattr(settings, "SUCCESSFUL_STATUS_ID", "18913935"))
     assert ok_status is True
 
-    print("services.amocrm ✅ self-tests passed")
+    print("services.amocrm OK self-tests passed")
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
-    asyncio.run(_test())
+    _test()  # синхронные тесты
+    asyncio.run(_test_async())  # асинхронные тесты
 
 # История изменений:
 # 2025-08-12 — Полный рефактор под MasterBot ≥ 15.1; добавлен get_deal_by_id;
 #              единый _request_json c ретраями; аккуратные offline-stubs.
+
+
+
+
