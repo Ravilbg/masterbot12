@@ -47,7 +47,7 @@ class _State:
         self.personal_report_message_id: Optional[int] = None
         # последние личные сообщения по пользователю: {uid: [Message,...]}
         self.last_user_messages: Dict[int, List[Message]] = {}
-# ��� ������������ ��������� �������� ���� � ��: {uid: message_id}
+# ��� ������������ ��������� �������� ���� � ��: {uid: message_id}
         self.menu_message_id: Dict[int, int] = {}
 
         # клавиатура отчёта лидеру (верхняя часть — игры)
@@ -133,6 +133,20 @@ class _State:
 
         # инициализация локов
         self._locks = {}
+        
+        # ═════════════════════════════════════════════════════════════
+        # ДОПОЛНИТЕЛЬНЫЕ ПОЛЯ ДЛЯ СОВМЕСТИМОСТИ С POLLS_LIFECYCLE
+        # ═════════════════════════════════════════════════════════════
+        # завершённые/зафиксированные распределения (finished_locked_distribution)
+        self.finished_locked_distribution: Dict[int, Dict[str, Any]] = {}
+        # индекс деталей (detail_index)
+        self.detail_index: Dict[Any, Any] = {}
+        # запросы на замену (swap_requests)
+        self.swap_requests: Dict[int, Dict[str, Any]] = {}
+        # месячные счётчики ролей (monthly_role_counters)
+        self.monthly_role_counters: Dict[int, int] = {}
+        # временные метки снапшотов сделок (deal_snapshots_ts)
+        self.deal_snapshots_ts: Dict[int, float] = {}
 
     # ────────────────────────────────────────────────────────────────
     # Per-user async-lock: синхронный геттер без await (логики ожидания нет)
@@ -157,5 +171,5 @@ __all__ = ["state"]
 # • 2025-08-09 — добавлены poll_details, deal_titles, pending_confirmations, detail_blocks.
 # • 2025-08-09 — добавлены tokens/amocrm_meta/amocrm_last_refresh_ts.
 # • 2025-08-09 — добавлено confirmed_users.
-# � 2025-09-17 � �������� menu_message_id ��� ��������� �������� ���� (SSOT).
-# 2025-09-17 � ������ ��������: ��������� ��� SSOT.
+# � 2025-09-17 � �������� menu_message_id ��� ��������� �������� ���� (SSOT).
+# 2025-09-17 � ������ ��������: ��������� ��� SSOT.

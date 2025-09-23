@@ -82,10 +82,14 @@ async def get_main_menu(user_id: int) -> Optional[ReplyKeyboardMarkup]:
     # Generic rating button for everyone
     _add_unique(builder, seen, _STAR_BUTTON)
 
-    if role in poll_roles or role in {"менеджер", "администратор"}:
-        for caption in _POLL_MASTER_EXTRA:
-            _add_unique(builder, seen, caption)
-        _add_unique(builder, seen, _STAR_ADMIN_BUTTON)
+    # Кнопка «Рейтинг команды» — ТОЛЬКО для роли «руководитель» (LEADER_ID)
+    try:
+        if int(user_id) == int(getattr(settings, "LEADER_ID", 0)):
+            for caption in _POLL_MASTER_EXTRA:
+                _add_unique(builder, seen, caption)
+            _add_unique(builder, seen, _STAR_ADMIN_BUTTON)
+    except Exception:
+        pass
 
     if not seen:
         return None
@@ -94,7 +98,7 @@ async def get_main_menu(user_id: int) -> Optional[ReplyKeyboardMarkup]:
     return builder.as_markup(resize_keyboard=True)
 
 
-async def send_root_menu_singleton(uid: int, kb: ReplyKeyboardMarkup, *, pin: bool = True) -> int:
+async def send_root_menu_singleton(uid: int, kb: ReplyKeyboardMarkup, *, pin: bool = False) -> int:
     """Send (or replace) root menu message using DM singleton helper."""
     message = await dm_singleton_send(int(uid), _ZERO_WIDTH, reply_markup=kb)
 

@@ -207,6 +207,12 @@ class Settings(BaseSettings):
     SUCCESSFUL_STATUS_ID: str = Field(default="18960415", env="SUCCESSFUL_STATUS_ID")
     # NEW: финальный статус «Успешно реализовано»
     WON_STATUS_ID: str = Field(default="", env="WON_STATUS_ID")
+    
+    # AmoCRM custom field for "Photographer" and enum id for "нет"
+    PHOTOGRAPHER_CF_ID: Optional[int] = Field(default=None, env="PHOTOGRAPHER_CF_ID")
+    PHOTOGRAPHER_ENUM_NO: Optional[int] = Field(default=None, env="PHOTOGRAPHER_ENUM_NO")
+
+# 2025-01-19: enum-поддержка фотографа
 
     # — access matrix —
     ACCESS: Dict[str, List[str]] = Field(default_factory=lambda: {
@@ -416,7 +422,11 @@ def _test():
     assert isinstance(s.SUCCESSFUL_STATUS_ID, str) and s.SUCCESSFUL_STATUS_ID
     # WON_STATUS_ID может быть пустым, но тип должен быть строка
     assert isinstance(s.WON_STATUS_ID, str)
+    # Новые поля фотографа
+    assert hasattr(s, 'PHOTOGRAPHER_CF_ID')
+    assert hasattr(s, 'PHOTOGRAPHER_ENUM_NO')
     print("✅ core/config.py tests passed")
+# 2025-01-19: тесты констант фотографа
 
 
 if __name__ == "__main__":

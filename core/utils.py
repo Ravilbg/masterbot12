@@ -476,6 +476,40 @@ def keep_for_vacuum(uid: int, *extra_msg_ids: int) -> List[int]:
     • sticky «Мои игры», если есть
     • любые дополнительные message_id, переданные вызвавшим кодом
     """
+    # Защита от uid бота - предотвращаем самоснос
+    try:
+        # Получаем информацию о боте синхронно из кэша или атрибутов
+        bot_id = None
+        try:
+            bot = Bot.get_current()
+            bot_id = getattr(bot, 'id', None)
+            if bot_id is None:
+                # Пытаемся получить из токена
+                token = getattr(bot, 'token', '')
+                if ':' in token:
+                    try:
+                        bot_id = int(token.split(':')[0])
+                    except (ValueError, IndexError):
+                        pass
+        except Exception:
+            pass
+        
+        if isinstance(uid, int) and bot_id is not None and uid == bot_id:
+            logger.debug("[keep_for_vacuum] skip for bot uid=%s", uid)
+            return []  # возвращаем пустой список для корректной работы
+    except Exception as e:
+        logger.debug("[keep_for_vacuum] bot check failed: %s", e)
+    
+    # Проверяем валидность uid
+    try:
+        uid = int(uid)
+        if uid <= 0:
+            logger.warning("[keep_for_vacuum] invalid uid=%s, returning empty keep", uid)
+            return []
+    except (ValueError, TypeError):
+        logger.warning("[keep_for_vacuum] non-numeric uid=%s, returning empty keep", uid)
+        return []
+    
     keep: List[int] = []
     sticky = get_sticky_my_games(int(uid))
     if isinstance(sticky, int):
@@ -498,6 +532,40 @@ async def vacuum_private(uid: int, keep: Optional[Sequence[int]] = None) -> None
       • БЕРЕЖЁМ ЛИЧНЫЙ ДАШБОРД ОТЧЁТА ЛИДЕРА ОПРОСА (если открыт и не подавлено).
       • Поддержка хранения detail_blocks по ключам uid И (uid, deal_id).
     """
+    # Защита от uid бота - предотвращаем самоснос
+    try:
+        # Получаем информацию о боте синхронно из кэша или атрибутов
+        bot_id = None
+        try:
+            bot = Bot.get_current()
+            bot_id = getattr(bot, 'id', None)
+            if bot_id is None:
+                # Пытаемся получить из токена
+                token = getattr(bot, 'token', '')
+                if ':' in token:
+                    try:
+                        bot_id = int(token.split(':')[0])
+                    except (ValueError, IndexError):
+                        pass
+        except Exception:
+            pass
+        
+        if isinstance(uid, int) and bot_id is not None and uid == bot_id:
+            logger.debug("[vacuum_private] skip vacuum for bot uid=%s", uid)
+            return  # Не выполняем vacuum для бота
+    except Exception as e:
+        logger.debug("[vacuum_private] bot check failed: %s", e)
+    
+    # Проверяем валидность uid
+    try:
+        uid = int(uid)
+        if uid <= 0:
+            logger.warning("[vacuum_private] invalid uid=%s, skipping vacuum", uid)
+            return
+    except (ValueError, TypeError):
+        logger.warning("[vacuum_private] non-numeric uid=%s, skipping vacuum", uid)
+        return
+    
     from core.state import state as _state  # гарантируем актуальный объект
 
     # 0) нормализуем keep и добавляем sticky
@@ -550,10 +618,27 @@ async def vacuum_private(uid: int, keep: Optional[Sequence[int]] = None) -> None
         if not bot:
             return False
         try:
+            try:
+                current_menu = None
+                with contextlib.suppress(Exception):
+                    from core.menu import get_menu_message_id as _mid
+                    current_menu = _mid(int(chat_id))
+                logger.debug(
+                    "[vacuum_private] delete chat=%s mid=%s (menu_mid=%s)",
+                    int(chat_id), int(message_id), current_menu,
+                )
+            except Exception:
+                pass
             await bot.delete_message(chat_id, message_id)
             return True
         except Exception:
             return False
+
+    # Диагностика keep-set
+    try:
+        logger.debug("[vacuum_private] uid=%s keep=%s", uid, sorted(list(keep_set)))
+    except Exception:
+        pass
 
     # 1) last_user_messages — удаляем всё, что не в keep_set
     lum = getattr(_state, "last_user_messages", {})
@@ -635,6 +720,31 @@ async def delete_previous_private_messages(*args, **kwargs) -> None:
     _uid = kwargs.get("uid", _uid)
     if not isinstance(_uid, int):
         return
+    
+    # Защита от uid бота - предотвращаем самоснос
+    try:
+        # Получаем информацию о боте синхронно из кэша или атрибутов
+        bot_id = None
+        try:
+            bot = Bot.get_current()
+            bot_id = getattr(bot, 'id', None)
+            if bot_id is None:
+                # Пытаемся получить из токена
+                token = getattr(bot, 'token', '')
+                if ':' in token:
+                    try:
+                        bot_id = int(token.split(':')[0])
+                    except (ValueError, IndexError):
+                        pass
+        except Exception:
+            pass
+        
+        if isinstance(_uid, int) and bot_id is not None and _uid == bot_id:
+            logger.debug("[delete_previous_private_messages] skip vacuum for bot uid=%s", _uid)
+            return  # Не выполняем vacuum для бота
+    except Exception as e:
+        logger.debug("[delete_previous_private_messages] bot check failed: %s", e)
+    
     keep = kwargs.get("keep")
     await vacuum_private(_uid, keep=keep)
 
@@ -753,6 +863,14 @@ async def strict_vacuum(uid: int, keep_ids: Optional[Set[int]] = None) -> None:
     2) Дочищает вручную по реестру state.detail_blocks.
     """
     keep_ids = keep_ids or set()
+    # гарантированно добавим главное меню в keep
+    try:
+        from core.menu import get_menu_message_id as _menu_id  # lazy
+        _mid = _menu_id(int(uid))
+        if isinstance(_mid, int) and _mid > 0:
+            keep_ids.add(int(_mid))
+    except Exception:
+        pass
     # 1) базовая очистка ядром
     await vacuum_private(uid, keep=list(keep_ids))
 
@@ -1019,7 +1137,13 @@ async def _test():
     assert callable(strict_vacuum) and callable(remember_dm)
     assert callable(dm_singleton_send) and callable(dm_singleton_edit_or_send)
 
-    print("core/utils.py ✅ tests passed")
+    print("core/utils.py OK tests passed")
+    
+    # Дополнительные тесты resolve_notify_chat_id
+    chat_id = resolve_notify_chat_id()
+    assert chat_id is None or isinstance(chat_id, int)
+    print("core/utils.py OK resolve_notify_chat_id test passed")
+# 2025-01-19: дополнительные тесты
 
 if __name__ == "__main__":  # локальный прогон
     import asyncio as _a
@@ -1032,6 +1156,7 @@ if __name__ == "__main__":  # локальный прогон
 #                      «кнопку нажали — выше ЛС пусто», исключения для poll_details/my_games.
 #   2025-09-03 — нормализация ключей state.detail_blocks (int → (uid, 0)),
 #                фиксация assigned_role_from_state для finished_locked.
+# 2025-01-19: выравнивание отправки в общий чат
 
 # === Названия игр (публичный алиас для UI) =========================
 _GAME_TITLE_ALIASES = {
